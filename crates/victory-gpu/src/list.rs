@@ -448,6 +448,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if !same_texels(dst, Some(src)) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src);
             }
@@ -471,6 +474,19 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
+}
+
+/// Whether a copy to the texture `dst` from the texture `src` (`None`:
+/// title memory) keeps its texels' size on the host: a widened target
+/// ([`crate::resource::NARROW_TARGETS`]) copies only to and from another.
+#[cfg(windows)]
+fn same_texels(dst: This, src: Option<This>) -> bool {
+    let same = crate::resource::widened(dst) == src.is_some_and(crate::resource::widened);
+    if !same {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("copy between a widened 16-bit target and 16-bit texels"));
+    }
+    same
 }
 
 /// A copy location as titles pass it, laid out as the host's: a resource,
@@ -513,11 +529,15 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        let footprint = src.kind == FOOTPRINT;
+        if !same_texels(dst.resource, (!footprint).then_some(src.resource)) {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
-        if src.kind == FOOTPRINT {
+        if footprint {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };

@@ -952,7 +952,8 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
+/// family, or in the narrow format of a widened target
+/// ([`crate::resource::NARROW_TARGETS`]), takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
@@ -988,7 +989,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    if family(view) != family(own) {
+    if family(view) != family(own) && crate::resource::target_format(view) != own {
         once!(view, own, "view format of another family");
         return false;
     }
@@ -1457,6 +1458,65 @@ mod tests {
         texture[12] = 0;
         assert!(placed_texture(&View::Placed(true, texture, words)).is_none());
         assert!(placed_texture(&View::Placed(false, texture, words)).is_some());
+    }
+
+    /// Render targets and unordered textures in the 16-bit formats the
+    /// host does not render to or write are made in R8G8B8A8_UNORM, and
+    /// views naming the narrow format view them; textures the title only
+    /// fills keep their format.
+    #[test]
+    fn narrow_targets_are_widened_with_their_views() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = Box::leak(vec![0u8; 0x5_0000].into_boxed_slice());
+        let base = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        let place = |at: u64, format: u32, flags: u32, unordered: bool| {
+            let texture = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, format, 1, 0, 0, flags, 0];
+            // A 2D view: unordered of mip 0, or shader of every mip with
+            // the plain channel mapping.
+            let mut words = [0u32; 16];
+            if unordered {
+                words[..2].copy_from_slice(&[format, 4]);
+            } else {
+                words[..6].copy_from_slice(&[format, 4, 0x1688, 0, 0, u32::MAX]);
+            }
+            words[10] = at as u32;
+            words[11] = (at >> 32) as u32;
+            View::Placed(unordered, texture, words)
+        };
+        let format = |r: usize| {
+            let t = crate::resource::host_resource(r as crate::object::This).expect("a host copy");
+            // SAFETY: a live resource.
+            unsafe { t.GetDesc() }.Format.0
+        };
+        // B5G5R5A1, render target and unordered: written through a view.
+        let uav = place(base, 86, 0x5, true);
+        let Some(View::Unordered(r, _, _)) = placed_texture(&uav) else {
+            panic!("no unordered view of the widened target");
+        };
+        assert_eq!(format(r), 28);
+        assert!(crate::resource::widened(r as crate::object::This));
+        assert_eq!(crate::resource::view_format(r as crate::object::This), None);
+        assert!(make(&uav, heap.cpu(0)).is_some());
+        assert!(make(&place(base, 86, 0x5, false), heap.cpu(1)).is_some());
+        // B4G4R4A4 render target.
+        let Some(View::Shader(r, _)) = placed_texture(&place(base + 0x1_0000, 115, 0x1, false))
+        else {
+            panic!("no shader view of the widened target");
+        };
+        assert_eq!(format(r), 28);
+        // B5G5R5A1 the title fills: its own format.
+        let Some(View::Shader(r, _)) = placed_texture(&place(base + 0x2_0000, 86, 0, false)) else {
+            panic!("no shader view of the texture");
+        };
+        assert_eq!(format(r), 86);
+        assert!(!crate::resource::widened(r as crate::object::This));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// The record stride of a buffer view is its element size as the

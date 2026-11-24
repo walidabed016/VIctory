@@ -273,6 +273,36 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// 16-bit formats the host does not render to or write through unordered
+/// access (B5G5R5A1, B4G4R4A4), with the format their render targets and
+/// unordered textures are made in instead (R8G8B8A8_UNORM, the same
+/// channels with more bits); views and pipelines of such targets name it.
+/// shortcut: such a target's title memory keeps the console's 16-bit
+/// texels; copies between it and title memory or 16-bit host textures are
+/// refused, not converted.
+pub(crate) const NARROW_TARGETS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+
+/// The format the host makes render targets and unordered textures of
+/// `format` in: [`NARROW_TARGETS`]' wider one, or `format`.
+pub(crate) fn target_format(format: u32) -> u32 {
+    NARROW_TARGETS
+        .iter()
+        .find(|&&(narrow, _)| narrow == format)
+        .map_or(format, |&(_, wide)| wide)
+}
+
+/// Whether `this`' host copy is in a wider format than the title's
+/// texture ([`NARROW_TARGETS`]).
+#[cfg(windows)]
+pub(crate) fn widened(this: This) -> bool {
+    let Some(host) = host_resource(this) else {
+        return false;
+    };
+    let own = resource(this).desc.format;
+    // SAFETY: a live resource.
+    own != target_format(own) && unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own)
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -284,7 +314,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -823,6 +853,11 @@ fn host_texture(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    let widen = d.flags & (RENDER_TARGET | UNORDERED) != 0;
+    if widen {
+        d.format = target_format(d.format);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -840,6 +875,9 @@ fn host_texture(
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        if widen {
+            value[0] = target_format(value[0]);
+        }
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {

@@ -156,7 +156,8 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                        let format = crate::resource::pc_format(f.0 as u32);
+                        f.0 = crate::resource::target_format(format) as i32;
                     }
                 }
                 16 => {
@@ -758,5 +759,32 @@ mod tests {
             let p = HostPipeline::new(&shaders, Some(&g)).expect("a host pipeline");
             assert_eq!(p.rectangles, rectangles, "topology type {topology}");
         }
+    }
+
+    /// Render targets in the 16-bit formats the host does not render to
+    /// (B5G5R5A1, B4G4R4A4) are in the format their textures are made in.
+    #[test]
+    fn narrow_target_formats_are_widened() {
+        // Render target formats: the type, eight formats, then the count.
+        let mut stream = [0u32; 10];
+        stream[..4].copy_from_slice(&[15, 86, 115, 10]);
+        stream[9] = 3;
+        let mut g = GraphicsState::default();
+        // SAFETY: a whole render target formats subobject.
+        unsafe { g.read(15, stream.as_ptr().cast()) };
+        let formats: Vec<i32> = g.targets.RTFormats[..3].iter().map(|f| f.0).collect();
+        assert_eq!(formats, [28, 28, 10]);
+        if host().is_none() {
+            eprintln!("no host GPU: skipped");
+            return;
+        }
+        let ps = victory_shader::emit::host::stub_ps();
+        let vs = victory_shader::emit::host::stub_vs(&ps).unwrap();
+        let shaders = [
+            Shader::with_code("vertex", "vs", vs.dxil),
+            Shader::with_code("pixel", "ps", ps.dxil),
+        ];
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        assert!(HostPipeline::new(&shaders, Some(&g)).is_some());
     }
 }
