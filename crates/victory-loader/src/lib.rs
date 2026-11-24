@@ -48,6 +48,8 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use threads::report_thread_notices;
 #[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]

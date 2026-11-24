@@ -245,6 +245,8 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
         return; // our exit watchdog, or threads ending with the process
     }
     if runs_no_title_code() {
+        #[cfg(feature = "diagnostics")]
+        count(reason, None);
         return;
     }
     // A snapshot: title code may map and attach another DLL from here.
@@ -260,6 +262,8 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
     // process if their per-thread state was touched first (the current
     // thread's id, which our logging asks for when title code calls us).
     // That state is put back as the thread started.
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let saved = (reason == DLL_THREAD_ATTACH && started_by_rust()).then(OwnTls::save);
     // Starts in load order, ends in reverse, as the Windows loader does.
     let notify_one = |(image, dll_main): &(Arc<LoadedImage>, bool)| {
@@ -273,6 +277,117 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
     }
     if let Some(saved) = saved {
         saved.restore();
+    }
+    #[cfg(feature = "diagnostics")]
+    count(reason, Some(started.elapsed()));
+}
+
+/// Thread starts and ends by the module holding the thread's start routine
+/// (diagnostics): those the title images heard of, the time their notices
+/// took, and those left out.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Notices {
+    module: usize,
+    heard: [u64; 2],
+    took: Duration,
+    left_out: [u64; 2],
+}
+
+/// Since the last report (diagnostics). Not a hash map: hashing reads
+/// Rust's per-thread state, which a new thread must not touch yet.
+#[cfg(feature = "diagnostics")]
+static NOTICES: Mutex<Vec<Notices>> = Mutex::new(Vec::new());
+
+/// Counts a thread notice the images heard (taking `took`) or not.
+#[cfg(feature = "diagnostics")]
+fn count(reason: u32, took: Option<Duration>) {
+    // SAFETY: the calling thread's pseudo handle.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() };
+    let module = start_of(thread)
+        .and_then(module_of)
+        .map_or(0, |m| m as usize);
+    let end = usize::from(reason == DLL_THREAD_DETACH);
+    let mut notices = NOTICES.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match notices.iter().position(|n| n.module == module) {
+        Some(i) => i,
+        None => {
+            notices.push(Notices {
+                module,
+                ..Notices::default()
+            });
+            notices.len() - 1
+        }
+    };
+    let n = &mut notices[i];
+    match took {
+        Some(took) => {
+            n.heard[end] += 1;
+            n.took += took;
+        }
+        None => n.left_out[end] += 1,
+    }
+}
+
+/// Diagnostics: every 10 s in which threads started or ended, logs them by
+/// the module holding their start routine, with the time the title images'
+/// notices took.
+#[cfg(feature = "diagnostics")]
+pub fn report_thread_notices() {
+    const EVERY: Duration = Duration::from_secs(10);
+    let reported = victory_core::thread::spawn_host("victory thread notices", || {
+        loop {
+            std::thread::sleep(EVERY);
+            let notices = std::mem::take(&mut *NOTICES.lock().unwrap_or_else(|e| e.into_inner()));
+            if notices.is_empty() {
+                continue;
+            }
+            let text: Vec<String> = notices
+                .iter()
+                .map(|n| {
+                    format!(
+                        "{}: {} starts and {} ends heard ({:.0} ms of title notices), {} starts and {} ends left out",
+                        module_name(n.module),
+                        n.heard[0],
+                        n.heard[1],
+                        n.took.as_secs_f64() * 1e3,
+                        n.left_out[0],
+                        n.left_out[1],
+                    )
+                })
+                .collect();
+            tracing::info!(
+                "thread starts and ends in the last 10 s, by start module: {}",
+                text.join("; ")
+            );
+        }
+    });
+    if let Err(e) = reported {
+        tracing::warn!(error = %e, "no thread notice reports");
+    }
+}
+
+/// The file name of the module at `module` (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn module_name(module: usize) -> String {
+    let mut path = [0u16; 1024];
+    // SAFETY: writes at most `path.len()` characters.
+    let n = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+            module as windows_sys::Win32::Foundation::HMODULE,
+            path.as_mut_ptr(),
+            path.len() as u32,
+        )
+    } as usize;
+    match n {
+        0 => format!("{module:#x}"),
+        n => {
+            let path = String::from_utf16_lossy(&path[..n.min(path.len())]);
+            path.rsplit(['\\', '/'])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        }
     }
 }
 
