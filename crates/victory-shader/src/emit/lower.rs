@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, BVH, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, BVH, CODE, Moved, Resources, Role, Site, Source, restored};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -2155,6 +2155,25 @@ impl<'a> Lower<'a> {
             .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
         inst.write(pick(reg)?)
+    }
+
+    /// What `v_readlane_b32` of a constant lane reads where every path
+    /// spilled one scalar there with `v_writelane_b32` (see [`restored`]).
+    fn restored(&self, inst: &Inst) -> Option<Moved> {
+        let p = self.x.p;
+        let def = |v: Value| {
+            let b = *self.def_block.get(&v)?;
+            p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        let args = |v: Value| {
+            self.phi_at
+                .get(&v)
+                .map(|&(b, i)| &p.blocks[b].phis[i].args[..])
+        };
+        restored(inst, &def, &args)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -5572,6 +5591,18 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_readlane_b32" => {
+                // Outside compute, a constant lane is the console's, not the
+                // host's; when `v_writelane` spilled a scalar there on every
+                // path (`resource::restored`), the scalar reads back as such.
+                if self.s.threads.is_none()
+                    && let Some(m) = self.restored(inst)
+                {
+                    let x = match m {
+                        Moved::Value(v) => self.i32_of(v)?,
+                        Moved::Const(k) => self.s.m.i32(k),
+                    };
+                    return int(self, x);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.

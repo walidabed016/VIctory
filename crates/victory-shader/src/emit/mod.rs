@@ -1076,6 +1076,111 @@ mod tests {
         assert_eq!(texels, want);
     }
 
+    /// A pixel shader that spills 2.0 and 1.0 to lanes 1 and 0 of a VGPR
+    /// (`v_writelane`), spills 4.0 to its lane 3 in a branch only pixels
+    /// with y < 2 take, then restores lanes 1 and 0 after the join
+    /// (`v_readlane`) and exports them: every pixel reads the spilled
+    /// scalars, as the textured and ped decal programs do with descriptor
+    /// offsets they spill.
+    #[test]
+    #[cfg(windows)]
+    fn scalars_restored_from_vgpr_lanes_in_a_pixel_shader_are_the_spilled_ones() {
+        let words = [
+            0xBE84_03F4u32, // s_mov_b32 s4, 2.0
+            0xD761_0005,
+            0x0001_0204, // v_writelane_b32 v5, s4, 1
+            0xBE84_03F2, // s_mov_b32 s4, 1.0
+            0xD761_0005,
+            0x0001_0004, // v_writelane_b32 v5, s4, 0
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x7C08_02F4, // v_cmp_gt_f32 vcc_lo, 2.0, v1
+            0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+            0xBF88_0003, // s_cbranch_execz join
+            0xBE85_03F6, // s_mov_b32 s5, 4.0
+            0xD761_0005,
+            0x0001_0605, // v_writelane_b32 v5, s5, 3
+            0x887E_0A7E, // join: s_or_b32 exec_lo, exec_lo, s10
+            0xD760_0006,
+            0x0001_0305, // v_readlane_b32 s6, v5, 1
+            0xD760_0007,
+            0x0001_0105, // v_readlane_b32 s7, v5, 0
+            0x7E08_0206, // v_mov_b32 v4, s6
+            0x7E0C_0207, // v_mov_b32 v6, s7
+            0xF800_180F,
+            0x0604_0604, // exp mrt0, v4, v6, v4, v6 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 7,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                // POS_X_FLOAT and POS_Y_FLOAT: the pixel's x and y in v0 and v1.
+                input_addr: 1 << 8 | 1 << 9,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, interp, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[el("SV_Position", 3, 4, 3)], true);
+        let osg1 = super::container::signature(&[el("SV_Target", 16, 0, 15)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let ps = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ps.dxil.clone()).unwrap();
+        }
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let vs = super::host::position_vs();
+        let (root, pso) = host.pipeline(&vs, &ps).unwrap();
+        let vertices = [
+            -1.0f32, -1.0, 0.5, 1.0, //
+            -1.0, 3.0, 0.5, 1.0, //
+            3.0, -1.0, 0.5, 1.0,
+        ];
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &super::host::Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (4, 4),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(texels, vec![[2.0, 1.0, 2.0, 1.0]; 16]);
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow
