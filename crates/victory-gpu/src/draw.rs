@@ -521,21 +521,22 @@ impl State {
             self.heap_slots(list, &values, &t.host);
             if let Some(param) = stage.view_strides {
                 // The record strides of the view heap the shader indexes.
-                let strides = (self.heaps[0] != 0)
+                let records = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
-                    .and_then(|h| h.strides());
-                let Some((buffer, gpu)) = strides else {
+                    .and_then(|h| h.records());
+                let Some((buffer, view)) = records else {
                     once!("a shader reads view strides without a view heap that has them: dropped");
                     return false;
                 };
                 list.keep(buffer);
-                // SAFETY: an open list; the buffer lives while the list does.
+                // SAFETY: an open list; the view is in the heap the list
+                // sets, and the buffer lives while the list does.
                 unsafe {
                     if compute {
-                        l.SetComputeRootShaderResourceView(param, gpu);
+                        l.SetComputeRootDescriptorTable(param, view);
                     } else {
-                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                        l.SetGraphicsRootDescriptorTable(param, view);
                     }
                 }
             }
@@ -1538,7 +1539,7 @@ void main() {
     /// through a view of that kind (none: zeros). Its instance culling
     /// reads instance records the same way.
     const CULL: &str = r#"
-#define RS "SRV(t0, space=2), SRV(t1), UAV(u0), DescriptorTable(SRV(t0, space=1, numDescriptors=64)), DescriptorTable(CBV(b0, space=1, numDescriptors=64))"
+#define RS "DescriptorTable(SRV(t0, space=2)), SRV(t1), UAV(u0), DescriptorTable(SRV(t0, space=1, numDescriptors=64)), DescriptorTable(CBV(b0, space=1, numDescriptors=64))"
 struct Words { uint4 w; };
 ByteAddressBuffer records : register(t0, space2);
 ByteAddressBuffer batches : register(t1);
@@ -1627,7 +1628,7 @@ void main() {
         let mut state = State::default();
         state.set_heaps(&[h]);
         state.heap_slots(&list, &[], &shader);
-        let (_, strides) = host_heap.strides().expect("the view heap's records");
+        let (_, records) = host_heap.records().expect("the view heap's records");
         // SAFETY: an open list; live heap, buffers, pipeline and root
         // signature.
         unsafe {
@@ -1635,7 +1636,7 @@ void main() {
             l.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
             l.SetComputeRootSignature(&root);
             l.SetPipelineState(&pso);
-            l.SetComputeRootShaderResourceView(0, strides);
+            l.SetComputeRootDescriptorTable(0, records);
             l.SetComputeRootShaderResourceView(1, batches.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
             let slots = host_heap.heap.GetGPUDescriptorHandleForHeapStart();
@@ -1659,5 +1660,74 @@ void main() {
         crate::shadow::unregister(p, start);
         release(p);
         assert_eq!(got, want, "words and kinds read through slots 37 and 9");
+    }
+
+    /// Reads the record of the slot in the root constant, the records'
+    /// size, and the records at their end and 1 GiB past it.
+    const RECORDS: &str = r#"
+#define RS "DescriptorTable(SRV(t0, space=2)), UAV(u0), RootConstants(num32BitConstants=1, b0)"
+cbuffer Slot : register(b0) { uint slot; };
+ByteAddressBuffer records : register(t0, space2);
+RWByteAddressBuffer read : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint bytes;
+    records.GetDimensions(bytes);
+    read.Store4(0, uint4(records.Load3(slot * 16), bytes));
+    read.Store3(16, records.Load3(bytes));
+    read.Store3(28, records.Load3(bytes + (1u << 30)));
+}
+"#;
+
+    /// A shader that reads the view heap's slot records at a heap index
+    /// past them (a lane's garbage index, or a title slot past the capped
+    /// heap) reads zeros, a slot with no view: through the records' view in
+    /// the heap, where a root view read whatever lay past the buffer (GPU
+    /// page faults in runs 54, 56 and 58).
+    #[test]
+    fn slot_records_read_past_their_end_are_zeros() {
+        use victory_shader::emit::view_kind;
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let host = crate::host::host().unwrap();
+        let h = crate::descriptor::tests::view_heap(64);
+        let host_heap = crate::descriptor::heap(h).host().expect("a host view heap");
+        let (out, data) = host.shared_buffer(256).unwrap();
+        let slot = host_heap.dynamic(1).expect("a dynamic slot");
+        // SAFETY: a live buffer.
+        host_heap.constant_at(slot, unsafe { out.GetGPUVirtualAddress() }, 256);
+        let (buffer, records) = host_heap.records().expect("the view heap's records");
+        // SAFETY: a live buffer.
+        let bytes = unsafe { buffer.GetDesc() }.Width as u32;
+        let (root, pso) = compute(RECORDS);
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; live heap, buffers, pipeline and root
+        // signature.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootDescriptorTable(0, records);
+            l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstant(2, slot, 0);
+            l.Dispatch(1, 1, 1);
+            l.Close().unwrap();
+        }
+        host.execute(&[&list]);
+        // SAFETY: the mapped words the dispatch wrote, waited for.
+        let got: [u32; 10] =
+            std::array::from_fn(|i| unsafe { data.cast::<u32>().add(i).read_volatile() });
+        drop(list);
+        host_heap.release(slot, 1);
+        crate::descriptor::tests::release_heap(h);
+        assert_eq!(
+            got,
+            [0, 0, view_kind::CBV, bytes, 0, 0, 0, 0, 0, 0],
+            "the slot's record, the records' bytes, and zeros past them"
+        );
     }
 }

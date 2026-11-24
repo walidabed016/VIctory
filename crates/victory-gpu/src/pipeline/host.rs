@@ -252,7 +252,7 @@ pub(crate) struct Stage {
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
     /// The root parameter of the view heap's record strides, if it reads
-    /// them (a root SRV, `t0` in `VIEW_STRIDE_SPACE`).
+    /// them (a table of their one view, `t0` in `VIEW_STRIDE_SPACE`).
     pub(crate) view_strides: Option<u32>,
 }
 
@@ -337,6 +337,19 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        // The view heap's records, through their view in the heap: a shader
+        // reads them at any heap index it computes, and a read past them
+        // gives zeros there (no view) where a root view would read whatever
+        // lies past the buffer. Volatile, so drivers keep the bounds check.
+        let records = [D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: VIEW_STRIDE_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        }];
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -391,12 +404,11 @@ impl HostPipeline {
             if t.view_strides {
                 stage.view_strides = Some(params.len() as u32);
                 params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                     Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                            ShaderRegister: 0,
-                            RegisterSpace: VIEW_STRIDE_SPACE,
-                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: records.len() as u32,
+                            pDescriptorRanges: records.as_ptr(),
                         },
                     },
                     ShaderVisibility: visibility,

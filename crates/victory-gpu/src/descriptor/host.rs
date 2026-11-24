@@ -43,7 +43,8 @@ pub(crate) struct HostHeap {
     /// before the first record ([`raw_elements`]) and the kind of view the
     /// host made there (`view_kind`), which accesses no used-resource entry
     /// names go by. An upload buffer and its mapping; none in sampler
-    /// heaps, or if the host would not make it.
+    /// heaps, or if the host would not make it. Shaders read it through a
+    /// raw view at the heap's last slot ([`HostHeap::records`]).
     strides: Option<(ID3D12Resource, usize)>,
     /// Slots of buffer views made from the title's writes whose data no
     /// stage has asked for since ([`HostHeap::take_unread`]).
@@ -158,16 +159,18 @@ impl HostHeap {
             host.upload_buffer(u64::from(count + extra) * u64::from(VIEW_RECORD_BYTES))
                 .map(|(buffer, data)| (buffer, data as usize))
         };
+        // The records' view takes the last dynamic slot.
+        let dynamic = extra - u32::from(strides.is_some());
         let h = HostHeap {
             heap,
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; dynamic as usize])),
             strides,
             unread: Mutex::default(),
         };
@@ -178,6 +181,26 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, count + extra) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+        }
+        if let Some((buffer, _)) = &h.strides {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: (count + extra) * (VIEW_RECORD_BYTES / 4),
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: the last slot of our heap; the buffer holds a record
+            // per slot.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(buffer, Some(&desc), h.cpu(count + dynamic))
+            };
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -371,12 +394,20 @@ impl HostHeap {
         }
     }
 
-    /// The buffer of the record strides and leads of this heap's slots and
-    /// its GPU address, for shaders that read them; none in sampler heaps.
-    pub(crate) fn strides(&self) -> Option<(&ID3D12Resource, u64)> {
+    /// The buffer of the records of this heap's slots and the view shaders
+    /// read them through, at the heap's last slot: a heap index past the
+    /// records reads zeros there, a slot with no view. None in sampler heaps.
+    pub(crate) fn records(&self) -> Option<(&ID3D12Resource, D3D12_GPU_DESCRIPTOR_HANDLE)> {
         let (buffer, _) = self.strides.as_ref()?;
-        // SAFETY: a live buffer.
-        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+        // SAFETY: a live heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        let at = u64::from(self.count + self.dynamic) * u64::from(self.step);
+        Some((
+            buffer,
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + at,
+            },
+        ))
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
@@ -1434,8 +1465,8 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let (_, gpu) = heap.strides().expect("a view heap has record strides");
-        assert_ne!(gpu, 0);
+        let (_, view) = heap.records().expect("a view heap has record strides");
+        assert_ne!(view.ptr, 0);
         let data = heap.strides.as_ref().map_or(0, |s| s.1);
         // SAFETY: dwords of the mapped buffer, a record per slot.
         let read = |i: u32| unsafe { (data as *const [u32; 4]).add(i as usize).read_volatile() };
@@ -1455,7 +1486,7 @@ mod tests {
         heap.constant_at(last, 0, 256);
         assert_eq!(read(last), [0, 0, view_kind::CBV, 0]);
         let samplers = HostHeap::new(true, 4).expect("a sampler heap");
-        assert!(samplers.strides().is_none());
+        assert!(samplers.records().is_none());
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

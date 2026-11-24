@@ -53,7 +53,7 @@
 //!   (`idxen` dword loads, stores, atomics) goes to the raw view the host
 //!   makes of every untyped buffer view (structured ones included) at byte
 //!   index * stride + offset, plus the view's lead for a heap descriptor.
-//!   Dwords `4i`, `4i + 1` and `4i + 2` of a raw root SRV `t0` in
+//!   Dwords `4i`, `4i + 1` and `4i + 2` of a raw buffer `t0` in
 //!   [`VIEW_STRIDE_SPACE`] ([`HostShader::view_strides`], records of
 //!   [`VIEW_RECORD_BYTES`]) hold the view at heap index `i`'s element size, which is what the console descriptor's
 //!   stride field holds (a structured view's `StructureByteStride`, a typed
@@ -204,9 +204,11 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
-    /// Whether the shader reads the view heap's records: a root SRV `t0`
+    /// Whether the shader reads the view heap's records: a raw buffer `t0`
     /// in [`VIEW_STRIDE_SPACE`] over two dwords (stride and lead) per slot
-    /// of the view heap it indexes (see the module notes).
+    /// of the view heap it indexes (see the module notes). A heap index is
+    /// whatever the program computes, so the host binds a view of them,
+    /// which reads zeros past their end, not a root SRV, which reads on.
     pub view_strides: bool,
     /// The view-heap slots the shader reaches through its user data that no
     /// used-resource entry names (see [`HeapIndex`]): the host makes them,
