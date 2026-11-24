@@ -221,12 +221,20 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
+            let first = last.read.len() != size;
             last.read.resize(size, 0);
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            read(&mut last.read, start);
+            let changed = read(&mut last.read, start) || first;
             #[cfg(feature = "diagnostics")]
             crate::copystat::cost(crate::copystat::Op::Copy, started, start, size as u64);
+            // Written as the same bytes, or elsewhere in the pages it shares:
+            // the staging buffer, and so the host texture, stay as they are.
+            if !changed {
+                #[cfg(feature = "diagnostics")]
+                seen::note(self, Some(seen::Outcome::WrittenSame), 0);
+                return (size, false);
+            }
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             if verify_every() != 0 {
@@ -390,22 +398,39 @@ fn threads() -> usize {
 }
 
 /// Reads title memory at `from` into `to` (its length) as
-/// [`crate::host::copy_mapped`] does, unmapped pages as zeros; split
-/// between threads when big.
-fn read(to: &mut [u8], from: usize) {
-    if to.len() < SPLIT {
-        crate::host::copy_mapped(to.as_mut_ptr(), from as *const u8, to.len(), false);
-        return;
-    }
-    let per = to.len().div_ceil(threads()).next_multiple_of(4096);
-    std::thread::scope(|s| {
-        for (k, chunk) in to.chunks_mut(per).enumerate() {
-            let at = from + k * per;
-            s.spawn(move || {
-                crate::host::copy_mapped(chunk.as_mut_ptr(), at as *const u8, chunk.len(), false)
-            });
+/// [`crate::host::copy_mapped`] does, unmapped pages as zeros, a piece at a
+/// time: whether any piece differed from what `to` held. Split between
+/// threads when big.
+fn read(to: &mut [u8], from: usize) -> bool {
+    /// L2-sized: each piece is compared while it is still in the cache.
+    const PIECE: usize = 64 << 10;
+    let pieces = |to: &mut [u8], from: usize| {
+        let mut piece = vec![0u8; PIECE.min(to.len())];
+        let mut changed = false;
+        for (k, held) in to.chunks_mut(PIECE).enumerate() {
+            let read = &mut piece[..held.len()];
+            let at = (from + k * PIECE) as *const u8;
+            crate::host::copy_mapped(read.as_mut_ptr(), at, read.len(), false);
+            if read != held {
+                held.copy_from_slice(read);
+                changed = true;
+            }
         }
-    });
+        changed
+    };
+    if to.len() < SPLIT {
+        return pieces(to, from);
+    }
+    let per = to.len().div_ceil(threads()).next_multiple_of(PIECE);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = to
+            .chunks_mut(per)
+            .enumerate()
+            .map(|(k, chunk)| s.spawn(move || pieces(chunk, from + k * per)))
+            .collect();
+        // The scope waits for any part not joined here.
+        parts.into_iter().any(|p| p.join().unwrap_or(true))
+    })
 }
 
 /// [`victory_formats::texture::Layout::detile`] of a big subresource with
@@ -556,6 +581,8 @@ pub(crate) mod seen {
         Watched,
         /// Watched and written since: detiled.
         WatchedWritten,
+        /// Watched and written since, its bytes the same: left as it was.
+        WrittenSame,
         /// Not committed: left as it was.
         Uncommitted,
         /// Hashed, unchanged.
@@ -568,10 +595,11 @@ pub(crate) mod seen {
         /// (`VICTORY_TEXTURE_VERIFY`).
         Stale,
     }
-    const OUTCOMES: usize = 7;
+    const OUTCOMES: usize = 8;
     const NAMES: [&str; OUTCOMES] = [
         "unwritten",
         "written",
+        "written same",
         "uncommitted",
         "hashed same",
         "hashed first",
@@ -654,8 +682,8 @@ pub(crate) mod seen {
             .and_then(|v| v.parse().ok())
             .unwrap_or(12);
         let mut seen: Vec<(usize, Seen)> = map.into_iter().collect();
-        let hashes = |s: &Seen| s.outcomes[3] + s.outcomes[4] + s.outcomes[5];
-        let changes = |s: &Seen| s.outcomes[1] + s.outcomes[4] + s.outcomes[5] + s.outcomes[6];
+        let hashes = |s: &Seen| s.outcomes[4] + s.outcomes[5] + s.outcomes[6];
+        let changes = |s: &Seen| s.outcomes[1] + s.outcomes[5] + s.outcomes[6] + s.outcomes[7];
         for kind in ["view", "watched", "unwatched"] {
             let of: Vec<&Seen> = seen
                 .iter()
@@ -757,7 +785,14 @@ mod tests {
             .collect();
         assert!(memory.len() >= SPLIT);
         let mut tiled = vec![0; memory.len()];
-        read(&mut tiled, memory.as_ptr() as usize);
+        assert!(read(&mut tiled, memory.as_ptr() as usize));
+        assert!(tiled == memory);
+        assert!(
+            !read(&mut tiled, memory.as_ptr() as usize),
+            "the same bytes"
+        );
+        tiled[SPLIT - 5] ^= 1;
+        assert!(read(&mut tiled, memory.as_ptr() as usize));
         assert!(tiled == memory);
         let pitch = 2048 * 4 + 256;
         let mut one = vec![0; pitch * 1031];
