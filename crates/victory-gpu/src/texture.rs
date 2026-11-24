@@ -5,10 +5,10 @@
 //! staging buffer when its content changed, and the staging buffer is
 //! copied into the host texture.
 //!
-//! "Changed" means a page of the memory was written since the last detiling
-//! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! "Changed" means a page of the memory was written since the last detiling,
+//! as the write watch or the guard on views and pools tells
+//! ([`crate::watch`]); in memory neither tells about, a content hash of the
+//! whole memory at every submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -58,6 +58,9 @@ struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     read: Vec<u8>,
+    /// Times the watch found the memory unwritten (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    unwritten: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -180,30 +183,36 @@ impl Staging {
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    /// since the last time (and is mapped at all); true if it did: the
+    /// staging buffer holds new contents.
+    pub(crate) fn refresh(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let (read, detiled) = self.refresh_now();
         let us = started.elapsed().as_micros() as u64;
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(us, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         #[cfg(feature = "diagnostics")]
         seen::note(self, None, us);
+        detiled
     }
 
-    /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    /// Returns the bytes of title memory read, and whether it detiled them.
+    fn refresh_now(&self) -> (usize, bool) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if let Some((now, written)) = crate::watch::writes(start, start + size, true) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 #[cfg(feature = "diagnostics")]
+                if self.verify(last) {
+                    return (size, true);
+                }
+                #[cfg(feature = "diagnostics")]
                 seen::note(self, Some(seen::Outcome::Watched), 0);
-                return 0;
+                return (0, false);
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
@@ -216,10 +225,14 @@ impl Staging {
             crate::copystat::cost(crate::copystat::Op::Copy, started, start, size as u64);
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
+            if verify_every() != 0 {
+                last.hash = Some(blake3::hash(&last.read));
+            }
+            #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             #[cfg(feature = "diagnostics")]
             seen::note(self, Some(seen::Outcome::WatchedWritten), 0);
-            return size;
+            return (size, true);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -231,7 +244,7 @@ impl Staging {
             );
             #[cfg(feature = "diagnostics")]
             seen::note(self, Some(seen::Outcome::Uncommitted), 0);
-            return 0;
+            return (0, false);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -245,7 +258,7 @@ impl Staging {
         if last.hash == Some(hash) {
             #[cfg(feature = "diagnostics")]
             seen::note(self, Some(seen::Outcome::Hashed), 0);
-            return size;
+            return (size, false);
         }
         #[cfg(feature = "diagnostics")]
         seen::note(
@@ -260,7 +273,45 @@ impl Staging {
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
+        (size, true)
+    }
+
+    /// Diagnostics (`VICTORY_TEXTURE_VERIFY=N`): every Nth time the watch
+    /// finds the memory unwritten, whether it changed all the same, by its
+    /// hash (a write nothing saw: the texture would show stale contents).
+    /// Logs it and detiles the memory; true if it did.
+    #[cfg(feature = "diagnostics")]
+    fn verify(&self, last: &mut Last) -> bool {
+        let every = verify_every();
+        last.unwritten += 1;
+        if every == 0 || !last.unwritten.is_multiple_of(every) {
+            return false;
+        }
+        let (start, end) = self.memory();
+        let started = std::time::Instant::now();
+        let mut now = vec![0; end - start];
+        crate::host::copy_mapped(now.as_mut_ptr(), self.memory, end - start, false);
+        let hash = blake3::hash(&now);
+        crate::copystat::cost(crate::copystat::Op::Hash, started, start, now.len() as u64);
+        crate::copystat::add(crate::copystat::C::TexHashed, now.len() as u64);
+        // Written since it was asked about: its fault opened a block, and
+        // the next asking takes it.
+        if last.hash == Some(hash) || !crate::watch::unwritten(start, end) {
+            return false;
+        }
+        static STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100 {
+            tracing::warn!(
+                "texture stale: {start:#x}+{:#x} ({}): its memory changed though no write to it was seen",
+                end - start,
+                self.name
+            );
+        }
+        seen::note(self, Some(seen::Outcome::Stale), 0);
+        last.hash = Some(hash);
+        last.read = now;
+        self.detile(&last.read);
+        true
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -304,6 +355,19 @@ impl Drop for Detiling {
     fn drop(&mut self) {
         crate::copystat::cost(crate::copystat::Op::Detile, self.0, self.1, self.2 as u64);
     }
+}
+
+/// Every how many unwritten findings a texture's memory is hashed to
+/// verify them (`VICTORY_TEXTURE_VERIFY`; 0, the default: never).
+#[cfg(feature = "diagnostics")]
+fn verify_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_VERIFY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -429,8 +493,11 @@ pub(crate) mod seen {
         HashedFirst,
         /// Hashed and changed: detiled.
         HashedChanged,
+        /// Unwritten as the watch tells, changed as its hash tells: detiled
+        /// (`VICTORY_TEXTURE_VERIFY`).
+        Stale,
     }
-    const OUTCOMES: usize = 6;
+    const OUTCOMES: usize = 7;
     const NAMES: [&str; OUTCOMES] = [
         "unwritten",
         "written",
@@ -438,6 +505,7 @@ pub(crate) mod seen {
         "hashed same",
         "hashed first",
         "hashed changed",
+        "STALE",
     ];
 
     struct Seen {
@@ -516,7 +584,7 @@ pub(crate) mod seen {
             .unwrap_or(12);
         let mut seen: Vec<(usize, Seen)> = map.into_iter().collect();
         let hashes = |s: &Seen| s.outcomes[3] + s.outcomes[4] + s.outcomes[5];
-        let changes = |s: &Seen| s.outcomes[1] + s.outcomes[4] + s.outcomes[5];
+        let changes = |s: &Seen| s.outcomes[1] + s.outcomes[4] + s.outcomes[5] + s.outcomes[6];
         for kind in ["view", "watched", "unwatched"] {
             let of: Vec<&Seen> = seen
                 .iter()

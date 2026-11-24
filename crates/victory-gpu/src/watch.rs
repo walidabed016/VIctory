@@ -995,6 +995,15 @@ pub fn physical_pages_written(first: u64, n: usize) {
     }
 }
 
+/// Whether every block of `[start, end)` is guarded and clean: not
+/// written since a guarded asking took it (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn unwritten(start: usize, end: usize) -> bool {
+    let g = guards();
+    let (from, to) = (start / BLOCK, end.div_ceil(BLOCK));
+    g.clean.gaps(from, to).is_empty() && g.protected.gaps(from, to).is_empty()
+}
+
 /// The runtime reserved (`watched`) or released write-watched title memory
 /// `[at, at + len)`: xmem's pools, which copies guard as they do views
 /// ([`guard_pools`]). It commits pool memory, and changes its protection,
