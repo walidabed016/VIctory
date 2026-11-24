@@ -162,6 +162,7 @@ fn build(words: &[u32], threads: [u32; 3], lds: u32) -> (HostShader, Waves, u32)
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        view_strides: lowered.view_strides,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
