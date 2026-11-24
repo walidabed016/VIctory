@@ -303,9 +303,8 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
-    #[cfg(windows)]
+    /// of resources or of memory) or memory the title placed a texture in.
+    #[cfg(all(windows, feature = "diagnostics"))]
     fn is_buffer(&self) -> bool {
         match self {
             View::Constant(..) | View::Placed(..) => true,
@@ -314,6 +313,14 @@ impl View {
             }
             View::Sampler(_) | View::ConsoleSampler(_) => false,
         }
+    }
+
+    /// Whether the view reads memory the title placed a texture in: such
+    /// views get host slots only for draws, which bring the texture up to
+    /// date.
+    #[cfg(windows)]
+    fn placed_texture(&self) -> bool {
+        matches!(self, View::Placed(_, resource, _) if resource[0] != 1)
     }
 }
 
@@ -572,9 +579,10 @@ pub(crate) extern "system" fn copy(
 /// Diagnostics (`VICTORY_HEAP_AUDIT=1`, logged with the meter's lines):
 /// the title's shader-visible view heaps against the host slots made of
 /// them. A shader that loads a slot's index from memory (the GPU-driven
-/// culling programs) reads only what the host made there: buffer views are
-/// made only for draws that name them, and a slot the title fills by
-/// copying descriptor bytes is made again only when a draw names it. Per
+/// culling programs) reads only what the host made there: views of memory
+/// the title placed a texture in are made only for draws that name them,
+/// and a slot the title fills by copying descriptor bytes is made again
+/// only when a draw names it. Per
 /// heap: buffer and texture views made, never made and outdated (the
 /// title's record changed since the host made the slot), and the title
 /// buffers the buffer views not made view, most slots first.
@@ -772,7 +780,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
@@ -784,6 +792,28 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A shader-visible view heap of `count` slots, as the title makes one.
+    pub(crate) fn view_heap(count: u32) -> This {
+        let desc = HeapDesc {
+            kind: 0,
+            count,
+            flags: 1,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        h
+    }
+
+    /// Releases a heap [`view_heap`] made.
+    pub(crate) fn release_heap(h: This) {
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     #[test]

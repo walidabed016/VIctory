@@ -384,8 +384,11 @@ impl HostHeap {
 
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
-    /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
+    /// views are made when the title writes them, as textures are: shaders
+    /// reach slots through indices they load from memory, which no draw
+    /// names (Grand Theft Auto VI's instance and meshlet culling). Views of
+    /// memory the title placed a texture in are made only for draws
+    /// (`for_draw`), which bring the texture up to date.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -417,7 +420,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            let later = !for_draw && view.is_buffer();
+            let later = !for_draw && view.placed_texture();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -1704,5 +1707,50 @@ mod tests {
             };
             assert_eq!((srv.Format, uav.Format), (format, format));
         }
+    }
+
+    /// Buffer views the title writes into a shader-visible heap get host
+    /// slots at once: Grand Theft Auto VI's instance and meshlet culling
+    /// reach their slots through indices they load from memory, which no
+    /// draw names.
+    #[test]
+    fn buffer_views_the_title_writes_are_made_at_once() {
+        use crate::descriptor::tests::{release_heap, view_heap};
+        use crate::descriptor::{create_cbv, create_placed_srv, create_placed_uav};
+        type Create =
+            extern "system" fn(crate::object::This, *const [u32; 14], *const [u32; 16], u64);
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let title = Title::new();
+        let h = view_heap(64);
+        let heap = crate::descriptor::heap(h);
+        let host = heap.host().expect("a host view heap");
+        let at = |index: u32| heap.handle(index).expect("a slot of the heap");
+        let null = std::ptr::null();
+        for (index, view) in [
+            (3, title.srv(39, 0, 1, 0, 1024)),
+            (4, title.uav(39, 0, 1, 0, 1024)),
+        ] {
+            let View::Placed(unordered, resource, desc) = view else {
+                unreachable!("a placed view");
+            };
+            let create: Create = if unordered {
+                create_placed_uav
+            } else {
+                create_placed_srv
+            };
+            create(null, &resource, &desc, at(index));
+        }
+        let (lo, hi) = (title.start as u32, (title.start >> 32) as u32);
+        create_cbv(null, &[lo, hi, 256, 0], at(5));
+        let data = host.strides.as_ref().map_or(0, |s| s.1);
+        // SAFETY: the slots' records in the mapped buffer.
+        let kind = |i: u32| unsafe { (data as *const [u32; 4]).add(i as usize).read_volatile()[2] };
+        assert_eq!(
+            [kind(3), kind(4), kind(5)],
+            [view_kind::RAW_SRV, view_kind::RAW_UAV, view_kind::CBV]
+        );
+        release_heap(h);
     }
 }

@@ -136,8 +136,8 @@ pub(crate) fn dispatched() -> u64 {
 /// user data for draws and dispatches ([`State::heap_slots`]), stages bound
 /// with heap accesses whose slot only the running shader knows (an index
 /// loaded from memory or chosen per lane), and those accesses. The host
-/// cannot make those slots for the draw: buffer views there read zeros
-/// unless a table entry made them.
+/// cannot make those slots for the draw: they hold what the title's writes
+/// made.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SLOTS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
