@@ -449,7 +449,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
+                crate::texture::upload(list, src);
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
@@ -543,7 +543,7 @@ extern "system" fn copy_texture_region(
                 return;
             };
             if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
+                crate::texture::upload(list, src.resource);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();

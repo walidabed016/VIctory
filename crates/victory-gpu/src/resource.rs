@@ -1806,6 +1806,154 @@ mod tests {
         }
     }
 
+    /// A title texture's contents reach its host copy in the prelude of the
+    /// first list that reads it after they change, and only then: a list
+    /// that reads unchanged contents copies nothing over the host copy.
+    #[test]
+    fn title_texture_contents_are_uploaded_only_when_they_change() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let _serial = crate::watch::serial();
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let desc = texture(64, 64, 28, 1);
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image
+            ),
+            S_OK
+        );
+        let (memory, _) = texture_memory(image).unwrap();
+        let size = texture_layout(&desc).unwrap().planes[0].layout.size as usize;
+        // Every texel the same, so the console's tiling does not matter.
+        // SAFETY: the texture's memory, `size` bytes.
+        let fill = |byte: u8| unsafe { (memory as *mut u8).write_bytes(byte, size) };
+        let texture = host_resource(image).unwrap();
+        let buffer = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
+            let mut b: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a 64 KiB buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: heap,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: 64 << 10,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .unwrap();
+            }
+            b.unwrap()
+        };
+        let (readback, other) = (
+            buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST),
+            buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ),
+        );
+        let rows = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28),
+                Width: 64,
+                Height: 64,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+        let at = |resource: &ID3D12Resource, footprint: bool| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: if footprint {
+                D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
+            } else {
+                D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+            },
+            Anonymous: if footprint {
+                D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: rows,
+                }
+            } else {
+                D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                }
+            },
+        };
+        // A list that reads the texture, as a draw sampling it would, and
+        // copies the host copy out: its first texel's first byte.
+        let read = || {
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image);
+            crate::list::ensure_state(&list, image, 0x800);
+            // SAFETY: an open list; live resources.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    &at(&readback, true),
+                    0,
+                    0,
+                    0,
+                    &at(texture, false),
+                    None,
+                )
+            };
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the finished copy's read-back buffer.
+            unsafe {
+                readback.Map(0, None, Some(&mut data)).unwrap();
+                let byte = data.cast::<u8>().read();
+                readback.Unmap(0, None);
+                byte
+            }
+        };
+        fill(0x11);
+        assert_eq!(read(), 0x11, "the first read uploads");
+        // The host copy changed behind the upload's back (a copy of ours).
+        let mut data = std::ptr::null_mut();
+        // SAFETY: our upload buffer, 64 KiB.
+        unsafe {
+            other.Map(0, None, Some(&mut data)).unwrap();
+            data.cast::<u8>().write_bytes(0x22, 64 << 10);
+        }
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, image, 0x400);
+        // SAFETY: an open list; live resources.
+        unsafe {
+            list.list
+                .CopyTextureRegion(&at(texture, false), 0, 0, 0, &at(&other, true), None)
+        };
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(read(), 0x22, "unchanged contents are not uploaded again");
+        fill(0x33);
+        assert_eq!(read(), 0x33, "changed contents are");
+        assert_eq!(host.log_messages(), None, "debug layer errors");
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

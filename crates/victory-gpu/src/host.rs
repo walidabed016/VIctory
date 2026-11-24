@@ -615,6 +615,11 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Their staging buffers and host copies: what the prelude copies.
+    staged: Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1217,34 +1222,68 @@ impl HostList {
         }
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
+    /// At submission, after the list's staging buffers were refreshed: the
+    /// list that moves each texture this list uses from its real state to
+    /// the one the list starts with, copying in staging buffers that hold
+    /// contents their host textures have not had yet on the way; the
+    /// textures' real states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
+        let deferred = self.deferred();
+        let due: Vec<_> = deferred
+            .staged
+            .iter()
+            .filter(|(staging, _)| staging.due())
             .collect();
-        if barriers.is_empty() {
+        let uploads: std::collections::HashSet<usize> = due
+            .iter()
+            .map(|(_, copy)| std::sync::Arc::as_ptr(copy) as usize)
+            .collect();
+        let move_to = |copy: &crate::resource::HostTexture, from: u32, to: u32| {
+            (from != to).then(|| {
+                transition(
+                    &copy.texture,
+                    D3D12_RESOURCE_STATES(from as i32),
+                    D3D12_RESOURCE_STATES(to as i32),
+                )
+            })
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for (key, (first, last, copy)) in states.iter() {
+            let real = copy.state.swap(*last, Ordering::Relaxed);
+            if uploads.contains(key) {
+                before.extend(move_to(copy, real, COPY_DEST));
+                after.extend(move_to(copy, COPY_DEST, *first));
+            } else {
+                before.extend(move_to(copy, real, *first));
+            }
+        }
+        // Uploaded but not otherwise used in the list: left for the copy.
+        for (_, copy) in &due {
+            if !states.contains_key(&(std::sync::Arc::as_ptr(copy) as usize)) {
+                let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
+                before.extend(move_to(copy, real, COPY_DEST));
+            }
+        }
+        if before.is_empty() && due.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures and staging buffers are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !before.is_empty() {
+                    list.ResourceBarrier(&before);
+                }
+                for (staging, copy) in &due {
+                    staging.copy_into(list, &copy.texture);
+                }
+                if !after.is_empty() {
+                    list.ResourceBarrier(&after);
+                }
                 list.Close()
             })
         };
@@ -1485,8 +1524,14 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Texture(staging.clone()));
+        deferred.staged.push((staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1969,6 +2014,14 @@ impl Meter {
                 crate::texture::seen::log(span);
                 crate::shadow::log_roots(span);
                 log_gpu_times(span);
+                let uploaded = crate::texture::UPLOADED
+                    .each_ref()
+                    .map(|n| n.swap(0, Ordering::Relaxed) as f64 / span.max(1.0));
+                tracing::info!(
+                    "texture uploads per frame: {:.0} subresources, {:.1} MB",
+                    uploaded[0],
+                    uploaded[1] / 1e6
+                );
                 let seen = crate::indirect::SEEN.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "indirect records run per frame: mesh {:.0} with groups, {:.0} empty; draws {:.0}, {:.0} empty; dispatches {:.0}, {:.0} empty",
