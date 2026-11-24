@@ -10,7 +10,8 @@
 //! copy leaves each 64 KiB block it took read-only, and our vectored handler
 //! takes the first write to it: it notes the block as written and gives the
 //! write access back. The runtime tells us when it maps or unmaps views
-//! ([`title_memory_remapped`]), which resets their protection.
+//! ([`title_memory_remapped`], [`title_memory_unmapping`]), which resets
+//! their protection.
 //!
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
@@ -344,8 +345,9 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     saved: BTreeMap::new(),
 });
 
-/// Held to read armed blocks without the guards' lock ([`mapped`]); the
-/// runtime's remappings wait for it.
+/// Held to read armed blocks without the guards' lock ([`mapped`]) and to
+/// arm them ([`arm`]); the runtime's unmappings wait for it, and it for
+/// them ([`title_memory_unmapping`]).
 static MAPPING: RwLock<()> = RwLock::new(());
 
 /// A set of blocks as runs (first, end), apart and in order, so that a
@@ -559,12 +561,13 @@ fn save(g: &mut Guards, from: usize, to: usize) {
 /// itself ([`before`]). Armed are the whole blocks guarded and not written
 /// since, nor since the copy took them (`copied`: the asking after which
 /// the copy took a page, 0 if never). Returns the asking now and the runs
-/// of blocks of the range not armed.
+/// of blocks of the range not armed. Waits for the runtime's unmappings.
 pub(crate) fn arm(
     start: usize,
     end: usize,
     copied: impl Fn(usize) -> u64,
 ) -> (u64, Vec<(usize, usize)>) {
+    let _mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     let (first, last) = (start.div_ceil(BLOCK), end / BLOCK);
@@ -654,17 +657,39 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
 }
 
-/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// The runtime mapped title memory `[at, at + len)`: what it shows is new
+/// and read-write, so it is no longer guarded. It unmaps through
+/// [`title_memory_unmapping`].
 pub fn title_memory_remapped(at: usize, len: usize) {
+    unguard(
+        &mut guards(),
+        at / BLOCK,
+        at.saturating_add(len).div_ceil(BLOCK),
+        true,
+    );
+}
+
+/// The runtime unmaps title memory `[at, at + len)` with `unmap`. Armed
+/// blocks keep what they held, and nothing of the range is guarded or
+/// armed after, though a copy may guard it again while `unmap` runs: a
+/// block left guarded with nothing mapped would be armed and read in place.
+/// Copies reading armed blocks in place and arming wait for it.
+pub fn title_memory_unmapping<R>(at: usize, len: usize, unmap: impl FnOnce() -> R) -> R {
     let _mapping = MAPPING.write().unwrap_or_else(|e| e.into_inner());
-    let mut g = guards();
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    // Armed blocks keep what they held (the runtime calls this before it
-    // unmaps a view, and guarded blocks are mapped), and are armed no more:
-    // their bytes come from the saved copy alone.
-    for (a, b) in g.protected.within(from, to) {
-        save(&mut g, a, b);
+    unguard(&mut guards(), from, to, true);
+    let unmapped = unmap();
+    unguard(&mut guards(), from, to, false);
+    unmapped
+}
+
+/// Blocks `[from, to)` are guarded and armed no more; armed blocks still
+/// `mapped` keep what they held, saved first.
+fn unguard(g: &mut Guards, from: usize, to: usize, mapped: bool) {
+    if mapped {
+        for (a, b) in g.protected.within(from, to) {
+            save(g, a, b);
+        }
     }
     g.armed.remove(from, to);
     g.protected.remove(from, to);
@@ -1014,6 +1039,51 @@ mod tests {
         title_memory_remapped(v, 4 * BLOCK);
         // The view stays: the journal keeps its pages, which another test
         // given the same addresses would read as its own.
+    }
+
+    /// A block a copy guards again while the runtime unmaps it is left
+    /// unguarded after, so no copy arms it and reads it in place.
+    #[test]
+    fn unmapped_blocks_are_left_unguarded() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, PAGE_NOACCESS, UnmapViewOfFile, VirtualAlloc,
+        };
+        let _serial = serial();
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let v = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(v, 0);
+        forget_asked();
+        let (now, _) = writes(v, v + 2 * BLOCK, true).expect("view memory");
+        let b = v / BLOCK;
+        title_memory_unmapping(v, 2 * BLOCK, || {
+            // A copy asks again before the view goes: guarded again.
+            forget_asked();
+            writes(v, v + 2 * BLOCK, true).expect("view memory");
+            assert_eq!(guards().protected.within(b, b + 2), vec![(b, b + 2)]);
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
+        });
+        assert!(guards().protected.within(b, b + 2).is_empty());
+        let (_, loose) = arm(v, v + 2 * BLOCK, |_| now);
+        assert_eq!(loose, vec![(b, b + 2)]);
+        assert!(guards().armed.within(b, b + 2).is_empty());
+        // The addresses stay taken: the journal keeps their pages, which
+        // another test given them would read as its own.
+        // SAFETY: a reservation of the free range.
+        let kept = unsafe { VirtualAlloc(v as *const _, 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!kept.is_null());
     }
 
     /// Committed memory is told by the working set where it answers (view

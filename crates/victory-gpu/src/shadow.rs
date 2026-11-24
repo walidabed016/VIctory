@@ -1787,9 +1787,10 @@ pub(crate) mod tests {
     fn unmap(views: &[usize]) {
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &v in views {
-            crate::watch::title_memory_remapped(v, 64 * MIB);
             // SAFETY: a view [`views`] mapped.
-            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
+            crate::watch::title_memory_unmapping(v, 64 * MIB, || unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ })
+            });
         }
     }
 
@@ -2184,12 +2185,11 @@ pub(crate) mod tests {
             unsafe { (a as *mut u32).write(word(a)) };
         }
         measure("a view (guarded)", view);
-        crate::watch::title_memory_remapped(view, 48 * MIB);
         // SAFETY: our view.
-        unsafe {
+        crate::watch::title_memory_unmapping(view, 48 * MIB, || unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: view as *mut _,
             })
-        };
+        });
     }
 }

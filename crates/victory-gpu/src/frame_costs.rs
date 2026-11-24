@@ -262,12 +262,11 @@ fn world_frame() {
         at += len;
     }
     for (at, len) in maps {
-        crate::watch::title_memory_remapped(at, len);
         // SAFETY: our views.
-        unsafe {
+        crate::watch::title_memory_unmapping(at, len, || unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: at as *mut _,
             })
-        };
+        });
     }
 }

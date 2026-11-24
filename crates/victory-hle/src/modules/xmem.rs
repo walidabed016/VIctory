@@ -838,17 +838,18 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
+        victory_gpu::title_memory_unmapping(at, size, || {
+            // SAFETY: a view we mapped; it becomes a placeholder again.
+            unsafe {
+                UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: at as *mut c_void,
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                )
+            }
+        });
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
