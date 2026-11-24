@@ -4497,6 +4497,44 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_absdiff_i32" => {
+                // |a - b| of the wrapped difference; SCC is set below as for
+                // the other results (nonzero).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let z = self.s.m.i32(0);
+                let t = self.s.m.bin(c, Bin::Sub, a, b);
+                let neg = self.s.m.cmp(c, pred::SLT, t, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, t);
+                (self.s.m.select(c, neg, n, t), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // The low half of the result is half of src0 (low for ll and
+                // lh, high for hh), the high half the one of src1 (low for ll,
+                // high otherwise).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low, high) = (
+                    self.s.m.i32(16),
+                    self.s.m.i32(0xFFFF),
+                    self.s.m.i32(0xFFFF_0000),
+                );
+                let lo_half = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low)
+                };
+                let hi_half = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, lo_half, hi_half), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -10936,6 +10974,34 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn scalar_pack_extend_and_absdiff_lower() {
+        // Each computes into s2 from two constants and branches on it (only
+        // code with an effect needs its operands).
+        let head = [
+            0xBE80_0387, // s_mov_b32 s0, 7
+            0xBE81_0383, // s_mov_b32 s1, 3
+        ];
+        let tail = [
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let ops = [
+            0x9602_0100, // s_absdiff_i32 s2, s0, s1
+            0xBE82_1901, // s_sext_i32_i8 s2, s1
+            0xBE82_1A01, // s_sext_i32_i16 s2, s1
+            0x9902_0100, // s_pack_ll_b32_b16 s2, s0, s1
+            0x9982_0100, // s_pack_lh_b32_b16 s2, s0, s1
+            0x9A02_0100, // s_pack_hh_b32_b16 s2, s0, s1
+        ];
+        for op in ops {
+            let words: Vec<u32> = head.iter().chain(&[op]).chain(&tail).copied().collect();
+            lowers(&words).unwrap();
+        }
     }
 
     #[test]
