@@ -651,6 +651,19 @@ pub(crate) mod seen {
         seen.sort_by_key(|(_, s)| std::cmp::Reverse(changes(s)));
         for (at, s) in seen.iter().take(lines).filter(|(_, s)| changes(s) > 0) {
             line("changing", *at, s);
+            // Which title buffer's copy holds its memory: shaders writing it
+            // change the memory through copy-back.
+            let at = *at as u64;
+            if let Some(b) = crate::shadow::find(at, s.size as u64) {
+                let (into, left) = (b.offset(at), b.left(at));
+                tracing::info!(
+                    "    in the copy of title buffer {:#x}+{:#x} ({:?}), shaders write it: {}",
+                    at - into,
+                    into + left,
+                    b.caller(),
+                    b.shaders_write()
+                );
+            }
         }
     }
 }
