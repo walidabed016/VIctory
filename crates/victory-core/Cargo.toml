@@ -14,8 +14,18 @@ serde.workspace = true
 toml.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Wdk_System_Threading"] }
 
 [features]
 # Lets `VICTORY_LOG` enable debug and trace output.

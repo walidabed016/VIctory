@@ -244,6 +244,9 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
     if EXITING.load(Ordering::SeqCst) {
         return; // our exit watchdog, or threads ending with the process
     }
+    if runs_no_title_code() {
+        return;
+    }
     // A snapshot: title code may map and attach another DLL from here.
     let notify: Vec<_> = images()
         .iter()
@@ -326,17 +329,59 @@ fn started_by_rust() -> bool {
     starts_in(unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() }, c"")
 }
 
-/// Whether `thread`'s start routine lies in the module named `module`
-/// (empty: our exe).
-fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::CStr) -> bool {
+/// Whether the calling thread never runs title code, so the title images
+/// need not hear of its start or end. It either came from
+/// `victory_core::thread::spawn_host` (host code only), or started in the
+/// host's D3D12 runtime or GPU driver, which titles cannot reach: they do
+/// not import them, and victory-gpu passes them no title code. A title's
+/// vectored exception handler (Bink2Scarlett.dll adds one) or its
+/// unhandled-exception filter can still run on such a thread. The same is
+/// true of threads started before an image was attached, which the Windows
+/// loader does not tell either.
+fn runs_no_title_code() -> bool {
+    // SAFETY: the calling thread's pseudo handle.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() };
+    let Some(start) = start_of(thread) else {
+        return false;
+    };
+    if victory_core::thread::from_spawn_host(start) {
+        return true;
+    }
+    let Some(module) = module_of(start) else {
+        return false;
+    };
+    let mut path = [0u16; 1024];
+    // SAFETY: writes at most `path.len()` characters.
+    let n = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+            module,
+            path.as_mut_ptr(),
+            path.len() as u32,
+        )
+    } as usize;
+    gpu_runtime(&String::from_utf16_lossy(&path[..n.min(path.len())]))
+}
+
+/// Whether the module at `path` is the D3D12 runtime, DXGI or a GPU
+/// driver (the driver store holds user-mode drivers).
+fn gpu_runtime(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let name = path.rsplit(['\\', '/']).next().unwrap_or_default();
+    path.contains("\\driverstore\\")
+        || [
+            "d3d12.dll",
+            "d3d12core.dll",
+            "d3d12sdklayers.dll",
+            "dxgi.dll",
+        ]
+        .contains(&name)
+}
+
+/// `thread`'s start routine, as passed to `CreateThread`.
+fn start_of(thread: windows_sys::Win32::Foundation::HANDLE) -> Option<usize> {
     use windows_sys::Wdk::System::Threading::{
         NtQueryInformationThread, ThreadQuerySetWin32StartAddress,
     };
-    use windows_sys::Win32::System::LibraryLoader::{
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        GetModuleHandleA, GetModuleHandleExW,
-    };
-
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     let status = unsafe {
@@ -348,23 +393,38 @@ fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::
             std::ptr::null_mut(),
         )
     };
+    (status == 0).then_some(start)
+}
+
+/// The module holding `address`, taking no reference to it.
+fn module_of(address: usize) -> Option<windows_sys::Win32::Foundation::HMODULE> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleHandleExW,
+    };
     let mut found = std::ptr::null_mut();
+    // SAFETY: looks up the module containing an address, taking no reference.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut found,
+        )
+    };
+    (ok != 0).then_some(found)
+}
+
+/// Whether `thread`'s start routine lies in the module named `module`
+/// (empty: our exe).
+fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::CStr) -> bool {
     let name = if module.is_empty() {
         std::ptr::null()
     } else {
         module.as_ptr().cast()
     };
-    // SAFETY: looks up the module containing an address, taking no reference.
-    status == 0
-        && unsafe {
-            GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                start as *const u16,
-                &mut found,
-            )
-        } != 0
-        // SAFETY: a module handle by name (or our exe's); no reference taken.
-        && found == unsafe { GetModuleHandleA(name) }
+    // SAFETY: a module handle by name (or our exe's); no reference taken.
+    let named = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(name) };
+    start_of(thread).and_then(module_of) == Some(named)
 }
 
 #[cfg(test)]
@@ -421,6 +481,43 @@ mod tests {
             if still_running { "KEPT" } else { "NOT KEPT" }
         );
         std::process::exit(0);
+    }
+
+    #[test]
+    fn host_threads_are_left_out_of_title_notices() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let host = sender.clone();
+        victory_core::thread::spawn_host("victory test", move || {
+            host.send(("host", super::runs_no_title_code())).unwrap();
+        })
+        .unwrap();
+        std::thread::spawn(move || sender.send(("std", super::runs_no_title_code())).unwrap());
+        let mut seen: Vec<_> = (0..2)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(10)).unwrap())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, [("host", true), ("std", false)]);
+        assert!(!super::runs_no_title_code());
+    }
+
+    #[test]
+    fn gpu_runtime_is_known_by_its_path() {
+        for (path, gpu) in [
+            (
+                r"C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_1\nvwgf2umx.dll",
+                true,
+            ),
+            (r"C:\Windows\System32\D3D12Core.dll", true),
+            (r"F:\VIctory\target\diag\D3D12\D3D12SDKLayers.dll", true),
+            (r"C:\Windows\System32\d3d12.dll", true),
+            (r"C:\Windows\System32\dxgi.dll", true),
+            (r"C:\Windows\System32\ntdll.dll", false),
+            (r"C:\Windows\System32\XAudio2_9.dll", false),
+            (r"C:\Windows\System32\d3d10warp.dll", false),
+            (r"F:\VIctory\target\diag\victory.exe", false),
+        ] {
+            assert_eq!(super::gpu_runtime(path), gpu, "{path}");
+        }
     }
 
     #[test]
