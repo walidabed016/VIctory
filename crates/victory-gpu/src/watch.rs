@@ -218,6 +218,56 @@ pub(crate) fn query(
     n
 }
 
+/// Whether `at` is view memory. A committed page of a view is shared in
+/// the working set's terms, which the system tells for the page alone
+/// (~0.3 us); asking `VirtualQuery` for every guarded asking walked the
+/// title's big views to their ends, ~0.3 s per world frame. Other pages are
+/// told apart without it where they are write-watched (private memory).
+fn view(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_MAPPED, MEMORY_BASIC_INFORMATION};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const SHARED: usize = 1 << 15;
+    // SAFETY: plain data, the address filled in below.
+    let mut page: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+    page.VirtualAddress = at as *mut _;
+    // SAFETY: one entry of the right size; the union's flags are set for
+    // valid and invalid pages alike.
+    let shared = unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            (&raw mut page).cast(),
+            size_of_val(&page) as u32,
+        ) != 0
+            && page.VirtualAttributes.Flags & SHARED != 0
+    };
+    if shared {
+        return true;
+    }
+    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    // SAFETY: room for one answer; without the reset flag nothing changes.
+    let watched = unsafe {
+        GetWriteWatch(
+            0,
+            (at & !(KERNEL_PAGE - 1)) as *const _,
+            KERNEL_PAGE,
+            (&raw mut found).cast(),
+            &mut count,
+            &mut granularity,
+        ) == 0
+    };
+    if watched {
+        return false;
+    }
+    // Pages of a view not committed yet (sections whose pages the runtime
+    // commits as the title maps them), placeholders, unwatched memory.
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    query(at, &mut info) != 0 && info.Type == MEM_MAPPED
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -243,11 +293,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let n = query(start, &mut info);
-    if n == 0 || info.Type != MEM_MAPPED {
+    if !view(start) {
         return None;
     }
     install();
@@ -527,6 +573,71 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// View memory is told apart from write-watched memory and placeholders
+    /// as `VirtualQuery` tells it, without walking regions: committed or not
+    /// (sections whose pages are committed as the title maps them), guarded
+    /// or not.
+    #[test]
+    fn view_memory_is_told_apart() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_RESERVE_PLACEHOLDER,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_NOACCESS, SEC_RESERVE, UnmapViewOfFile,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _serial = serial();
+        // SAFETY: a section of ours with its first block committed, mapped
+        // read-write; a write-watched allocation; a placeholder.
+        let (v, p, h) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let v = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            assert_eq!(
+                VirtualAlloc(v as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) as usize,
+                v
+            );
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            let h = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            (v, p, h)
+        };
+        assert!(view(v), "committed, never touched");
+        // SAFETY: the committed block of our view.
+        unsafe { (v as *mut u8).write(1) };
+        assert!(view(v + 100), "committed, touched");
+        assert!(guard(v, v + BLOCK).is_some());
+        assert!(view(v), "guarded");
+        assert!(view(v + BLOCK), "not committed");
+        assert!(!view(p), "write-watched");
+        assert!(!view(h), "a placeholder");
+        title_memory_remapped(v, 2 * BLOCK);
+        // SAFETY: ours.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            VirtualFree(h as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// A write or mapping that runs past the end of the address space (a
