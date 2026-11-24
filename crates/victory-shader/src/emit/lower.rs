@@ -4261,6 +4261,85 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                "s_bcnt0_i32_b64" => {
+                    // The count of clear bits: the set bits of the complement.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (i32t, ones) = (self.s.t.i32, self.s.m.i32(u32::MAX));
+                    let (a, b) = (
+                        self.s.m.bin(c, Bin::Xor, a, ones),
+                        self.s.m.bin(c, Bin::Xor, b, ones),
+                    );
+                    let na = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
+                    let nb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+                    let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    self.set(lo, Val::I32(r));
+                    let z = self.s.m.i32(0);
+                    let s = self.s.m.cmp(c, pred::NE, r, z);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_ff0_i32_b64" => {
+                    // The lowest clear bit, -1 for none: the lowest set bit
+                    // of the complement, as s_ff1_i32_b64.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (i32t, ones) = (self.s.t.i32, self.s.m.i32(u32::MAX));
+                    let (a, b) = (
+                        self.s.m.bin(c, Bin::Xor, a, ones),
+                        self.s.m.bin(c, Bin::Xor, b, ones),
+                    );
+                    let fa = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
+                    let fb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, b, z);
+                    let fb = self.s.m.select(c, none, fb, fb32);
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let r = self.s.m.select(c, low, fa, fb);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    // The first bit from the top of the pair (for the signed
+                    // form, the first that differs from the sign), counted
+                    // from bit 63; -1 for none. The high dword answers unless
+                    // it has no such bit; then it is all sign (or zero), and
+                    // the low dword is searched for a bit that differs from it.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let signed = name == "s_flbit_i32_i64";
+                    let fh = self.s.op(
+                        c,
+                        "unaryBits.i32",
+                        Attr::ReadNone,
+                        i32t,
+                        if signed { 34 } else { 33 },
+                        &[b],
+                    );
+                    let a = if signed {
+                        self.s.m.bin(c, Bin::Xor, a, b)
+                    } else {
+                        a
+                    };
+                    let fl = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let (z, k32, m1) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(u32::MAX));
+                    let fl32 = self.s.m.bin(c, Bin::Add, fl, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, a, z);
+                    let fl = self.s.m.select(c, none, m1, fl32);
+                    let high = self.s.m.cmp(c, pred::NE, fh, m1);
+                    let r = self.s.m.select(c, high, fh, fl);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
@@ -4416,6 +4495,18 @@ impl<'a> Lower<'a> {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
                 let a = src32(self, 0)?;
                 let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
+            "s_ff0_i32_b32" | "s_bcnt0_i32_b32" => {
+                // The same of the complement: the first clear bit (-1 for
+                // none), or the count of clear bits.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
@@ -11001,6 +11092,37 @@ mod tests {
         for op in ops {
             let words: Vec<u32> = head.iter().chain(&[op]).chain(&tail).copied().collect();
             lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_zero_counts_and_bit_scans_lower() {
+        // s_bcnt0_i32_b32/_b64, s_ff0_i32_b32/_b64, s_flbit_i32_b64 and
+        // s_flbit_i32_i64 of s0 (or the pair s[0:1]), with a branch on the
+        // result so the instruction has an effect.
+        for op in [0x0D, 0x0E, 0x11, 0x12, 0x16, 0x18] {
+            let words = [
+                0xBE80_03C1,           // s_mov_b32 s0, -1
+                0xBE81_0380,           // s_mov_b32 s1, 0
+                0xBE82_0000 | op << 8, // <op> s2, s0 (s[0:1])
+                0xBF07_8002,           // s_cmp_lg_u32 s2, 0
+                0xBF85_0001,           // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380,           // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ];
+            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x}: {e}"));
+        }
+        // The zero counts also leave "result != 0" in SCC.
+        for op in [0x0D, 0x0E] {
+            let words = [
+                0xBE80_03C1,           // s_mov_b32 s0, -1
+                0xBE81_0380,           // s_mov_b32 s1, 0
+                0xBE82_0000 | op << 8, // s_bcnt0_i32_b32/_b64 s2, s0 (s[0:1])
+                0xBF85_0001,           // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380,           // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ];
+            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x} SCC: {e}"));
         }
     }
 
