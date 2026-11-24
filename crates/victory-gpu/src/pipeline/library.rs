@@ -113,6 +113,14 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    // Diagnostics: with Aftermath on, the driver compiles every pipeline
+    // here, which is when it makes the shader debug information a crash
+    // dump's decoding needs (a stored pipeline skips the compile).
+    #[cfg(feature = "diagnostics")]
+    if crate::aftermath::on() {
+        MADE.fetch_add(1, Ordering::Relaxed);
+        return create();
+    }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);

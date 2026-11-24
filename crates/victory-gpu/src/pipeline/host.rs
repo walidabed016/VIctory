@@ -330,6 +330,8 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        #[cfg(feature = "diagnostics")]
+        crate::aftermath::shaders(stages.iter().map(|(s, _)| *s));
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();

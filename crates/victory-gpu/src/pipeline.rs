@@ -129,6 +129,39 @@ impl Shader {
     }
 }
 
+#[cfg(all(windows, test, feature = "diagnostics"))]
+impl Shader {
+    /// A shader whose translation is `code` as it stands (tests that need
+    /// host code without a console container).
+    pub(crate) fn with_code(stage: &'static str, hash: &str, code: Vec<u8>) -> Arc<Shader> {
+        use victory_shader::HwStage;
+        let hw = match stage {
+            "compute" => HwStage::Cs,
+            "pixel" => HwStage::Ps,
+            "mesh" => HwStage::Ms,
+            _ => HwStage::Vs,
+        };
+        Arc::new(Shader {
+            stage,
+            hash: hash.to_owned(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(Translated {
+                host: victory_shader::emit::HostShader {
+                    stage: hw,
+                    dxil: code,
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    view_strides: false,
+                },
+                used: Vec::new(),
+            })),
+        })
+    }
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};

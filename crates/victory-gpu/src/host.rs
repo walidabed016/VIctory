@@ -101,6 +101,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            #[cfg(feature = "diagnostics")]
+            if let Some(dump) = crate::aftermath::report() {
+                text.push_str(&format!("; Aftermath: {dump}"));
+            }
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
@@ -172,6 +176,10 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
+        // Diagnostics: GPU crash dumps (`VICTORY_AFTERMATH`), enabled before
+        // the device is made.
+        #[cfg(feature = "diagnostics")]
+        crate::aftermath::enable();
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
@@ -184,6 +192,8 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        #[cfg(feature = "diagnostics")]
+        crate::aftermath::initialize(&device, debug);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -309,6 +319,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With Aftermath on: the list's context for its event markers, which
+    /// carry the same texts.
+    #[cfg(feature = "diagnostics")]
+    marks: Option<crate::aftermath::Marks>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -472,6 +486,8 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            #[cfg(feature = "diagnostics")]
+            let marks = crate::aftermath::Marks::new(&list);
             Ok(HostList {
                 allocator,
                 list,
@@ -485,6 +501,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                marks,
             })
         }
     }
@@ -967,7 +985,8 @@ impl HostList {
     /// Notes what the command about to be recorded does, as a marker
     /// command whose text the list keeps (diagnostics, with device-removed
     /// data on): the report pairs the breadcrumbs' marker commands with the
-    /// texts in order and names the commands a fault stopped among.
+    /// texts in order and names the commands a fault stopped among. With
+    /// Aftermath on, also as an Aftermath event marker.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
         self.note(what, None);
@@ -989,6 +1008,9 @@ impl HostList {
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
+            if let Some(marks) = &self.marks {
+                marks.mark(&what);
+            }
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
@@ -999,6 +1021,8 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        } else if let Some(marks) = &self.marks {
+            marks.mark(&what());
         }
     }
 

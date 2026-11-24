@@ -121,6 +121,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_AFTERMATH=<dll>` | NVIDIA Nsight Aftermath GPU crash dumps (`GFSDK_Aftermath_Lib.x64.dll`, or its folder): on a GPU hang or fault, the dump, its shaders' debug information and the dump as JSON, and a logged summary naming the shaders, warps and offsets in flight; commands carry Aftermath markers, and pipelines are compiled, not loaded from the pipeline library |
+| `VICTORY_AFTERMATH_DIR=<dir>` | where those files go (default `aftermath` under the current folder) |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_COPY_TITLE_MEMORY=1` | title buffers of 1 MiB and more are copied to host buffers at every submission instead of used in place |
