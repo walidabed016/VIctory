@@ -1297,7 +1297,13 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            // The signature has no SV_Barycentrics (`signature` refuses that
+            // system value), so the console compiler reads these registers
+            // as data only where its value is undefined: a register it
+            // reused, for bits a shift drops or on paths no lane takes.
+            // shortcut: those reads take 0; a source read of an uninitialized
+            // variable would see the barycentric on the console.
+            Input::Barycentric { .. } => return Val::I32(self.s.m.i32(0)),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.

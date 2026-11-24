@@ -855,6 +855,110 @@ mod tests {
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
     }
 
+    /// A pixel shader whose 64-bit shift takes J (the second perspective
+    /// barycentric, v1) as the high dword of a pair and keeps only the low
+    /// dword, as the console compiler does with a register whose value it
+    /// leaves undefined. The read takes 0 and every pixel is 40. That holds
+    /// only without SV_Barycentrics in the signature, which is refused.
+    #[test]
+    #[cfg(windows)]
+    fn barycentric_registers_reused_for_undefined_data_read_as_zero() {
+        let words = [
+            0x7E00_0285u32, // v_mov_b32 v0, 5
+            0xD6FF_0002,
+            0x0002_0083, // v_lshlrev_b64 v[2:3], 3, v[0:1]
+            0x7E08_0D02, // v_cvt_f32_u32 v4, v2
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            0xBF81_0000,
+        ];
+        let el = |name: &str, kind, cols, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage,
+            half: false,
+        };
+        let emit_with = |inputs: &[SigElement], system_value: Option<u32>| {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 5,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![],
+                    // PERSP_CENTER: I and J in v0 and v1.
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let mut isg1 = super::container::signature(inputs, true);
+            if let Some(sv) = system_value {
+                // The first element's system value.
+                let base = u32::from_le_bytes(isg1[4..8].try_into().unwrap()) as usize;
+                isg1[base + 12..base + 16].copy_from_slice(&sv.to_le_bytes());
+            }
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 4, 15)], false);
+            let bytes =
+                crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+        // D3D_NAME_BARYCENTRICS.
+        let refused = emit_with(&[el("SV_Barycentrics", 0, 3, 0)], Some(23)).map(|_| ());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("a system value in the signature")),
+            "{refused:?}"
+        );
+        let ps = emit_with(&[], None).unwrap();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ps.dxil.clone()).unwrap();
+        }
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let vs = super::host::position_vs();
+        let (root, pso) = host.pipeline(&vs, &ps).unwrap();
+        let vertices = [
+            -1.0f32, -1.0, 0.5, 1.0, //
+            -1.0, 3.0, 0.5, 1.0, //
+            3.0, -1.0, 0.5, 1.0,
+        ];
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &super::host::Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (4, 4),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap();
+        assert!(texels.iter().all(|t| *t == [40.0; 4]), "{texels:?}");
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow

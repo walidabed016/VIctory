@@ -483,6 +483,50 @@ pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     Ok(stub(false, outputs))
 }
 
+/// A vertex shader passing its POSITION (four floats) on as the position.
+#[cfg(test)]
+pub fn position_vs() -> HostShader {
+    use super::bitcode::{Attr, Term};
+    let el = |name: &str, kind| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    let mut s = super::shader::Shader::new(false);
+    let b = s.entry;
+    for col in 0..4 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        let x = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), x];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.inputs.push(el("POSITION", 0));
+    s.outputs.push(SigElement {
+        interp: 4,
+        ..el("SV_Position", 3)
+    });
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: crate::native::HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        view_strides: false,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
+    }
+}
+
 /// A pixel shader that reads nothing and writes target 0.
 pub fn stub_ps() -> HostShader {
     let target = SigElement {
