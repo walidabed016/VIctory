@@ -334,3 +334,63 @@ fn scalar_loads_of_structured_views_start_at_the_first_record() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// Each lane stores dword 0 of the last record of the structured buffer of
+/// `stride` bytes at table entry 1, read with `s_buffer_load_dword` at
+/// (records - 1) * `stride`: the record count is dword 2 of the buffer's
+/// descriptor, read as a number.
+fn last_record(stride: u32) -> Vec<u32> {
+    vec![
+        0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0303,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+        0xF408_0203,
+        0xFA00_0020, // s_load_dwordx4 s[8:11], s[6:7], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x8110_C10A, // s_add_i32 s16, s10, -1
+        0x9310_FF10,
+        stride, // s_mul_i32 s16, s16, stride
+        0xF420_0444,
+        0x2000_0000, // s_buffer_load_dword s17, s[8:11], s16
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0211, // v_mov_b32 v1, s17
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8003_0103, // buffer_store_dword v1, v3, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+#[test]
+fn a_structured_views_record_count_read_from_its_descriptor_counts_its_records() {
+    const RECORDS: u32 = 5;
+    let mut failed = Vec::new();
+    for [stride, lead] in [[12, 0], [12, 8], [64, 0], [64, 12]] {
+        let shader = build_with(&last_record(stride), &[structured(stride)]);
+        let data: Vec<u32> = (0..(lead + RECORDS * stride) / 4)
+            .map(|i| 1000 + i)
+            .collect();
+        let views = [
+            View::RawUav(LANES),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ];
+        let want = vec![data[((lead + (RECORDS - 1) * stride) / 4) as usize]; LANES as usize];
+        let records = [
+            [4, 0, view_kind::RAW_UAV],
+            [stride, lead, view_kind::RAW_SRV],
+        ];
+        for (label, uavs) in run(&shader, &views, &records) {
+            if uavs[0] != want {
+                failed.push(format!(
+                    "{label} {stride}+{lead}: got {:?}, want {want:?}",
+                    uavs[0]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

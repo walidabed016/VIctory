@@ -3785,20 +3785,28 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // How the program uses the descriptor tells the view's kind: a
+        // vector memory or image access best, else a scalar buffer load.
+        let uses: Vec<(Site, u8)> = self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
+            .filter_map(|d| {
                 d.source.leaves().into_iter().find_map(|l| match *l {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
-            });
-        let Some((at, first)) = use_at else {
+            })
+            .collect();
+        let scalar = |at: Site| {
+            matches!(
+                self.x.p.blocks[at.0].insts[at.1].fields,
+                Fields::Smem { .. }
+            )
+        };
+        let Some(&(at, first)) = uses.iter().find(|u| !scalar(u.0)).or(uses.first()) else {
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -3840,6 +3848,23 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            // Scalar buffer loads read the raw view the host makes of a
+            // buffer view: its descriptor counts the records of a structured
+            // view (the used-resource entry's stride), the bytes of a raw one.
+            Fields::Smem { .. } => {
+                let stride = match used {
+                    Some(u) if u.kind != ResourceType::Cbv => u.stride,
+                    Some(_) => return Err("a constant buffer's descriptor read as data"),
+                    None => return Err("a scalar memory read as data"),
+                };
+                if stride != 0 {
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a record count of a stride off whole dwords");
+                    }
+                    records = Some(Some(stride));
+                }
+                ((11 | u, 0), None)
             }
             _ => return Err("a scalar memory read as data"),
         };
