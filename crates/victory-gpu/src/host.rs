@@ -1657,6 +1657,15 @@ impl Meter {
                     "indirect records run per frame: mesh {:.0} with groups, {:.0} empty; draws {:.0}, {:.0} empty; dispatches {:.0}, {:.0} empty",
                     seen[0], seen[1], seen[2], seen[3], seen[4], seen[5]
                 );
+                let heap = crate::draw::HEAP_SLOTS
+                    .each_ref()
+                    .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "heap slots per frame: {:.0} made through user data; {:.0} stages bound with {:.0} heap accesses whose slot only the shader knows",
+                    heap[0],
+                    heap[1],
+                    heap[2]
+                );
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

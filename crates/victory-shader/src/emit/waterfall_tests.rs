@@ -91,6 +91,8 @@ fn lower_cs(words: &[u32], buffers: bool) -> (HostShader, u32, bool) {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         view_strides: lowered.view_strides,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

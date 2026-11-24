@@ -163,6 +163,8 @@ fn build_cs(body: &[u32], lds_granules: u32, threads: u32) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         view_strides: lowered.view_strides,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

@@ -6,7 +6,7 @@
 //! run on the host GPU and WARP against views of each kind.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, lower, validator, view_kind};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -72,6 +72,8 @@ fn build(words: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         view_strides: lowered.view_strides,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -83,13 +85,13 @@ fn build(words: &[u32]) -> HostShader {
 }
 
 /// Runs `shader` with `views` at heap indices 0.. and their `records`
-/// (stride and lead, one per view) on the hardware GPU and on WARP (each
+/// (stride, lead and kind, one per view) on the hardware GPU and on WARP (each
 /// skipped without a device): per one that ran, each UAV's dwords in heap
 /// order.
 fn run(
     shader: &HostShader,
     views: &[View],
-    records: &[[u32; 2]],
+    records: &[[u32; 3]],
 ) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -117,7 +119,7 @@ fn run(
                             1,
                             Root::View {
                                 srv: true,
-                                data: records.concat(),
+                                data: records.iter().flat_map(|&[s, l, k]| [s, l, k, 0]).collect(),
                             },
                         ),
                     ],
@@ -192,7 +194,11 @@ fn indexed_loads_read_records_of_the_views_own_stride() {
             },
         ];
         let want = loaded(&data[lead as usize / 4..], stride);
-        for (label, uavs) in run(&shader, &views, &[[4, 0], [stride, lead]]) {
+        let records = [
+            [4, 0, view_kind::RAW_UAV],
+            [stride, lead, view_kind::RAW_SRV],
+        ];
+        for (label, uavs) in run(&shader, &views, &records) {
             if uavs[0] != want {
                 failed.push(format!(
                     "{label} {stride}+{lead}: got {:?}, want {want:?}",
@@ -238,7 +244,11 @@ fn indexed_stores_and_atomics_write_records_of_the_views_own_stride() {
         for record in 0..4 {
             want[at(record, 2)] = LANES / 4;
         }
-        for (label, uavs) in run(&shader, &views, &[[4, 0], [stride, lead]]) {
+        let records = [
+            [4, 0, view_kind::RAW_UAV],
+            [stride, lead, view_kind::RAW_UAV],
+        ];
+        for (label, uavs) in run(&shader, &views, &records) {
             if uavs[1] != want {
                 failed.push(format!(
                     "{label} {stride}+{lead}: got {:?}, want {want:?}",

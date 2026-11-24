@@ -74,6 +74,13 @@ struct Tally {
     /// How emitted wave64 compute programs' waves run (see
     /// `emit::Waves`) → programs, and the first one.
     waves: BTreeMap<String, (usize, String)>,
+    /// Emitted programs that reach view-heap slots through user data
+    /// without a used-resource entry (see `emit::HeapIndex`), those slots
+    /// by form, and heap descriptor accesses whose slot only the running
+    /// shader knows, by reason → (accesses, programs, the first one).
+    heap_programs: usize,
+    heap_forms: BTreeMap<String, usize>,
+    heap_unknown: BTreeMap<&'static str, (usize, usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -142,6 +149,15 @@ impl Tally {
         }
         for (how, (n, example)) in other.waves {
             self.waves.entry(how).or_insert((0, example)).0 += n;
+        }
+        self.heap_programs += other.heap_programs;
+        for (form, n) in other.heap_forms {
+            *self.heap_forms.entry(form).or_default() += n;
+        }
+        for (why, (n, programs, example)) in other.heap_unknown {
+            let e = self.heap_unknown.entry(why).or_insert((0, 0, example));
+            e.0 += n;
+            e.1 += programs;
         }
     }
 }
@@ -283,6 +299,19 @@ pub fn run(
     for (how, (n, example)) in &t.waves {
         println!("  {n:>7}  {how}  (e.g. {example})");
     }
+    println!(
+        "heap slots   {} emitted programs reach {} view-heap slots through user data \
+         without a used-resource entry; {} accesses' slots only the shader knows:",
+        t.heap_programs,
+        t.heap_forms.values().sum::<usize>(),
+        t.heap_unknown.values().map(|u| u.0).sum::<usize>()
+    );
+    for (form, n) in &t.heap_forms {
+        println!("  {n:>7}  {form}");
+    }
+    for (why, (n, programs, example)) in &t.heap_unknown {
+        println!("  {n:>7}  {why} ({programs} programs, e.g. {example})");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -417,6 +446,7 @@ fn translate(
                                 }
                                 t.waves.entry(how).or_insert_with(|| (0, label())).0 += 1;
                             }
+                            tally_heap(&shader, &emit::heap_indices(&program, &p, &r), t, &label);
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -659,6 +689,67 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             .or_default() += 1;
     }
     t.unlisted += traced.difference(&listed).count();
+}
+
+/// The view-heap slots an emitted program reaches through user data, by
+/// form, and its heap accesses whose slot only the shader knows.
+fn tally_heap(
+    shader: &emit::HostShader,
+    heaps: &emit::HeapIndices,
+    t: &mut Tally,
+    label: &impl Fn() -> String,
+) {
+    let root = |d: u32| {
+        shader
+            .user_data
+            .iter()
+            .find(|u| u.index == d)
+            .map(|u| u.root)
+    };
+    let mut forms = Vec::new();
+    for h in &heaps.known {
+        let term = |t: &emit::HeapTerm| {
+            let masked = if t.mask == u32::MAX {
+                String::new()
+            } else {
+                format!(" & {:#x}", t.mask)
+            };
+            match (root(t.user_data), t.scale) {
+                (Some(RootType::Table), 1) if masked.is_empty() => "a table entry".to_owned(),
+                (Some(RootType::Constants), 32) => format!("a root constant{masked} as the index"),
+                (r, scale) => format!("{r:?}{masked} times {scale}"),
+            }
+        };
+        let form = match &h.terms[..] {
+            [] => "a constant slot".to_owned(),
+            terms => terms.iter().map(term).collect::<Vec<_>>().join(" plus "),
+        };
+        let write = if h.write { " (written)" } else { "" };
+        forms.push(format!("{form}{write}"));
+        *t.heap_forms.entry(form).or_default() += 1;
+    }
+    if !heaps.known.is_empty() {
+        t.heap_programs += 1;
+    }
+    let mut seen = Vec::new();
+    for &why in &heaps.unknown {
+        let e = t.heap_unknown.entry(why).or_insert_with(|| (0, 0, label()));
+        e.0 += 1;
+        if !seen.contains(&why) {
+            seen.push(why);
+            e.1 += 1;
+        }
+    }
+    if t.list && (!forms.is_empty() || !heaps.unknown.is_empty()) {
+        t.lines.push(format!(
+            "{}  heap: {} slots [{}], {} unknown {:?}",
+            label(),
+            forms.len(),
+            forms.join(", "),
+            heaps.unknown.len(),
+            seen
+        ));
+    }
 }
 
 fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Tally) {

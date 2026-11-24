@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HeapIndex, HeapTerm, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -211,6 +211,18 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.view_strides));
+    word(&mut out, s.heap_indices.len() as u32);
+    for h in &s.heap_indices {
+        word(&mut out, h.terms.len() as u32);
+        for t in &h.terms {
+            word(&mut out, t.user_data);
+            word(&mut out, t.mask);
+            word(&mut out, t.scale);
+        }
+        word(&mut out, h.offset);
+        word(&mut out, u32::from(h.write));
+    }
+    word(&mut out, s.heap_unknown);
     out
 }
 
@@ -272,6 +284,29 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         1 => true,
         _ => return None,
     };
+    let n = r.word()? as usize;
+    let mut heap_indices = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let terms = (0..r.word()?.min(16))
+            .map(|_| {
+                Some(HeapTerm {
+                    user_data: r.word()?,
+                    mask: r.word()?,
+                    scale: r.word()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        heap_indices.push(HeapIndex {
+            terms,
+            offset: r.word()?,
+            write: match r.word()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+        });
+    }
+    let heap_unknown = r.word()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -281,6 +316,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         view_strides,
+        heap_indices,
+        heap_unknown,
     })
 }
 
@@ -308,6 +345,34 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             view_strides: true,
+            heap_indices: vec![
+                HeapIndex {
+                    terms: vec![HeapTerm {
+                        user_data: 6,
+                        mask: u32::MAX,
+                        scale: 32,
+                    }],
+                    offset: 0,
+                    write: false,
+                },
+                HeapIndex {
+                    terms: vec![
+                        HeapTerm {
+                            user_data: 4,
+                            mask: u32::MAX,
+                            scale: 1,
+                        },
+                        HeapTerm {
+                            user_data: 5,
+                            mask: 0x3ff,
+                            scale: 32,
+                        },
+                    ],
+                    offset: 96,
+                    write: true,
+                },
+            ],
+            heap_unknown: 3,
         }
     }
 

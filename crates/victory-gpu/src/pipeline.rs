@@ -155,6 +155,8 @@ impl Shader {
                     root_cbvs: Vec::new(),
                     root_srvs: Vec::new(),
                     view_strides: false,
+                    heap_indices: Vec::new(),
+                    heap_unknown: 0,
                 },
                 used: Vec::new(),
             })),

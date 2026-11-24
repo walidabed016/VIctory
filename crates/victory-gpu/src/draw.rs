@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::HostShader;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -130,6 +131,16 @@ static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
+
+/// Since the last frame line (diagnostics): view-heap slots made through
+/// user data for draws and dispatches ([`State::heap_slots`]), stages bound
+/// with heap accesses whose slot only the running shader knows (an index
+/// loaded from memory or chosen per lane), and those accesses. The host
+/// cannot make those slots for the draw: buffer views there read zeros
+/// unless a table entry made them.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_SLOTS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
@@ -473,17 +484,17 @@ impl State {
                 crate::pipeline::note_why("no dynamic slots for its tables".to_owned());
                 return false;
             }
+            let mut values = vec![0u32; stage.user_data.map_or(0, |u| u.1) as usize];
+            for u in &t.host.user_data {
+                let fresh = made
+                    .iter()
+                    .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                values[u.index as usize] = match fresh {
+                    Some(&(_, offset)) => offset,
+                    None => self.user_value(compute, u.slot, u.root, u.dword),
+                };
+            }
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
-                for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
-                    };
-                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -493,6 +504,7 @@ impl State {
                     }
                 }
             }
+            self.heap_slots(list, &values, &t.host);
             if let Some(param) = stage.view_strides {
                 // The record strides of the view heap the shader indexes.
                 let strides = (self.heaps[0] != 0)
@@ -640,6 +652,44 @@ impl State {
         }
     }
 
+    /// The view-heap slots a stage reaches through its user data that no
+    /// used-resource entry names (a descriptor index in a root constant,
+    /// say; see `victory_shader::emit::HeapIndex`), made for the draw with
+    /// their data as table entries are: buffer views get host slots only
+    /// for draws that read them. `values` is the stage's user data.
+    fn heap_slots(&self, list: &HostList, values: &[u32], shader: &HostShader) {
+        #[cfg(feature = "diagnostics")]
+        if shader.heap_unknown > 0 {
+            HEAP_SLOTS[1].fetch_add(1, Ordering::Relaxed);
+            HEAP_SLOTS[2].fetch_add(u64::from(shader.heap_unknown), Ordering::Relaxed);
+        }
+        if shader.heap_indices.is_empty() || self.heaps[0] == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let Some(host) = heap.host() else {
+            return;
+        };
+        for h in &shader.heap_indices {
+            // Dynamic slots (of tables made afresh) are made with the table.
+            let slot = h.slot(values);
+            let Some(handle) = heap.handle(slot).filter(|_| slot < host.count()) else {
+                continue;
+            };
+            let Some(view) = host.mirror(slot, handle, true) else {
+                continue;
+            };
+            #[cfg(feature = "diagnostics")]
+            HEAP_SLOTS[0].fetch_add(1, Ordering::Relaxed);
+            let kind = if h.write {
+                ResourceType::Uav
+            } else {
+                ResourceType::Srv
+            };
+            readable(list, kind, &view);
+        }
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -652,7 +702,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+            readable(list, u.kind, &view);
         }
     }
 
@@ -739,7 +789,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u.kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -774,7 +824,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u.kind, &view);
                         }
                     }
                     None => {
@@ -1144,9 +1194,9 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
-/// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// Gets what a shader reads (`kind` SRV) or writes (UAV) through a view
+/// ready: buffer data copied, textures moved to the state they need.
+fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1158,11 +1208,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
-        if u.kind == ResourceType::Uav {
+        if kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
         }
     }
-    match (view, u.kind) {
+    match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)

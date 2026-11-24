@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use victory_shader::emit::{VIEW_RECORD_BYTES, view_kind};
+
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
@@ -33,12 +35,14 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
-    /// Two dwords per slot for translated shaders' indexed accesses through
-    /// heap descriptors (`victory_shader::emit::VIEW_STRIDE_SPACE`): the
-    /// record stride of the slot's view ([`record_stride`]) and the bytes
-    /// its host view starts before the first record ([`raw_elements`]). An
-    /// upload buffer and its mapping; none in sampler heaps, or if the host
-    /// would not make it.
+    /// A record per slot (`VIEW_RECORD_BYTES`) for translated shaders'
+    /// accesses through heap descriptors
+    /// (`victory_shader::emit::VIEW_STRIDE_SPACE`): the record stride of
+    /// the slot's view ([`record_stride`]), the bytes its host view starts
+    /// before the first record ([`raw_elements`]) and the kind of view the
+    /// host made there (`view_kind`), which accesses no used-resource entry
+    /// names go by. An upload buffer and its mapping; none in sampler
+    /// heaps, or if the host would not make it.
     strides: Option<(ID3D12Resource, usize)>,
 }
 
@@ -143,11 +147,11 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        // Zeroed: no slot holds a buffer view yet.
+        // Zeroed: no slot holds a view yet (`view_kind::NONE`).
         let strides = if sampler {
             None
         } else {
-            host.upload_buffer(u64::from(count + extra) * 8)
+            host.upload_buffer(u64::from(count + extra) * u64::from(VIEW_RECORD_BYTES))
                 .map(|(buffer, data)| (buffer, data as usize))
         };
         let h = HostHeap {
@@ -300,8 +304,10 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        let record = kept.as_ref().map_or([0, 0], |k| [record_stride(view), k.1]);
-        self.keep(index, kept.and_then(|k| k.0), record);
+        let record = kept
+            .as_ref()
+            .map_or([0; 3], |k| [record_stride(view), k.lead, k.kind]);
+        self.keep(index, kept.and_then(|k| k.resource), record);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -311,24 +317,24 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, None, [0, 0]);
+        self.keep(index, None, [0; 3]);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's), in
-    /// records of `record[0]` bytes from byte `record[1]` of its host view
-    /// (see [`HostHeap::strides`]).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>, record: [u32; 2]) {
+    /// records of `record[0]` bytes from byte `record[1]` of its host view,
+    /// a view of kind `record[2]` (see [`HostHeap::strides`]).
+    fn keep(&self, index: u32, resource: Option<ID3D12Resource>, record: [u32; 3]) {
         use std::sync::atomic::{AtomicU32, Ordering};
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             *slot = resource;
             if let Some((_, data)) = self.strides {
-                // SAFETY: the slot's two dwords of the mapped buffer;
-                // shaders read them only.
+                // SAFETY: the slot's record in the mapped buffer; shaders
+                // read it only.
                 let at = unsafe {
                     std::slice::from_raw_parts(
-                        (data as *const AtomicU32).add(2 * index as usize),
-                        2,
+                        (data as *const AtomicU32).add((VIEW_RECORD_BYTES / 4 * index) as usize),
+                        3,
                     )
                 };
                 for (at, word) in at.iter().zip(record) {
@@ -349,7 +355,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None, [0, 0]);
+        self.keep(index, None, [0, 0, view_kind::CBV]);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -415,8 +421,8 @@ impl HostHeap {
             }
             let record = kept
                 .as_ref()
-                .map_or([0, 0], |k| [record_stride(&view), k.1]);
-            self.keep(index, kept.and_then(|k| k.0), record);
+                .map_or([0; 3], |k| [record_stride(&view), k.lead, k.kind]);
+            self.keep(index, kept.and_then(|k| k.resource), record);
         }
         Some(view)
     }
@@ -592,9 +598,25 @@ fn raw_elements(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64
     ))
 }
 
-/// What a slot made by [`make`] holds: the host resource it views, if
-/// any, and the lead of a raw view of a structured one ([`raw_elements`]).
-type Kept = (Option<ID3D12Resource>, u32);
+/// What a slot made by [`make`] holds.
+struct Kept {
+    /// The host resource it views, if any.
+    resource: Option<ID3D12Resource>,
+    /// The lead of a raw view of a structured one ([`raw_elements`]).
+    lead: u32,
+    /// The kind of view (`view_kind`).
+    kind: u32,
+}
+
+impl Kept {
+    fn of(resource: &ID3D12Resource, kind: u32) -> Option<Kept> {
+        Some(Kept {
+            resource: Some(resource.clone()),
+            lead: 0,
+            kind,
+        })
+    }
+}
 
 fn buffer_srv(
     address: u64,
@@ -637,13 +659,22 @@ fn buffer_srv(
     } else {
         buffer.FirstElement += offset / element;
     }
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some((Some(shadow.buffer.clone()), lead))
+    Some(Kept {
+        resource: Some(shadow.buffer.clone()),
+        lead,
+        kind: if raw {
+            view_kind::RAW_SRV
+        } else {
+            view_kind::TYPED_SRV
+        },
+    })
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -695,13 +726,22 @@ fn buffer_uav(
     } else {
         buffer.FirstElement += offset / element;
     }
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some((Some(shadow.buffer.clone()), lead))
+    Some(Kept {
+        resource: Some(shadow.buffer.clone()),
+        lead,
+        kind: if raw {
+            view_kind::RAW_UAV
+        } else {
+            view_kind::TYPED_UAV
+        },
+    })
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -779,7 +819,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some((Some(shadow.buffer.clone()), 0))
+            Kept::of(&shadow.buffer, view_kind::CBV)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -796,7 +836,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some((Some(texture.clone()), 0))
+                Kept::of(texture, view_kind::TEXTURE)
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -828,7 +868,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some((Some(texture.clone()), 0))
+            Kept::of(texture, view_kind::TEXTURE_UAV)
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -839,13 +879,21 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some((None, 0))
+            Some(Kept {
+                resource: None,
+                lead: 0,
+                kind: view_kind::NONE,
+            })
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some((None, 0))
+            Some(Kept {
+                resource: None,
+                lead: 0,
+                kind: view_kind::NONE,
+            })
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
@@ -1154,7 +1202,7 @@ mod tests {
         assert_eq!(raw_elements(0, 2, 3, 6), Some((0, 7, 12)));
     }
 
-    /// Each slot's record stride and lead follow what is made there;
+    /// Each slot's record stride, lead and kind follow what is made there;
     /// samplers have none.
     #[test]
     fn slots_keep_the_record_stride_of_their_view() {
@@ -1164,16 +1212,23 @@ mod tests {
         let (_, gpu) = heap.strides().expect("a view heap has record strides");
         assert_ne!(gpu, 0);
         let data = heap.strides.as_ref().map_or(0, |s| s.1);
-        // SAFETY: dwords of the mapped buffer, two per slot.
-        let read = |i: u32| unsafe { (data as *const [u32; 2]).add(i as usize).read_volatile() };
+        // SAFETY: dwords of the mapped buffer, a record per slot.
+        let read = |i: u32| unsafe { (data as *const [u32; 4]).add(i as usize).read_volatile() };
         let last = heap.count + heap.dynamic - 1;
-        heap.keep(2, None, [12, 8]);
-        heap.keep(last, None, [64, 0]);
-        assert_eq!((read(0), read(2), read(last)), ([0, 0], [12, 8], [64, 0]));
+        heap.keep(2, None, [12, 8, view_kind::RAW_SRV]);
+        heap.keep(last, None, [64, 0, view_kind::RAW_UAV]);
+        assert_eq!(
+            (read(0), read(2), read(last)),
+            (
+                [0; 4],
+                [12, 8, view_kind::RAW_SRV, 0],
+                [64, 0, view_kind::RAW_UAV, 0]
+            )
+        );
         heap.make_null(2);
-        assert_eq!(read(2), [0, 0]);
+        assert_eq!(read(2), [0; 4]);
         heap.constant_at(last, 0, 256);
-        assert_eq!(read(last), [0, 0]);
+        assert_eq!(read(last), [0, 0, view_kind::CBV, 0]);
         let samplers = HostHeap::new(true, 4).expect("a sampler heap");
         assert!(samplers.strides().is_none());
     }

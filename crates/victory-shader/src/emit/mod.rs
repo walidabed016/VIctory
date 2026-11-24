@@ -53,9 +53,9 @@
 //!   (`idxen` dword loads, stores, atomics) goes to the raw view the host
 //!   makes of every untyped buffer view (structured ones included) at byte
 //!   index * stride + offset, plus the view's lead for a heap descriptor.
-//!   Dwords `2i` and `2i + 1` of a raw root SRV `t0` in
-//!   [`VIEW_STRIDE_SPACE`] ([`HostShader::view_strides`]) hold the view at
-//!   heap index `i`'s element size, which is what the console descriptor's
+//!   Dwords `4i`, `4i + 1` and `4i + 2` of a raw root SRV `t0` in
+//!   [`VIEW_STRIDE_SPACE`] ([`HostShader::view_strides`], records of
+//!   [`VIEW_RECORD_BYTES`]) hold the view at heap index `i`'s element size, which is what the console descriptor's
 //!   stride field holds (a structured view's `StructureByteStride`, a typed
 //!   view's format size, 4 for a raw view, 0 where no buffer view is), and
 //!   its lead: the bytes its host raw view starts before the first record
@@ -64,7 +64,26 @@
 //!   at run time (a descriptor the program reads from the heap itself,
 //!   `ResourceDescriptorHeap[i]` in HLSL). Grand Theft Auto VI's instance
 //!   culling and ray-tracing material resolves read their instance and
-//!   geometry records this way.
+//!   geometry records this way. Dword `4i + 2` is the kind of view the host
+//!   made there ([`view_kind`]: none, CBV, raw or typed buffer SRV or UAV,
+//!   texture SRV or UAV; structured views count as raw, as the host makes
+//!   them).
+//! * **Heap slots by kind** (added 2026-11-24): a buffer access
+//!   (`s_buffer_load_dword*`, `buffer_*`) through a heap descriptor no
+//!   used-resource entry names (an index in a root constant or in memory)
+//!   reads its slot's kind first and branches to a handle of that kind: a
+//!   constant buffer, a raw buffer (with the view's lead) SRV or UAV, or a
+//!   typed one for typed accesses. A slot of another kind reads zeros and
+//!   drops writes. A handle of another kind than the slot's view is
+//!   undefined (a constant buffer read of a buffer SRV hangs NVIDIA GPUs:
+//!   Grand Theft Auto VI's meshlet culling). Accesses a used-resource entry
+//!   names keep the handle its kind gives.
+//! * **Heap slots through user data** (added 2026-11-24,
+//!   [`HostShader::heap_indices`]): the slots a shader reaches through its
+//!   user data without a used-resource entry, as each slot's user-data
+//!   dwords, masks, scales and offset; the host makes them, with their
+//!   data, for each draw or dispatch. Slots whose index each lane loads, or
+//!   the shader loads from memory, are counted ([`HostShader::heap_unknown`]).
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
@@ -98,8 +117,11 @@ mod diff_tests;
 mod halves;
 #[cfg(all(test, windows))]
 mod halves_tests;
+mod heap;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod kind_tests;
 mod lower;
 mod sampler;
 mod shader;
@@ -117,8 +139,11 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use heap::{HeapIndices, heap_indices};
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDE_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_RECORD_BYTES, VIEW_STRIDE_SPACE, view_kind,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -181,6 +206,45 @@ pub struct HostShader {
     /// in [`VIEW_STRIDE_SPACE`] over two dwords (stride and lead) per slot
     /// of the view heap it indexes (see the module notes).
     pub view_strides: bool,
+    /// The view-heap slots the shader reaches through its user data that no
+    /// used-resource entry names (see [`HeapIndex`]): the host makes them,
+    /// with their data, for each draw or dispatch.
+    pub heap_indices: Vec<HeapIndex>,
+    /// Heap descriptor accesses whose slot the host cannot know (each lane
+    /// loads its descriptor, or its index from memory).
+    pub heap_unknown: u32,
+}
+
+/// A view-heap slot as the user data gives it: `(offset + the sum of the
+/// terms) >> 5`, modulo 2^32 before the shift (descriptors are 32 bytes on
+/// the console). A heap index in root constant `u` is one term of `u`
+/// times 32, the second entry of a table at `t` one term of `t` times 1
+/// with offset 32.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapIndex {
+    pub terms: Vec<HeapTerm>,
+    pub offset: u32,
+    /// Whether the shader writes through it (stores, atomics).
+    pub write: bool,
+}
+
+/// A user-data dword (as [`UserData::index`]) AND `mask`, times `scale`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapTerm {
+    pub user_data: u32,
+    pub mask: u32,
+    pub scale: u32,
+}
+
+impl HeapIndex {
+    /// The slot, from the user data the shader reads (by dword).
+    pub fn slot(&self, user_data: &[u32]) -> u32 {
+        let at = self.terms.iter().fold(self.offset, |at, t| {
+            let value = user_data.get(t.user_data as usize).copied().unwrap_or(0);
+            at.wrapping_add((value & t.mask).wrapping_mul(t.scale))
+        });
+        at >> 5
+    }
 }
 
 impl HostShader {
@@ -329,6 +393,7 @@ pub fn emit_with_waves(
         }
         _ => 0,
     };
+    let heaps = heap_indices(p, native, res);
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -360,6 +425,8 @@ pub fn emit_with_waves(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         view_strides: l.view_strides,
+        heap_indices: heaps.known,
+        heap_unknown: heaps.unknown.len() as u32,
     };
     Ok((shader, l.waves))
 }
@@ -470,6 +537,34 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    /// A heap index's slot is its offset plus each term's masked user-data
+    /// dword times its scale, in bytes of 32 per slot, modulo 2^32; user
+    /// data past the stage's reads as 0.
+    #[test]
+    fn heap_indices_give_the_slot_their_user_data_names() {
+        use super::{HeapIndex, HeapTerm};
+        let h = HeapIndex {
+            terms: vec![
+                HeapTerm {
+                    user_data: 1,
+                    mask: 0x3ff,
+                    scale: 32,
+                },
+                HeapTerm {
+                    user_data: 0,
+                    mask: u32::MAX,
+                    scale: 1,
+                },
+            ],
+            offset: 32,
+            write: false,
+        };
+        assert_eq!(h.slot(&[0, 7]), 8);
+        assert_eq!(h.slot(&[64, 0xABC0_0007]), 10);
+        assert_eq!(h.slot(&[0u32.wrapping_sub(64), 7]), 6);
+        assert_eq!(h.slot(&[96]), 4);
     }
     use super::container::SigElement;
     use super::shader::Shader;
@@ -619,6 +714,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             view_strides: false,
+            heap_indices: Vec::new(),
+            heap_unknown: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -630,6 +727,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 view_strides: false,
+                heap_indices: Vec::new(),
+                heap_unknown: 0,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

@@ -33,6 +33,20 @@ pub struct Address {
     pub dynamic: Option<Value>,
 }
 
+/// A scalar the program computes from at most one root parameter dword:
+/// that dword as the user data holds it (a constant, or a table's byte
+/// offset in its heap) AND `mask`, times `scale`, plus `offset`, modulo
+/// 2^32. How a root constant (or a table offset) becomes a descriptor's
+/// heap address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Linear {
+    /// Layout index and dword of the root parameter; none for a constant.
+    pub param: Option<(usize, u32)>,
+    pub mask: u32,
+    pub scale: u32,
+    pub offset: u32,
+}
+
 /// [`Address::param`] of the program's own code: a constant table the
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
@@ -112,6 +126,10 @@ pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
+    /// The computed term of each scalar memory access's address that has
+    /// one (`s_load_*`), as a [`Linear`] function of a root parameter, or
+    /// why it is none (an index loaded from memory, say).
+    pub terms: Vec<(Site, Result<Linear, &'static str>)>,
     pub descriptors: Vec<Descriptor>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
@@ -209,6 +227,9 @@ pub fn track(
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    if let Some(d) = address.dynamic {
+                        out.terms.push((site, t.linear(Term::Value(d), 0)));
+                    }
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -734,6 +755,147 @@ impl<'a> Tracer<'a> {
             None => "an address from a phi",
             _ => "an address not from a root parameter",
         }
+    }
+
+    /// `t` as a [`Linear`] function of a root constant or table offset:
+    /// through copies, additions, masks, shifts left and multiplications by
+    /// constants (scalar, or vector of scalars read back with
+    /// `v_readfirstlane_b32`); `depth` steps in.
+    fn linear(&self, t: Term, depth: usize) -> Result<Linear, &'static str> {
+        let constant = |c: u32| Linear {
+            param: None,
+            mask: u32::MAX,
+            scale: 0,
+            offset: c,
+        };
+        let v = match t {
+            Term::Const(c) => return Ok(constant(c)),
+            Term::Value(v) => v,
+        };
+        if depth > 4 * MAX_JOINS {
+            return Err("an index computed in too many steps");
+        }
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            let (param, dword) = self
+                .param_of(reg)
+                .ok_or("an index in an SGPR that is no root parameter")?;
+            return match self.layout[param].root {
+                RootType::Constants | RootType::Table => Ok(Linear {
+                    param: Some((param, dword)),
+                    mask: u32::MAX,
+                    scale: 1,
+                    offset: 0,
+                }),
+                _ => Err("an index from a root address"),
+            };
+        }
+        if let Some(x) = self.first_lane_source(v) {
+            return self.linear(self.lane_term(Term::Value(x)), depth + 1);
+        }
+        let Some(inst) = self.def(v) else {
+            return Err("an index chosen by control flow");
+        };
+        let name = inst.name();
+        if [
+            "s_load_",
+            "s_buffer_load_",
+            "global_load_",
+            "buffer_load_",
+            "ds_read",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
+        {
+            return Err("an index loaded from memory");
+        }
+        let operands = match self.sop2(v, &[name]) {
+            Some((_, terms)) => terms.to_vec(),
+            None => self.valu_terms(inst, v).unwrap_or_default(),
+        };
+        let ops: Vec<Result<Linear, &'static str>> = operands
+            .iter()
+            .map(|&t| self.linear(t, depth + 1))
+            .collect();
+        // Another operation: why its operands are unknown, memory first.
+        let why = || {
+            let whys = || ops.iter().filter_map(|o| o.err());
+            if let Some(w) = whys().find(|&w| w == "an index loaded from memory") {
+                return w;
+            }
+            if name.starts_with("v_cndmask") || name.starts_with("s_cselect") {
+                return "an index chosen per lane or by a condition";
+            }
+            whys()
+                .next()
+                .unwrap_or("an index another operation computes")
+        };
+        let [x, y] = match &ops[..] {
+            [Ok(x), Ok(y)] => [*x, *y],
+            _ => return Err(why()),
+        };
+        // `x` times the constant `by`.
+        let scaled = |x: Linear, by: u32| Linear {
+            scale: x.scale.wrapping_mul(by),
+            offset: x.offset.wrapping_mul(by),
+            ..x
+        };
+        let (x, y) = match name {
+            // The value operand first.
+            "v_lshlrev_b32" | "v_lshlrev_b64" => (y, x),
+            "s_lshl_b32" | "s_lshl_b64" => (x, y),
+            _ if x.param.is_none() => (y, x),
+            _ => (x, y),
+        };
+        if y.param.is_some() && !name.contains("add") {
+            return Err(if x.param.is_some() {
+                "an index of two root parameters"
+            } else {
+                why()
+            });
+        }
+        match name {
+            "s_add_u32" | "s_add_i32" | "v_add_nc_u32" | "v_add_co_u32" | "v_add_u32" => {
+                if y.param.is_some() && (x.param, x.mask) != (y.param, y.mask) {
+                    return Err("an index of two root parameters");
+                }
+                Ok(Linear {
+                    scale: x.scale.wrapping_add(y.scale),
+                    offset: x.offset.wrapping_add(y.offset),
+                    ..x
+                })
+            }
+            // The low dword of a 64-bit shift is the low dword's.
+            "s_lshl_b32" | "s_lshl_b64" | "v_lshlrev_b32" | "v_lshlrev_b64" => {
+                Ok(scaled(x, 1u32 << (y.offset & 31)))
+            }
+            "s_mul_i32" | "v_mul_lo_u32" | "v_mul_u32_u24" => Ok(scaled(x, y.offset)),
+            "s_and_b32" | "v_and_b32" if x.param.is_none() => Ok(constant(x.offset & y.offset)),
+            "s_and_b32" | "v_and_b32" if (x.scale, x.offset) == (1, 0) => Ok(Linear {
+                mask: x.mask & y.offset,
+                ..x
+            }),
+            _ => Err(why()),
+        }
+    }
+
+    /// The source operands of the VALU instruction `inst` writing `v` to
+    /// a VGPR (through VGPR copies of scalars), without modifiers.
+    fn valu_terms(&self, inst: &Inst, v: Value) -> Option<Vec<Term>> {
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = f.dst else {
+            return None;
+        };
+        if inst.write(Reg::V(reg)) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        f.src.iter().map(|s| self.vterm(inst, s)).collect()
     }
 
     /// The terms of the additions that compute `v`.

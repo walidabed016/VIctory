@@ -13,8 +13,35 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the view heap's records are bound: `t0` in this space, a root
-/// SRV (raw) of two dwords per heap slot (see [`super::HostShader`]).
+/// SRV (raw) of [`VIEW_RECORD_BYTES`] per heap slot (see
+/// [`super::HostShader`]).
 pub const VIEW_STRIDE_SPACE: u32 = 2;
+
+/// Bytes of a heap slot's record in [`VIEW_STRIDE_SPACE`]: the view's
+/// record stride, its lead, its kind ([`view_kind`]) and a dword left 0.
+pub const VIEW_RECORD_BYTES: u32 = 16;
+
+/// The kind of view the host made in a heap slot, as its record names it:
+/// what a translated access through a heap descriptor no used-resource
+/// entry names reads (see the module notes of [`super`]).
+pub mod view_kind {
+    /// Nothing a buffer access may read: no view, a null view, a sampler.
+    pub const NONE: u32 = 0;
+    /// A constant buffer view.
+    pub const CBV: u32 = 1;
+    /// A raw buffer shader resource view (structured ones are made raw).
+    pub const RAW_SRV: u32 = 2;
+    /// A raw buffer unordered access view (structured ones too).
+    pub const RAW_UAV: u32 = 3;
+    /// A typed buffer shader resource view.
+    pub const TYPED_SRV: u32 = 4;
+    /// A typed buffer unordered access view.
+    pub const TYPED_UAV: u32 = 5;
+    /// A texture shader resource view.
+    pub const TEXTURE: u32 = 6;
+    /// A texture unordered access view.
+    pub const TEXTURE_UAV: u32 = 7;
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
