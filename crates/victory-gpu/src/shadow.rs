@@ -1968,6 +1968,90 @@ pub(crate) mod tests {
         unmap(&made);
     }
 
+    /// Title memory shown at two addresses (xmem maps physical pages more
+    /// than once, as the console does): the title's write through the other
+    /// address does not fault where a copy armed its blocks, and copy-back
+    /// keeps it rather than take it for the GPU's.
+    #[test]
+    fn a_write_through_another_address_survives_copy_back() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            MapViewOfFile3, UnmapViewOfFile,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let (at, len) = ((963 * SLAB) as usize - 256 * MIB, MIB);
+        // SAFETY: a section of ours, mapped at a free address (checked) and
+        // wherever the system puts it.
+        let (x, y) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let x = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                at as *const _,
+                0,
+                len,
+                0,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+            .Value as usize;
+            let y = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            CloseHandle(section);
+            (x, y)
+        };
+        assert!(x == at && y != 0, "no free address for test views");
+        // As xmem tells it: both show the section's pages.
+        const PAGES: u64 = 0x7e57 << 32;
+        crate::watch::title_memory_shows(x, len, PAGES);
+        crate::watch::title_memory_shows(y, len, PAGES);
+        for a in (x..x + len).step_by(4) {
+            // SAFETY: our view.
+            unsafe { (a as *mut u32).write(word(a)) };
+        }
+        register(usize::MAX - 11, x as u64, (len / 2) as u64);
+        let s = find(x as u64, (len / 2) as u64).unwrap();
+        assert!(!s.in_place);
+        let declared = [(x, len / 2)];
+        crate::watch::forget_asked();
+        s.update(x, len / 2);
+        s.writing(x, len / 2);
+        // While the GPU runs, the title writes a word through the other
+        // address, and the GPU another of the same block.
+        let (title, gpu) = (x + PAGE + 8, x + PAGE + 64);
+        // SAFETY: our view of the section, and inside the copy's memory.
+        unsafe {
+            ((title - x + y) as *mut u32).write(7);
+            s.host_at(gpu - x, 4).cast::<u32>().write(0xfeed);
+        }
+        s.copy_back(&declared);
+        crate::watch::disarm();
+        // SAFETY: our view.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        assert_eq!(read(title), 7, "the title's write was undone");
+        assert_eq!(read(gpu), 0xfeed);
+        drop(s);
+        unregister(usize::MAX - 11, x as u64);
+        unmap(&[x]);
+        // SAFETY: our other view.
+        crate::watch::title_memory_unmapping(y, len, || unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: y as *mut _ })
+        });
+    }
+
     /// The word a copy holds for title address `at` (0 where it has no
     /// memory).
     fn held(s: &Shadow, at: usize) -> Option<u32> {

@@ -13,13 +13,19 @@
 //! ([`title_memory_remapped`], [`title_memory_unmapping`]), which resets
 //! their protection.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! A physical page can show at several addresses (the title's pool view and
+//! its tiled heap, which the GPU maps the pool's pages into), and the
+//! runtime writes pages through views of its own (DirectStorage's page
+//! destinations). The runtime tells which page each block of its views
+//! shows ([`title_memory_shows`]) and when it writes pages
+//! ([`physical_pages_writing`]): a block guarded clean has every other
+//! block showing its page guarded too, and a write through any of them, or
+//! to the page, makes them all written.
+//!
+//! shortcut: a system call writing into a guarded block fails (none is
+//! known to; the runtime opens the title's own reads first).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -94,6 +100,19 @@ pub(crate) fn wrote(start: usize, end: usize) {
         j.written.insert(page, now);
     }
     j.ours.push((now, start, end));
+    // So are the blocks showing the same physical pages elsewhere.
+    let mut g = guards();
+    let Some(shown) = &g.shown else {
+        return;
+    };
+    let aliases: Vec<usize> = (start / BLOCK..end.div_ceil(BLOCK))
+        .flat_map(|b| shown.aliases(b))
+        .collect();
+    for a in aliases {
+        g.clean.remove(a, a + 1);
+        j.written.insert(a * BLOCK / PAGE, now);
+        j.ours.push((now, a * BLOCK, (a + 1) * BLOCK));
+    }
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -342,6 +361,8 @@ struct Guards {
     saved: BTreeMap<usize, Vec<u8>>,
     /// Write-watched title memory guarded instead ([`title_memory_watched`]).
     pools: Blocks,
+    /// The physical pages the runtime's views show.
+    shown: Option<Shown>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -350,7 +371,42 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     armed: Blocks(BTreeMap::new()),
     saved: BTreeMap::new(),
     pools: Blocks(BTreeMap::new()),
+    shown: None,
 });
+
+/// The physical pages blocks of the runtime's views show
+/// ([`title_memory_shows`]), by its numbering of them.
+#[derive(Default)]
+struct Shown {
+    /// By block: the page it shows.
+    page: HashMap<usize, u64>,
+    /// By page: the blocks showing it.
+    blocks: HashMap<u64, Vec<usize>>,
+    /// Pages the runtime writes through views of its own, with how many
+    /// such writes are under way ([`physical_pages_writing`]).
+    writing: HashMap<u64, usize>,
+}
+
+impl Shown {
+    /// The blocks other than `block` showing the page it shows.
+    fn aliases(&self, block: usize) -> Vec<usize> {
+        let Some(page) = self.page.get(&block) else {
+            return Vec::new();
+        };
+        self.blocks[page]
+            .iter()
+            .copied()
+            .filter(|&b| b != block)
+            .collect()
+    }
+
+    /// Whether the runtime is writing the page `block` shows.
+    fn being_written(&self, block: usize) -> bool {
+        self.page
+            .get(&block)
+            .is_some_and(|page| self.writing.contains_key(page))
+    }
+}
 
 /// Held to read an armed block in place ([`in_place`]) and to arm blocks
 /// ([`arm`]); the runtime's unmappings wait for it, and it for them
@@ -518,6 +574,9 @@ fn reguard(start: usize, end: usize, pool: bool) -> (Vec<usize>, Vec<(usize, usi
         if at < to {
             protect(&mut g, at, to, pool);
         }
+        if !pool {
+            guard_aliases(&mut g, from, to);
+        }
         let unguarded = match pool {
             true => g.protected.gaps(from, to),
             false => Vec::new(),
@@ -539,47 +598,8 @@ fn reguard(start: usize, end: usize, pool: bool) -> (Vec<usize>, Vec<(usize, usi
 /// `pool`, only a block wholly not committed is (the runtime tells when it
 /// commits pool memory).
 fn protect(g: &mut Guards, from: usize, to: usize, pool: bool) {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
-    };
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        // SAFETY: title memory; only its protection changes.
-        let mut set = unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        };
-        // Pools take the title's protection: memory it can execute (or
-        // otherwise not just read or write) is not guarded, since our
-        // handler gives write access back as plain read-write. Read-only
-        // is ours, guarded before and not opened since, or the title's.
-        if set && old != PAGE_READWRITE && old != PAGE_READONLY {
-            // SAFETY: as above, back as it was.
-            unsafe {
-                VirtualProtect(
-                    (from * BLOCK) as *const _,
-                    (to - from) * BLOCK,
-                    old,
-                    &mut old,
-                )
-            };
-            set = false;
-        }
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::cost(
-            crate::copystat::Op::Protect,
-            started,
-            from * BLOCK,
-            ((to - from) * BLOCK) as u64,
-        );
-        set
-    };
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
+    let set = read_only;
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert(from, to);
         g.clean.insert(from, to);
@@ -603,6 +623,98 @@ fn protect(g: &mut Guards, from: usize, to: usize, pool: bool) {
     }
 }
 
+/// Makes blocks `[from, to)` read-only; false if they are not all
+/// committed read-write or read-only memory of one view or allocation.
+fn read_only(from: usize, to: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: title memory; only its protection changes.
+    let mut set = unsafe {
+        VirtualProtect(
+            (from * BLOCK) as *const _,
+            (to - from) * BLOCK,
+            PAGE_READONLY,
+            &mut old,
+        ) != 0
+    };
+    // Pools take the title's protection: memory it can execute (or
+    // otherwise not just read or write) is not guarded, since our
+    // handler gives write access back as plain read-write. Read-only
+    // is ours, guarded before and not opened since, or the title's.
+    if set && old != PAGE_READWRITE && old != PAGE_READONLY {
+        // SAFETY: as above, back as it was.
+        unsafe {
+            VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                old,
+                &mut old,
+            )
+        };
+        set = false;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::cost(
+        crate::copystat::Op::Protect,
+        started,
+        from * BLOCK,
+        ((to - from) * BLOCK) as u64,
+    );
+    set
+}
+
+/// Blocks `[from, to)` were just guarded (or found still guarded) and
+/// noted clean: the other blocks showing their physical pages are guarded
+/// too, not noted clean (what they show was not taken through them), so
+/// that a write through any of them is seen. A block is not clean if one of
+/// those cannot be guarded, or while the runtime writes its page.
+fn guard_aliases(g: &mut Guards, from: usize, to: usize) {
+    let Some(shown) = &g.shown else {
+        return;
+    };
+    let aliased: Vec<(usize, Vec<usize>, bool)> = (from..to)
+        .filter(|b| shown.page.contains_key(b))
+        .map(|b| (b, shown.aliases(b), shown.being_written(b)))
+        .collect();
+    for (block, aliases, being_written) in aliased {
+        if !g.clean.contains(block) || !g.protected.contains(block) {
+            continue;
+        }
+        let mut guarded = !being_written;
+        for a in aliases {
+            if !guarded {
+                break;
+            }
+            if g.protected.contains(a) {
+                continue;
+            }
+            guarded = read_only(a, a + 1);
+            if guarded {
+                g.protected.insert(a, a + 1);
+            }
+        }
+        if !guarded {
+            g.clean.remove(block, block + 1);
+        }
+    }
+}
+
+/// Blocks `[from, to)` are about to be written: so are the other blocks
+/// showing their physical pages, which are no longer clean, the armed ones
+/// saved first.
+fn aliases_written(g: &mut Guards, from: usize, to: usize) {
+    let Some(shown) = &g.shown else {
+        return;
+    };
+    let aliases: Vec<usize> = (from..to).flat_map(|b| shown.aliases(b)).collect();
+    for a in aliases {
+        save(g, a, a + 1);
+        g.clean.remove(a, a + 1);
+    }
+}
+
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
@@ -617,6 +729,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
             // SAFETY: a block we made read-only.
             unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
         }
+        aliases_written(g, from, to);
     }
     !runs.is_empty()
 }
@@ -780,9 +893,106 @@ pub fn title_memory_unmapping<R>(at: usize, len: usize, unmap: impl FnOnce() -> 
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     unguard(&mut guards(), from, to, true);
     let unmapped = unmap();
-    unguard(&mut guards(), from, to, false);
+    let mut g = guards();
+    unguard(&mut g, from, to, false);
+    forget_shown(&mut g, from, to);
+    drop(g);
     UNMAPPED.fetch_add(1, Ordering::Relaxed);
     unmapped
+}
+
+/// The runtime mapped physical pages at title memory `[at, at + len)`,
+/// after [`title_memory_remapped`]: block by block, pages `first`,
+/// `first + 1`... by its numbering (consecutive pages of an allocation
+/// numbered consecutively). The other blocks showing those pages are no
+/// longer clean (the new ones are not guarded), the armed ones saved first.
+pub fn title_memory_shows(at: usize, len: usize, first: u64) {
+    let mut g = guards();
+    let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    forget_shown(&mut g, from, to);
+    let shown = g.shown.get_or_insert_with(Shown::default);
+    let mut others = Vec::new();
+    for (block, page) in (from..to).zip(first..) {
+        let blocks = shown.blocks.entry(page).or_default();
+        others.extend_from_slice(blocks);
+        blocks.push(block);
+        shown.page.insert(block, page);
+    }
+    for a in others {
+        save(&mut g, a, a + 1);
+        g.clean.remove(a, a + 1);
+    }
+}
+
+/// Blocks `[from, to)` show no physical pages any more.
+fn forget_shown(g: &mut Guards, from: usize, to: usize) {
+    let Some(shown) = &mut g.shown else {
+        return;
+    };
+    // A whole reservation is not walked block by block.
+    let gone: Vec<usize> = if to - from > shown.page.len() {
+        let within = |b: &&usize| from <= **b && **b < to;
+        shown.page.keys().filter(within).copied().collect()
+    } else {
+        (from..to).filter(|b| shown.page.contains_key(b)).collect()
+    };
+    for block in gone {
+        if let Some(page) = shown.page.remove(&block)
+            && let Some(blocks) = shown.blocks.get_mut(&page)
+        {
+            blocks.retain(|&b| b != block);
+            if blocks.is_empty() {
+                shown.blocks.remove(&page);
+            }
+        }
+    }
+}
+
+/// The runtime is about to write physical pages `[first, first + n)`
+/// (numbered as for [`title_memory_shows`]) through a view of its own,
+/// until [`physical_pages_written`]: the blocks showing them are not
+/// clean, the armed ones saved first, and are not guarded clean until then.
+pub fn physical_pages_writing(first: u64, n: usize) {
+    let mut g = guards();
+    let shown = g.shown.get_or_insert_with(Shown::default);
+    let mut blocks = Vec::new();
+    for page in first..first + n as u64 {
+        *shown.writing.entry(page).or_default() += 1;
+        blocks.extend(shown.blocks.get(&page).into_iter().flatten().copied());
+    }
+    for b in blocks {
+        save(&mut g, b, b + 1);
+        g.clean.remove(b, b + 1);
+    }
+}
+
+/// The runtime wrote physical pages `[first, first + n)` after
+/// [`physical_pages_writing`]: the blocks showing them count as written.
+pub fn physical_pages_written(first: u64, n: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = guards();
+    let Some(shown) = &mut g.shown else {
+        return;
+    };
+    let mut blocks = Vec::new();
+    for page in first..first + n as u64 {
+        if let Some(k) = shown.writing.get_mut(&page) {
+            *k -= 1;
+            if *k == 0 {
+                shown.writing.remove(&page);
+            }
+        }
+        blocks.extend(shown.blocks.get(&page).into_iter().flatten().copied());
+    }
+    if blocks.is_empty() {
+        return;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for b in blocks {
+        g.clean.remove(b, b + 1);
+        j.written.insert(b * BLOCK / PAGE, now);
+    }
 }
 
 /// The runtime reserved (`watched`) or released write-watched title memory
@@ -1496,5 +1706,157 @@ mod tests {
         title_memory_remapped(p, 2 * BLOCK);
         // The memory stays: the journal keeps its pages, which another test
         // given the same addresses would read as its own.
+    }
+
+    /// A pagefile section of `blocks` blocks mapped twice, read-write.
+    fn two_views(blocks: usize) -> (usize, usize) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        // SAFETY: a section of ours, mapped wherever the system puts it.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let x = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize;
+            let y = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize;
+            CloseHandle(section);
+            assert!(x != 0 && y != 0);
+            (x, y)
+        }
+    }
+
+    /// Unmaps views of `blocks` blocks as the runtime does, keeping their
+    /// addresses: the journal keeps their pages, which another test given
+    /// them would read as its own.
+    fn let_go(views: &[usize], blocks: usize) {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_MAPPED_VIEW_ADDRESS, PAGE_NOACCESS, UnmapViewOfFile,
+        };
+        for &v in views {
+            // SAFETY: a view of ours.
+            title_memory_unmapping(v, blocks * BLOCK, || unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ })
+            });
+            // SAFETY: a reservation of the range just freed.
+            let kept =
+                unsafe { VirtualAlloc(v as *const _, blocks * BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!kept.is_null());
+        }
+    }
+
+    /// The blocks of `[at, at + blocks)` a guarded asking in a new
+    /// submission finds written, by index.
+    fn written_blocks(at: usize, blocks: usize) -> Vec<usize> {
+        forget_asked();
+        let (now, w) = writes(at, at + blocks * BLOCK, true).expect("view memory");
+        w.iter()
+            .filter(|&&(_, a)| a == now)
+            .map(|&(page, _)| page - at / PAGE)
+            .collect()
+    }
+
+    /// Physical pages shown at two addresses: a write through either one,
+    /// faulting, through the kernel or a copy of ours, is a write to the
+    /// other, which a copy of it guards too.
+    #[test]
+    fn writes_through_another_address_are_seen() {
+        let _serial = serial();
+        let (x, y) = two_views(4);
+        const PAGES: u64 = 0x7e58 << 32;
+        title_memory_shows(x, 4 * BLOCK, PAGES);
+        title_memory_shows(y, 4 * BLOCK, PAGES);
+        assert_eq!(written_blocks(x, 4), [0, 1, 2, 3]);
+        assert!(written_blocks(x, 4).is_empty());
+        let yb = y / BLOCK;
+        assert_eq!(
+            guards().protected.within(yb, yb + 4),
+            [(yb, yb + 4)],
+            "y is guarded with x"
+        );
+        assert!(
+            guards().clean.within(yb, yb + 4).is_empty(),
+            "but not clean"
+        );
+        // SAFETY: our view (guarded: our handler opens the block).
+        unsafe { ((y + BLOCK + 8) as *mut u32).write(1) };
+        assert_eq!(written_blocks(x, 4), [1]);
+        writing(y + 2 * BLOCK, 10);
+        assert_eq!(written_blocks(x, 4), [2]);
+        wrote(y + 3 * BLOCK, y + 3 * BLOCK + 1);
+        assert_eq!(written_blocks(x, 4), [3]);
+        assert!(written_blocks(x, 4).is_empty());
+        // SAFETY: our view, guarded.
+        unsafe { ((x + 8) as *mut u32).write(2) };
+        assert_eq!(written_blocks(y, 4), [0, 1, 2, 3], "y's first asking");
+        // SAFETY: our view, guarded.
+        unsafe { ((x + 8) as *mut u32).write(3) };
+        assert_eq!(written_blocks(y, 4), [0]);
+        // SAFETY: the word written through x, read through y.
+        assert_eq!(unsafe { ((y + 8) as *const u32).read() }, 3);
+        let_go(&[x, y], 4);
+        assert!(
+            guards()
+                .shown
+                .as_ref()
+                .is_none_or(|s| !s.page.contains_key(&(x / BLOCK)))
+        );
+    }
+
+    /// While the runtime writes physical pages through a view of its own,
+    /// the blocks showing them are written at every asking and none is
+    /// armed; once it is done, they are written once more.
+    #[test]
+    fn physical_page_writes_are_seen() {
+        let _serial = serial();
+        // y stands for the runtime's own view.
+        let (x, y) = two_views(2);
+        const PAGES: u64 = 0x7e59 << 32;
+        title_memory_shows(x, 2 * BLOCK, PAGES);
+        assert_eq!(written_blocks(x, 2), [0, 1]);
+        assert!(written_blocks(x, 2).is_empty());
+        physical_pages_writing(PAGES + 1, 1);
+        assert_eq!(written_blocks(x, 2), [1]);
+        assert_eq!(written_blocks(x, 2), [1]);
+        let (_, loose) = arm(x, x + 2 * BLOCK, |_| u64::MAX - 1);
+        let b = x / BLOCK;
+        assert_eq!(loose, [(b + 1, b + 2)]);
+        disarm();
+        // SAFETY: the runtime's view, not guarded.
+        unsafe { ((y + BLOCK + 8) as *mut u32).write(5) };
+        physical_pages_written(PAGES + 1, 1);
+        assert_eq!(written_blocks(x, 2), [1]);
+        assert!(written_blocks(x, 2).is_empty());
+        let_go(&[x, y], 2);
+    }
+
+    /// A page mapped at a new address is no longer clean where it showed
+    /// already (nothing guards the new address yet); unmapped, the address
+    /// no longer counts.
+    #[test]
+    fn a_new_address_of_a_page_leaves_it_unclean() {
+        let _serial = serial();
+        let (x, y) = two_views(1);
+        const PAGES: u64 = 0x7e5a << 32;
+        title_memory_shows(x, BLOCK, PAGES);
+        assert_eq!(written_blocks(x, 1), [0]);
+        assert!(written_blocks(x, 1).is_empty());
+        title_memory_shows(y, BLOCK, PAGES);
+        assert_eq!(written_blocks(x, 1), [0]);
+        // SAFETY: our view, guarded as x's alias.
+        unsafe { (y as *mut u32).write(1) };
+        assert_eq!(written_blocks(x, 1), [0]);
+        let_go(&[y], 1);
+        assert!(written_blocks(x, 1).is_empty());
+        let x_block = x / BLOCK;
+        assert!(guards().shown.as_ref().unwrap().aliases(x_block).is_empty());
+        let_go(&[x], 1);
     }
 }
