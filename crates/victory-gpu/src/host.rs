@@ -649,24 +649,33 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+        let mut back: Vec<Declared> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                let Step::GpuWrite(shadow, address, len) = step else {
+                    continue;
+                };
+                let i = match back
+                    .iter()
+                    .position(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
                 {
-                    back.push((shadow.clone(), *address, *len));
+                    Some(i) => i,
+                    None => {
+                        back.push((shadow.clone(), Vec::new()));
+                        back.len() - 1
+                    }
+                };
+                if !back[i].1.contains(&(*address, *len)) {
+                    back[i].1.push((*address, *len));
                 }
             }
         }
         #[cfg(feature = "diagnostics")]
         let _charged = crate::copystat::charge(crate::copystat::Caller::CopyBack);
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
+        for (shadow, declared) in &back {
             crate::watch::forget_asked();
-            let written = shadow.copy_back(address, len);
+            let written = shadow.copy_back(declared);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
