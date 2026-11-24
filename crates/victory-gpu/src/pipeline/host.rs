@@ -269,6 +269,9 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    /// Draws the console's rectangle lists: a geometry shader adds each
+    /// rectangle's fourth corner (`victory_shader::emit::rectangles`).
+    pub(crate) rectangles: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -477,6 +480,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                rectangles: false,
                 pso,
                 root,
                 stages: bound,
@@ -509,6 +513,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                rectangles: false,
                 pso,
                 root,
                 stages: bound,
@@ -518,45 +523,73 @@ impl HostPipeline {
             });
         }
 
-        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-            // SAFETY: a borrowed pointer the description never releases.
-            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
-            PS: code(1),
-            BlendState: g.blend,
-            SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
-            DepthStencilState: g.depth,
-            InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                pInputElementDescs: g.inputs.as_ptr(),
-                NumElements: g.inputs.len() as u32,
-            },
-            IBStripCutValue: g.strip_cut,
-            // The console's rectangle and quad types draw as triangles on
-            // the host (see `draw`).
-            PrimitiveTopologyType: match g.topology.0 {
-                RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                _ => g.topology,
-            },
-            NumRenderTargets: g.targets.NumRenderTargets,
-            RTVFormats: g.targets.RTFormats,
-            DSVFormat: g.depth_format,
-            SampleDesc: g.samples,
-            ..Default::default()
+        // The console's rectangle lists draw as triangle lists through a
+        // geometry shader that adds each rectangle's fourth corner.
+        let gs = (g.topology.0 == RECTANGLES)
+            .then(|| stages[0].0.translated())
+            .flatten()
+            .and_then(|t| match victory_shader::emit::rectangles(&t.host.dxil) {
+                Ok(gs) => Some(gs),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                    None
+                }
+            });
+        let make = |gs: Option<&[u8]>| {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: a borrowed pointer the description never releases.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: code(0),
+                GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, |gs| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }),
+                PS: code(1),
+                BlendState: g.blend,
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: g.inputs.as_ptr(),
+                    NumElements: g.inputs.len() as u32,
+                },
+                IBStripCutValue: g.strip_cut,
+                // The console's rectangle and quad types draw as triangles
+                // on the host (see `draw`).
+                PrimitiveTopologyType: match g.topology.0 {
+                    RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    _ => g.topology,
+                },
+                NumRenderTargets: g.targets.NumRenderTargets,
+                RTVFormats: g.targets.RTFormats,
+                DSVFormat: g.depth_format,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            let mut parts = vec![code_bytes(&code(0)), code_bytes(&code(1))];
+            parts.extend(gs.map(<[u8]>::to_vec));
+            let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let name = super::library::name("graphics", &root_blob, &parts, &state);
+            super::library::pipeline(
+                &name,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+            )
         };
-        let name = super::library::name(
-            "graphics",
-            &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-            &state,
-        );
-        let made = super::library::pipeline(
-            &name,
-            // SAFETY: the description points at live data.
-            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
-            // SAFETY: as above.
-            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
-        );
+        let mut rectangles = gs.is_some();
+        let mut made = make(gs.as_deref());
+        if let (Err(e), true) = (&made, rectangles) {
+            tracing::warn!(
+                error = %e,
+                ?shaders,
+                "host pipeline refused with its rectangle geometry shader; made without"
+            );
+            host.log_messages();
+            rectangles = false;
+            made = make(None);
+        }
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
@@ -565,7 +598,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, rectangles, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -579,6 +612,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            rectangles,
             pso,
             root,
             stages: bound,
@@ -695,5 +729,34 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod tests {
+    use super::*;
+
+    /// Pipelines of the console's rectangle type get the geometry shader
+    /// that draws rectangle lists; others do not.
+    #[test]
+    fn rectangle_pipelines_get_their_geometry_shader() {
+        if host().is_none() {
+            eprintln!("no host GPU: skipped");
+            return;
+        }
+        let ps = victory_shader::emit::host::stub_ps();
+        let vs = victory_shader::emit::host::stub_vs(&ps).unwrap();
+        let shaders = [
+            Shader::with_code("vertex", "vs", vs.dxil),
+            Shader::with_code("pixel", "ps", ps.dxil),
+        ];
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        for (topology, rectangles) in [(RECTANGLES, true), (3, false)] {
+            g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(topology);
+            let p = HostPipeline::new(&shaders, Some(&g)).expect("a host pipeline");
+            assert_eq!(p.rectangles, rectangles, "topology type {topology}");
+        }
     }
 }
