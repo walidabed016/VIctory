@@ -110,6 +110,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(all(test, windows))]
+mod atomic64_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
