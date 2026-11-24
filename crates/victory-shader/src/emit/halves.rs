@@ -25,6 +25,9 @@
 //!   barrier is only sound where every thread of the group gets as often,
 //!   so these exchanges sit only in [`meeting_blocks`]; anywhere else the
 //!   program keeps the console's 64-lane waves, with the reason.
+//! * **One lane.** Where one lane of each console wave at most gets
+//!   ([`alone_blocks`]: `if (index == 0)`), `v_readfirstlane` reads that
+//!   lane's own value, with no exchange.
 //! * **LDS of a one-wave group.** The console compiler leaves out barriers
 //!   when the group is one wave, which its two halves no longer are: every
 //!   LDS access gets a barrier before it, so they happen in program order
@@ -36,9 +39,9 @@
 
 use std::collections::HashSet;
 
-use crate::gfx10::Fields;
+use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
-use crate::structure::{Atom, LaneExit, Structured};
+use crate::structure::{Atom, Bool, Bools, LaneExit, Structured};
 
 /// Per block: whether every thread of the group gets there equally often
 /// (in the same order as to the other such blocks), so a barrier there is
@@ -51,7 +54,10 @@ use crate::structure::{Atom, LaneExit, Structured};
 /// (equal within a console wave only). A loop's iteration limit leaves
 /// from its header in the threads that reach it, together where the header
 /// meets, else on their own; the end of the program and an indirect jump
-/// are exits too.
+/// are exits too. A block holding the console's own `s_barrier` meets as
+/// well: its translation already takes every thread of the group to get
+/// there equally often and in step with the other barriers (a thread the
+/// iteration limit stops leaves that barrier short too).
 pub(crate) fn meeting_blocks(
     p: &Program,
     st: &Structured,
@@ -118,7 +124,10 @@ pub(crate) fn meeting_blocks(
     let Some(apart) = diverging(&succ, &order, &splits) else {
         return vec![false; n];
     };
-    (0..n).map(|b| rpo[b] != usize::MAX && !apart[b]).collect()
+    let barrier = |b: usize| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier");
+    (0..n)
+        .map(|b| rpo[b] != usize::MAX && (!apart[b] || barrier(b)))
+        .collect()
 }
 
 /// Per block: whether a loop can come back to it.
@@ -148,6 +157,126 @@ pub(crate) fn looping_blocks(p: &Program, st: &Structured) -> Vec<bool> {
             false
         })
         .collect()
+}
+
+/// Per block: at most one lane of each console wave gets there. Every lane
+/// that does passed a compare holding in one lane of a wave at most: the
+/// equality of a value the wave shares (a constant, or an SGPR not made
+/// from `lane_values`) with one each lane has its own: `distinct` (the
+/// thread's x index where a wave's lanes have different ones), plus, minus
+/// or xor a shared value, written wherever it is reached. The compare and
+/// what makes the lane's value lie outside loops, so a wave's lanes have
+/// them from the same pass. A `v_readfirstlane` there in every lane that
+/// gets there reads the lane's own value.
+pub(crate) fn alone_blocks(
+    p: &Program,
+    st: &Structured,
+    distinct: Option<Value>,
+    lane_values: &[Value],
+) -> Vec<bool> {
+    let n = p.blocks.len();
+    let Some(seed) = distinct else {
+        return vec![false; n];
+    };
+    let varying = spread(p, lane_values.iter().copied().collect(), |_| false);
+    let shared = |i: &Inst, op: &Operand| match *op {
+        Operand::Const(_) | Operand::Literal(_) => true,
+        Operand::Scalar { code, .. } if code != NULL => {
+            i.read(Reg::S(code)).is_some_and(|v| !varying.contains(&v))
+        }
+        _ => false,
+    };
+    let vgpr = |i: &Inst, op: &Operand| match *op {
+        Operand::Vector { reg, .. } => i.read(Reg::V(reg)),
+        _ => None,
+    };
+    let looped = looping_blocks(p, st);
+    let mut own = HashSet::from([seed]);
+    let mut singles = Vec::new();
+    loop {
+        let before = own.len();
+        singles.clear();
+        for (b, block) in p.blocks.iter().enumerate().filter(|b| !looped[b.0]) {
+            for (k, i) in block.insts.iter().enumerate() {
+                let Fields::Valu(v) = &i.fields else {
+                    continue;
+                };
+                let is_own = |op: &Operand| vgpr(i, op).is_some_and(|x| own.contains(&x));
+                let plain = v.dpp.is_none()
+                    && v.sdwa.is_none()
+                    && !v.clamp
+                    && v.omod == 0
+                    && v.opsel == 0
+                    && v.abs == 0
+                    && v.neg == 0;
+                // One source the lane's own, the others shared.
+                let one = plain
+                    && v.src.iter().filter(|op| is_own(op)).count() == 1
+                    && v.src.iter().all(|op| is_own(op) || shared(i, op));
+                if !one {
+                    continue;
+                }
+                let name = i.name();
+                if let Some(rest) = name
+                    .strip_prefix("v_cmp_eq_")
+                    .or(name.strip_prefix("v_cmpx_eq_"))
+                {
+                    let code = match v.dst {
+                        _ if name.starts_with("v_cmpx") => Some(EXEC),
+                        Some(Operand::Scalar { code, .. }) => Some(code),
+                        _ => None,
+                    };
+                    if matches!(rest, "u32" | "i32")
+                        && let Some(lo) = code.and_then(|c| i.write(Reg::S(c)))
+                    {
+                        singles.push(Atom::Lane(lo));
+                    }
+                    continue;
+                }
+                let fits = match name {
+                    "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32"
+                    | "v_xor_b32" | "v_add3_u32" => true,
+                    // (s0 << s1) + s2.
+                    "v_lshl_add_u32" => v.src.get(2).is_some_and(is_own),
+                    _ => false,
+                };
+                if fits
+                    && st.guards[b][k].is_none()
+                    && let Some(Operand::Vector { reg, .. }) = v.dst
+                    && let Some(w) = i.write(Reg::V(reg))
+                {
+                    own.insert(w);
+                }
+            }
+        }
+        if own.len() == before {
+            break;
+        }
+    }
+    (0..n)
+        .map(|b| singles.iter().any(|&a| implies(&st.bools, st.reach[b], a)))
+        .collect()
+}
+
+/// Whether `b` holds only where `atom` does: no way through it to true
+/// with `atom` false.
+fn implies(bools: &Bools, b: Bool, atom: Atom) -> bool {
+    let mut stack = vec![b];
+    let mut seen = HashSet::new();
+    while let Some(x) = stack.pop() {
+        if x == Bool::TRUE {
+            return false;
+        }
+        if x == Bool::FALSE || !seen.insert(x) {
+            continue;
+        }
+        let (a, lo, hi) = bools.node(x).expect("not a constant");
+        stack.push(lo);
+        if a != atom {
+            stack.push(hi);
+        }
+    }
+    true
 }
 
 /// `out` and the values computed from it, or written by an instruction
@@ -286,6 +415,93 @@ mod tests {
     const S_CMP_LG_S0_0: u32 = 0xBF07_8000;
     /// `s_cbranch_scc1` back four dwords.
     const S_CBRANCH_SCC1_BACK_4: u32 = 0xBF85_FFFC;
+
+    /// Each block's offset and whether one lane of a console wave at most
+    /// gets there, v0 holding each lane's own x index.
+    fn alone(words: &[u32]) -> Vec<(usize, bool)> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 16).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let x = p.inputs.iter().find(|i| i.0 == Reg::V(0)).map(|i| i.1);
+        let a = alone_blocks(&p, &st, x, &[]);
+        p.blocks.iter().map(|b| b.offset).zip(a).collect()
+    }
+
+    /// `v_lshl_add_u32 v2, s1, 8, v0`, `v_and_b32 v2, 31, v0`.
+    const V_LSHL_ADD_V2: [u32; 2] = [0xD746_0002, 0x0401_1001];
+    const V_AND_V2_31_V0: u32 = 0x3604_009F;
+    /// `v_cmpx_eq_u32 exec, 0, v2`.
+    const V_CMPX_EQ_U32_0_V2: u32 = 0x7DA4_0480;
+
+    #[test]
+    fn one_lane_of_a_wave_gets_past_an_equality_with_its_own_index() {
+        // if (s1 * 256 + x == 0) v1 = 0.
+        let a = alone(&[
+            V_LSHL_ADD_V2[0],
+            V_LSHL_ADD_V2[1],
+            V_CMPX_EQ_U32_0_V2,
+            S_CBRANCH_EXECZ_1,
+            V_MOV_V1_0,
+            S_ENDPGM,
+        ]);
+        assert_eq!(a, [(0, false), (16, true), (20, false)]);
+    }
+
+    #[test]
+    fn lanes_that_share_a_masked_index_are_not_alone() {
+        // if ((x & 31) == 0) v1 = 0: lanes 0 and 32 of each wave.
+        let a = alone(&[
+            V_AND_V2_31_V0,
+            V_CMPX_EQ_U32_0_V2,
+            S_CBRANCH_EXECZ_1,
+            V_MOV_V1_0,
+            S_ENDPGM,
+        ]);
+        assert_eq!(a, [(0, false), (12, false), (16, false)]);
+    }
+
+    #[test]
+    fn an_index_made_in_a_loop_is_not_the_lanes_own() {
+        // for (s0 = 4; s0 != 0; s0--) v2 = s0 + x; if (v2 == 0) v1 = 0:
+        // lanes leaving in different passes could share v2.
+        let a = alone(&[
+            S_MOV_S0_4,
+            V_ADD_V2_S0_V0,
+            S_SUB_S0_1,
+            S_CMP_LG_S0_0,
+            S_CBRANCH_SCC1_BACK_4,
+            V_CMPX_EQ_U32_0_V2,
+            S_CBRANCH_EXECZ_1,
+            V_MOV_V1_0,
+            S_ENDPGM,
+        ]);
+        assert!(a.iter().all(|b| !b.1), "{a:?}");
+    }
+
+    /// `v_add_nc_u32 v2, s0, v0`.
+    const V_ADD_V2_S0_V0: u32 = 0x4A04_0000;
+    /// `s_cbranch_execnz` back three dwords; `s_barrier`.
+    const S_BARRIER: u32 = 0xBF8A_0000;
+
+    #[test]
+    fn a_block_with_the_programs_barrier_meets_after_a_lane_loop() {
+        // do v1 = 0 while (x == 0), lane by lane; then v1 = 0 after the
+        // program's barrier or without one.
+        let lane_loop = [
+            S_SAVE,
+            V_MOV_V1_0,
+            V_CMPX_EQ_U32_0_V0,
+            S_CBRANCH_EXECNZ_BACK_3,
+            S_RESTORE,
+        ];
+        let with = [&lane_loop[..], &[S_BARRIER, V_MOV_V1_0, S_ENDPGM]].concat();
+        let without = [&lane_loop[..], &[V_MOV_V1_0, S_ENDPGM]].concat();
+        assert_eq!(meeting_in_waves(&with), [(0, true), (4, false), (16, true)]);
+        assert_eq!(
+            meeting_in_waves(&without),
+            [(0, true), (4, false), (16, false)]
+        );
+    }
 
     #[test]
     fn a_uniform_loop_and_what_follows_it_meet() {

@@ -394,6 +394,10 @@ struct Halves {
     meet: Vec<bool>,
     /// Per IR block: a loop can come back to it.
     looped: Vec<bool>,
+    /// Per IR block: one lane of each console wave gets there at most
+    /// ([`super::halves::alone_blocks`]): a `v_readfirstlane` there under
+    /// no guard reads the lane's own value.
+    alone: Vec<bool>,
     /// Masks read as data (low dwords): balloted where they are written.
     data_masks: HashSet<Value>,
     /// One console wave per group with LDS: a barrier before each access.
@@ -514,13 +518,30 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
                 if split && wave == 64 {
                     s.wave_size = Some(32);
+                    // A wave's lanes have their own x index.
+                    let distinct = (cs.threads[0] % 64 == 0 || cs.threads[1] * cs.threads[2] == 1)
+                        .then(|| {
+                            x.io.inputs
+                                .iter()
+                                .find(|i| i.1 == Input::ThreadIdInGroup(0))
+                                .map(|i| i.0)
+                        })
+                        .flatten();
+                    let alone =
+                        super::halves::alone_blocks(p, x.st, distinct, &x.res.waterfall.reads);
+                    // A first lane read as the lane's own differs between
+                    // threads (see `Halves::alone`).
+                    let mut lane_values = x.res.waterfall.reads.clone();
+                    for (b, block) in p.blocks.iter().enumerate().filter(|b| alone[b.0]) {
+                        for (i, inst) in block.insts.iter().enumerate() {
+                            if inst.name() == "v_readfirstlane_b32" && x.st.guards[b][i].is_none() {
+                                lane_values.extend(inst.writes.iter().map(|w| w.1));
+                            }
+                        }
+                    }
                     halves = Some(Halves {
-                        meet: super::halves::meeting_blocks(
-                            p,
-                            x.st,
-                            one_wave,
-                            &x.res.waterfall.reads,
-                        ),
+                        meet: super::halves::meeting_blocks(p, x.st, one_wave, &lane_values),
+                        alone,
                         looped: super::halves::looping_blocks(p, x.st),
                         data_masks: data_masks(p, x.st),
                         lds_barriers: one_wave && s.lds_dwords > 0 && threads > 32,
@@ -4867,6 +4888,14 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if guard.is_none()
+                    && self.halves.as_ref().is_some_and(|h| h.alone[self.cur_ir]) =>
+            {
+                // Halves: the one lane of its console wave that gets here.
                 let a = s(self, 0)?;
                 int(self, a)
             }

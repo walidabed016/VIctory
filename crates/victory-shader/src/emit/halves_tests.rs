@@ -428,3 +428,150 @@ fn one_wave_lds_on_halves_is_in_program_order() {
         }
     }
 }
+
+/// `v_lshl_add_u32 v7, s1, 8, v0` (s1 is 0).
+const V_LSHL_ADD_V7: [u32; 2] = [0xD746_0007, 0x0401_1001];
+
+/// Thread 0 alone runs a loop summing LDS[1..4] into a running prefix that
+/// it moves through an SGPR (`v_readfirstlane`), as the console compiler
+/// writes `if (index == 0) { for ... }`; then every thread stores
+/// LDS[index % 4], and its `v_mbcnt` (which makes it a program of
+/// console lanes). `compare` picks the threads that run the loop: `v7`
+/// holds s1 * 256 + x.
+fn serial_prefix(threads: [u32; 3], compare: &[u32]) -> Vec<u32> {
+    let mut w = prologue(threads);
+    w.extend(vop3(0x365, 13, ONES, ZERO));
+    w.extend(V_LSHL_ADD_V7);
+    w.extend([vop2(0x1A, 5, inline(2), 3), vop2(0x0B, 6, inline(3), 3)]);
+    w.extend(ds(0x0D, 0, 5, 6, 0));
+    w.push(sopp(0x0A, 0));
+    w.extend(compare);
+    w.push(sop1(0x24, 2, VCC_LO));
+    let mut body = vec![
+        sop2(0x1E, 6, 7, inline(2) as u8),
+        sop2(0x02, 7, 7, inline(1) as u8),
+        vop1(0x001, 10, 6),
+        sopc(0x08, 7, inline(3) as u8),
+    ];
+    body.extend(ds(0x36, 9, 10, 0, 0));
+    body.push(vop2(0x25, 9, 16, 9));
+    body.extend(ds(0x0D, 0, 10, 9, 0));
+    let mut region = vec![
+        vop1(0x001, 9, ZERO),
+        sop1(0x03, 16, 0x80),
+        sop1(0x03, 7, inline(1) as u8),
+        sopp(0x02, 1),
+        vop1(0x002, 16, v(9)),
+    ];
+    let back = -(body.len() as i16 + 2);
+    region.extend(body);
+    region.push(sopp(0x04, back));
+    w.push(sopp(0x08, region.len() as i16));
+    w.extend(region);
+    w.extend([sop1(0x04, EXEC_LO, 2), sopp(0x0A, 0)]);
+    w.extend([vop2(0x1B, 11, inline(3), 3), vop2(0x1A, 11, inline(2), 11)]);
+    w.extend(ds(0x36, 12, 11, 0, 0));
+    w.extend(store(12, 4, 0));
+    w.extend(store(13, 4, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn one_lane_of_each_wave_reads_its_own_first_lane_on_halves() {
+    // Two console waves; the first has the one lane where x == 0.
+    let threads = [128, 1, 1];
+    let (shader, waves, _) = build(
+        &serial_prefix(threads, &[vopc(0xC2, ZERO, 7)]),
+        threads,
+        512,
+    );
+    assert_eq!(waves, Waves::Halves);
+    for (label, got) in run(&shader, 128 * SLOTS) {
+        for f in 0..128u32 {
+            let at = (f * SLOTS) as usize;
+            let want = [0, 3, 9, 18][(f % 4) as usize];
+            assert_eq!(got[at], want, "{label}: thread {f}");
+            assert_eq!(got[at + 1], (f % 64).min(32), "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn an_x_index_repeated_in_a_wave_keeps_64_lane_waves() {
+    // x == 0 holds in lanes 0 and 32 of a 32x4 group's first wave.
+    let threads = [32, 4, 1];
+    let (_, waves, _) = build(
+        &serial_prefix(threads, &[vopc(0xC2, ZERO, 7)]),
+        threads,
+        512,
+    );
+    assert_eq!(
+        waves,
+        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
+    );
+}
+
+#[test]
+fn lanes_that_share_a_first_lane_keep_64_lane_waves() {
+    // x % 32 == 0 holds in two lanes of each console wave.
+    let threads = [128, 1, 1];
+    let compare = [vop2(0x1B, 8, inline(31), 7), vopc(0xC2, ZERO, 8)];
+    let (_, waves, _) = build(&serial_prefix(threads, &compare), threads, 512);
+    assert_eq!(
+        waves,
+        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
+    );
+}
+
+/// Each thread adds 2 to v5 x % 4 times in a loop of its own (as Sort's
+/// per-thread item loops), then, after the program's `s_barrier` or with
+/// none, adds lane 31's flat index (`v_readlane`, the lower half's).
+fn after_a_lane_loop(threads: [u32; 3], barrier: bool) -> Vec<u32> {
+    let mut w = prologue(threads);
+    w.extend([
+        vop1(0x001, 5, ZERO),
+        vop2(0x1B, 6, inline(3), 3),
+        SAVE_EXEC,
+        vopc(0xD5, ZERO, 6),
+        sopp(0x08, 4),
+        vop2(0x25, 5, inline(2), 5),
+        vop2(0x27, 6, inline(1), 6),
+        vopc(0xD5, ZERO, 6),
+        sopp(0x09, -4),
+        RESTORE_EXEC,
+    ]);
+    if barrier {
+        w.push(sopp(0x0A, 0));
+    }
+    w.extend(vop3(0x360, 2, v(3), inline(31)));
+    w.push(vop2(0x25, 7, 2, 5));
+    w.extend(store(7, 4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn a_cross_lane_read_by_the_programs_barrier_after_a_lane_loop_runs_on_halves() {
+    let threads = [128, 1, 1];
+    let (shader, waves, barriers) = build(&after_a_lane_loop(threads, true), threads, 0);
+    assert_eq!(waves, Waves::Halves);
+    // The counter's and the exchange's.
+    assert_eq!(barriers, 2);
+    for (label, got) in run(&shader, 128 * SLOTS) {
+        for f in 0..128u32 {
+            let want = f / 64 * 64 + 31 + 2 * (f % 4);
+            assert_eq!(got[(f * SLOTS) as usize], want, "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn a_cross_lane_read_after_a_lane_loop_with_no_barrier_keeps_64_lane_waves() {
+    let threads = [128, 1, 1];
+    let (_, waves, _) = build(&after_a_lane_loop(threads, false), threads, 0);
+    assert_eq!(
+        waves,
+        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
+    );
+}
