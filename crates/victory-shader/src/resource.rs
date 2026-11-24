@@ -1848,72 +1848,88 @@ impl<'a> Tracer<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
 }
 
 impl Tracer<'_> {
-    /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
-    /// lane, found by following the VGPR's `v_writelane_b32` writes.
     fn restored(&self, inst: &Inst) -> Option<Moved> {
-        let Fields::Valu(v) = &inst.fields else {
-            return None;
-        };
-        if inst.name() != "v_readlane_b32" {
-            return None;
-        }
-        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
-            return None;
-        };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
+        let p = self.p;
+        let args = |v: Value| self.phis[v.0 as usize].map(|(b, i)| &p.blocks[b].phis[i].args[..]);
+        restored(inst, &|v| self.def(v), &args)
     }
+}
 
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
-                    }
-                    found = Some(m);
-                }
-            }
-            return Ok(found);
-        }
-        let inst = self.def(v).ok_or(())?;
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32" {
-            return Err(());
-        }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
-            }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
-            _ => None,
-        }
-        .map(Some)
-        .ok_or(())
+/// For `v_readlane_b32` of a constant lane: the SGPR spilled to that lane,
+/// found by following the VGPR's `v_writelane_b32` writes. `def` gives a
+/// value's defining instruction, `args` a phi value's arguments.
+pub(crate) fn restored<'p>(
+    inst: &Inst,
+    def: &dyn Fn(Value) -> Option<&'p Inst>,
+    args: &dyn Fn(Value) -> Option<&'p [Value]>,
+) -> Option<Moved> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
     }
+    let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+        return None;
+    };
+    let vgpr = inst.read(Reg::V(reg))?;
+    spilled(vgpr, lane_of(lane)?, def, args, &mut Vec::new())
+        .ok()
+        .flatten()
+}
+
+/// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
+/// `seen` (already being resolved), `Err` if not a spilled SGPR.
+fn spilled<'p>(
+    v: Value,
+    lane: u32,
+    def: &dyn Fn(Value) -> Option<&'p Inst>,
+    args: &dyn Fn(Value) -> Option<&'p [Value]>,
+    seen: &mut Vec<Value>,
+) -> Result<Option<Moved>, ()> {
+    if let Some(phi_args) = args(v) {
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        seen.push(v);
+        let mut found = None;
+        for &a in phi_args {
+            if let Some(m) = spilled(a, lane, def, args, seen)? {
+                if found.is_some_and(|f| f != m) {
+                    return Err(());
+                }
+                found = Some(m);
+            }
+        }
+        return Ok(found);
+    }
+    let inst = def(v).ok_or(())?;
+    let Fields::Valu(w) = &inst.fields else {
+        return Err(());
+    };
+    let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        return Err(());
+    };
+    if inst.name() != "v_writelane_b32" {
+        return Err(());
+    }
+    if lane_of(*at).ok_or(())? != lane {
+        return spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, def, args, seen);
+    }
+    match *value {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Moved::Value),
+        Operand::Literal(x) => Some(Moved::Const(x)),
+        Operand::Const(c) => inline(c).map(Moved::Const),
+        _ => None,
+    }
+    .map(Some)
+    .ok_or(())
 }
 
 /// A lane select given as a constant.

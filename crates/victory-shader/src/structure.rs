@@ -22,6 +22,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::resource::{Moved, restored};
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -675,8 +676,13 @@ impl<'a> Lanes<'a> {
             return (m, false);
         }
         let p = self.p;
-        let (m, derived) = match self.join(k) {
-            Some(join) => join,
+        // A mask restored from the VGPR lanes it was spilled to is the
+        // spilled mask, bit for bit.
+        let known = self
+            .join(k)
+            .or_else(|| self.restored(k).map(|s| self.mask(s)));
+        let (m, derived) = match known {
+            Some(known) => known,
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
@@ -708,6 +714,22 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The pair a mask restored by `v_readlane_b32` was spilled from.
+    fn restored(&self, k: Key) -> Option<Key> {
+        let p = self.p;
+        let def = |v: Value| self.defs.get(&v).map(|&(b, i)| &p.blocks[b].insts[i]);
+        let args = |v: Value| {
+            self.phis
+                .get(&v)
+                .map(|&(b, i)| &p.blocks[b].phis[i].args[..])
+        };
+        let from = |v: Value| match restored(def(v)?, &def, &args)? {
+            Moved::Value(s) => Some(s),
+            Moved::Const(_) => None,
+        };
+        Some((from(k.0)?, from(k.1)?))
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -921,8 +943,10 @@ impl<'a> Lanes<'a> {
                         && code != NULL
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
-                        let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        let lazy = self.phis.contains_key(&k.0)
+                            || self.phis.contains_key(&k.1)
+                            || self.restored(k).is_some();
+                        takes_mask |= self.masks.contains_key(&k) || lazy && self.mask(k).1;
                     }
                 }
                 let touches_exec =
