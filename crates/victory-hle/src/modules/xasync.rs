@@ -10,11 +10,11 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
@@ -90,40 +90,53 @@ struct Port {
     mode: Mode,
     tasks: Mutex<VecDeque<Task>>,
     ready: Condvar,
+    /// A serialized port's: whether a pool job is running its tasks. Set
+    /// and cleared with `tasks` locked.
+    draining: AtomicBool,
 }
 
 impl Port {
     fn new(mode: Mode) -> Arc<Port> {
-        let port = Arc::new(Port {
+        Arc::new(Port {
             mode,
             tasks: Mutex::default(),
             ready: Condvar::new(),
-        });
-        if mode == Mode::Serialized {
-            // The worker ends once it holds the last reference (every queue
-            // using the port is closed) and nothing is left to run.
-            let worker = port.clone();
-            std::thread::spawn(move || {
-                loop {
-                    match worker.take(1000, || false) {
-                        Some(task) => task.run(false),
-                        None if Arc::strong_count(&worker) == 1 => break,
-                        None => {}
-                    }
-                }
-            });
-        }
-        port
+            draining: AtomicBool::new(false),
+        })
     }
 
-    fn submit(&self, task: Task) {
+    fn submit(self: &Arc<Self>, task: Task) {
         match self.mode {
             Mode::Immediate => task.run(false),
-            Mode::ThreadPool => POOL.submit(task),
-            Mode::Manual | Mode::Serialized => {
+            Mode::ThreadPool => POOL.submit(Box::new(move || task.run(false))),
+            Mode::Serialized => {
+                let mut tasks = lock(&self.tasks);
+                tasks.push_back(task);
+                let idle = !self.draining.swap(true, Ordering::Relaxed);
+                drop(tasks);
+                if idle {
+                    let port = self.clone();
+                    POOL.submit(Box::new(move || port.drain()));
+                }
+            }
+            Mode::Manual => {
                 lock(&self.tasks).push_back(task);
                 self.ready.notify_one();
             }
+        }
+    }
+
+    /// Runs a serialized port's tasks in order, one at a time, until none
+    /// is left.
+    fn drain(&self) {
+        loop {
+            let mut tasks = lock(&self.tasks);
+            let Some(task) = tasks.pop_front() else {
+                self.draining.store(false, Ordering::Relaxed);
+                return;
+            };
+            drop(tasks);
+            task.run(false);
         }
     }
 
@@ -147,12 +160,17 @@ impl Port {
     }
 }
 
-/// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
+/// Work for the pool, which calls title code.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The thread pool behind thread-pool and serialized ports, delayed
+/// callbacks and async work: idle workers are reused, and a new one starts
+/// whenever more jobs wait than workers idle, so a callback that blocks on
+/// another never starves it. Workers stay for reuse: every thread's start
+/// and end runs each title image's thread notices.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    /// Queued jobs and the number of idle workers.
+    state: Mutex<(VecDeque<Job>, usize)>,
     ready: Condvar,
 }
 
@@ -162,9 +180,9 @@ static POOL: Pool = Pool {
 };
 
 impl Pool {
-    fn submit(&'static self, task: Task) {
+    fn submit(&'static self, job: Job) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
+        state.0.push_back(job);
         if state.0.len() > state.1 {
             std::thread::spawn(move || self.work());
         } else {
@@ -180,10 +198,10 @@ impl Pool {
                 state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
                 state.1 -= 1;
             }
-            let task = state.0.pop_front();
+            let job = state.0.pop_front();
             drop(state);
-            if let Some(task) = task {
-                task.run(false);
+            if let Some(job) = job {
+                job();
             }
             state = lock(&self.state);
         }
@@ -218,10 +236,10 @@ impl Queue {
             self.deliver(port, task);
         } else {
             let queue = self.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms.into()));
-                queue.deliver(port, task);
-            });
+            after(
+                Duration::from_millis(delay_ms.into()),
+                Box::new(move || queue.deliver(port, task)),
+            );
         }
         S_OK
     }
@@ -240,6 +258,50 @@ impl Queue {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Jobs for the pool later, by when they are due and then in order.
+static DELAYED: Mutex<BTreeMap<(Instant, u64), Job>> = Mutex::new(BTreeMap::new());
+static DELAYED_ADDED: Condvar = Condvar::new();
+
+/// Hands `job` to the pool after `delay`. One thread, started on first
+/// use, waits for every delayed job; it runs no title code itself.
+fn after(delay: Duration, job: Job) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let started = victory_core::thread::spawn_host("victory XTaskQueue delays", || {
+            let mut delayed = lock(&DELAYED);
+            loop {
+                let now = Instant::now();
+                delayed = match delayed.first_key_value().map(|(&(at, _), _)| at) {
+                    None => DELAYED_ADDED
+                        .wait(delayed)
+                        .unwrap_or_else(|e| e.into_inner()),
+                    Some(at) if at > now => {
+                        DELAYED_ADDED
+                            .wait_timeout(delayed, at - now)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
+                    }
+                    Some(_) => {
+                        let due = delayed.pop_first();
+                        drop(delayed);
+                        if let Some((_, job)) = due {
+                            POOL.submit(job);
+                        }
+                        lock(&DELAYED)
+                    }
+                };
+            }
+        });
+        if let Err(e) = started {
+            tracing::warn!(error = %e, "XTaskQueue: no thread for delayed callbacks");
+        }
+    });
+    let key = (Instant::now() + delay, NEXT.fetch_add(1, Ordering::Relaxed));
+    lock(&DELAYED).insert(key, job);
+    DELAYED_ADDED.notify_one();
 }
 
 /// The process queue: `None` until first used (then a thread-pool queue),
@@ -773,7 +835,7 @@ pub fn pending_with(
                 // SAFETY: as above; cleanup waits for completion.
                 let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
                 let (block, state) = (data.block as usize, state as usize);
-                std::thread::spawn(move || {
+                POOL.submit(Box::new(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),
@@ -785,7 +847,7 @@ pub fn pending_with(
                         state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
                     }
                     XAsyncComplete(block as *mut AsyncBlock, hr, len);
-                });
+                }));
             }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
@@ -1203,6 +1265,71 @@ mod tests {
             S_OK
         );
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+    }
+
+    /// Serialized ports run on the pool, one callback at a time, in order.
+    #[test]
+    fn serialized_ports_run_callbacks_one_at_a_time_in_order() {
+        static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        static INSIDE: AtomicU32 = AtomicU32::new(0);
+        static OVERLAPS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn record(context: *mut c_void, _: bool) {
+            if INSIDE.fetch_add(1, Ordering::SeqCst) != 0 {
+                OVERLAPS.fetch_add(1, Ordering::SeqCst);
+            }
+            std::thread::sleep(Duration::from_micros(200));
+            lock(&ORDER).push(context as usize);
+            INSIDE.fetch_sub(1, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(2, 2, &mut q), S_OK);
+        for i in 0..50 {
+            let context = i as *mut c_void;
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(q, WORK, 0, context, Some(record)),
+                S_OK
+            );
+        }
+        let start = Instant::now();
+        while lock(&ORDER).len() < 50 && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*lock(&ORDER), (0..50).collect::<Vec<_>>());
+        assert_eq!(OVERLAPS.load(Ordering::SeqCst), 0);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// Delayed callbacks run once due, in the order they fall due.
+    #[test]
+    fn delayed_callbacks_run_when_due() {
+        static RAN: Mutex<Vec<(usize, Duration)>> = Mutex::new(Vec::new());
+        static START: Mutex<Option<Instant>> = Mutex::new(None);
+        extern "system" fn ran(context: *mut c_void, _: bool) {
+            let start = lock(&START).unwrap();
+            lock(&RAN).push((context as usize, start.elapsed()));
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        *lock(&START) = Some(Instant::now());
+        for ms in [60usize, 20, 40] {
+            let context = ms as *mut c_void;
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(q, WORK, ms as u32, context, Some(ran)),
+                S_OK
+            );
+        }
+        let start = Instant::now();
+        while lock(&RAN).len() < 3 && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ran = lock(&RAN).clone();
+        assert_eq!(ran.iter().map(|r| r.0).collect::<Vec<_>>(), [20, 40, 60]);
+        assert!(
+            ran.iter()
+                .all(|&(ms, at)| at >= Duration::from_millis(ms as u64)),
+            "{ran:?}"
+        );
+        XTaskQueueCloseHandle(q);
     }
 
     #[test]
