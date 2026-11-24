@@ -2807,6 +2807,38 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads data0 of lane (address + offset) / 4 mod 32;
+            // a source lane outside EXEC gives 0. No LDS is involved.
+            if self.x.native.wave64 {
+                return Err("ds_bpermute_b32 in a 64-lane wave");
+            }
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let (o, two, k31) = (self.s.m.i32(offset), self.s.m.i32(2), self.s.m.i32(31));
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let src = self.s.m.bin(c, Bin::LShr, at, two);
+            let src = self.s.m.bin(c, Bin::And, src, k31);
+            let r = self.read_lane(x, src);
+            // EXEC: the host lanes here, less those the guard leaves out.
+            let active = match guard {
+                Some(g) => g,
+                None => self.s.m.bool(true),
+            };
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let exec = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active]);
+            let exec = self.s.m.extract(c, exec, 0);
+            let on = self.lane_bit_of(c, src, exec, None);
+            let z = self.s.m.i32(0);
+            let r = self.s.m.select(c, on, r, z);
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }

@@ -127,6 +127,8 @@ mod join_tests;
 #[cfg(all(test, windows))]
 mod kind_tests;
 mod lower;
+#[cfg(all(test, windows))]
+mod permute_tests;
 mod rectangles;
 mod sampler;
 mod shader;
