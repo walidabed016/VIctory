@@ -284,21 +284,31 @@ impl State {
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
+        // A target without a host texture keeps its slot as a null view, so
+        // the targets after it stay in theirs.
+        let null = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT(28),
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
+                rtvs.push(host.rtv(None, Some(&null)));
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                let desc = (!record.resource.is_null()).then(|| record.desc());
+                rtvs.push(host.rtv(None, Some(&desc.flatten().unwrap_or(null))));
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1694,6 +1704,34 @@ void main() {
         crate::shadow::unregister(p, start);
         release(p);
         assert_eq!(got, want, "words and kinds read through slots 37 and 9");
+    }
+
+    /// Render targets the host has no texture or no view for keep their
+    /// slots as null views, so the targets after them stay in theirs.
+    #[test]
+    fn missing_render_targets_keep_their_slots() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let memory = Box::leak(vec![0u8; 0x2_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        // A 64x64 R8G8B8A8_UNORM render target the title placed.
+        let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 0x1, 0];
+        let target = crate::resource::texture_at(address, &desc).expect("a host texture");
+        // Render target view records: the tag, whether described, the
+        // resource, the description.
+        let tag = u64::from(u32::from_le_bytes(*b"vRTV"));
+        let records = [[tag, 0, 0, 0, 0], [tag, target as u64, 0, 0, 0]];
+        let handles = [0, records[0].as_ptr() as u64, records[1].as_ptr() as u64];
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_targets(&list, &handles, 0);
+        assert_eq!(state.targets, [target as usize]);
+        // SAFETY: an open list.
+        unsafe { list.list.Close() }.unwrap();
+        host.execute(&[&list]);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Reads the record of the slot in the root constant, the records'
