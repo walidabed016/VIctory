@@ -134,6 +134,8 @@ mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
 mod stride_tests;
+#[cfg(all(test, windows))]
+mod typed_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

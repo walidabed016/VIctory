@@ -1006,6 +1006,8 @@ pub enum View<'a> {
     Uint64TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV in this 4-byte format holding these dwords.
+    TypedUavOf(DXGI_FORMAT, &'a [u32]),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1244,7 +1246,10 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::RawUavOf(_) | View::HalfUav(_) => {
+                    View::RawUav(_)
+                    | View::RawUavOf(_)
+                    | View::HalfUav(_)
+                    | View::TypedUavOf(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::RawUavOf(data) => {
@@ -1259,6 +1264,10 @@ impl Host {
                             ),
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::TypedUavOf(format, data) => {
+                                let n = data.len() as u32;
+                                (n, format, n, D3D12_BUFFER_UAV_FLAG_NONE)
                             }
                             _ => unreachable!(),
                         };
@@ -1280,7 +1289,7 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
-                        if let View::RawUavOf(data) = *v {
+                        if let View::RawUavOf(data) | View::TypedUavOf(_, data) = *v {
                             // Promoted to a copy destination from the common
                             // state by the copy.
                             let up = upload(data)?;
