@@ -1068,6 +1068,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            Shape::F16Sum(src, mask, ident, high) => return self.f16_sum(src, mask, ident, high),
         };
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
@@ -1201,6 +1202,61 @@ impl<'a> Lower<'a> {
                 self.as_int(r)
             }
         }
+    }
+
+    /// [`Shape::F16Sum`](super::wave::Shape::F16Sum) in lockstep, where
+    /// every lane of both halves runs: the console's tree in order (in each
+    /// half lanes l and l ^ n for n = 1, 2, 4, 8, 16, then the halves),
+    /// each sum exact in f32 and rounded to the nearest even f16 as
+    /// `v_add_f16` rounds it ([`Self::f16_nearest`]); in the high half,
+    /// lane `high`'s.
+    fn f16_sum(&mut self, src: Value, mask: Value, ident: u32, high: u32) -> Result<V, Why> {
+        if !self.lockstep() {
+            return Err("an f16 wave sum outside lockstep");
+        }
+        let ids = self.halves.as_ref().and_then(|h| h.ids).ok_or(APART)?;
+        let c = self.cur;
+        let on = self.mask_bit(mask, "a wave reduction's untracked mask")?;
+        let x = self.i32_of(src)?;
+        let id = self.s.m.i32(ident);
+        let x = self.s.m.select(c, on, x, id);
+        self.s.flags |= flags::WAVE_OPS;
+        let add = |l: &mut Self, a: V, b: V| {
+            let (c, f32t) = (l.cur, l.s.t.f32);
+            let fa = l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[a]);
+            let fb = l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[b]);
+            let r = l.s.m.bin(c, Bin::Add, fa, fb);
+            l.f16_nearest(r)
+        };
+        let low = self.s.m.i32(0xFFFF);
+        let mut sum = self.s.m.bin(c, Bin::And, x, low);
+        for n in [1, 2, 4, 8, 16] {
+            let n = self.s.m.i32(n);
+            let other = self.s.m.bin(c, Bin::Xor, ids.lane, n);
+            let theirs = self.read_lane(sum, other);
+            sum = add(self, sum, theirs);
+        }
+        let lane = self.s.m.i32(high);
+        let top = self.read_lane(x, lane);
+        let [(sum0, sum1), (top0, top1)] = self.exchange([sum, top], APART)?;
+        // A console wave with no upper half adds its 32 lanes of `ident`.
+        let (sum1, top1) = match ids.upper {
+            None => (sum1, top1),
+            Some(u) if ident & 0x7FFF == 0 => {
+                let (c, empty) = (self.cur, self.s.m.i32(ident & 0xFFFF));
+                (
+                    self.s.m.select(c, u, sum1, empty),
+                    self.s.m.select(c, u, top1, id),
+                )
+            }
+            Some(_) => return Err("an f16 wave sum of a nonzero identity over a half wave"),
+        };
+        let total = add(self, sum1, sum0);
+        let c = self.cur;
+        let keep = self.s.m.i32(0xFFFF_0000);
+        let top = if high < 32 { top0 } else { top1 };
+        let top = self.s.m.bin(c, Bin::And, top, keep);
+        Ok(self.s.m.bin(c, Bin::Or, top, total))
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -1873,6 +1929,46 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let stepped = self.s.m.bin(c, Bin::Sub, h, one);
         self.s.m.select(c, away, stepped, h)
+    }
+
+    /// `f` as an f16 in the low bits, rounded to nearest even as the
+    /// console's f16 results are (the MODE default), from its bits: DXIL's
+    /// conversion rounds toward zero on the RTX 4090 and WARP, and turns an
+    /// overflow into the largest finite half. A NaN gives a quiet NaN.
+    fn f16_nearest(&mut self, f: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+        let x = self.as_int(f);
+        let (k16, k8000) = (k(self, 16), k(self, 0x8000));
+        let sign = self.s.m.bin(c, Bin::LShr, x, k16);
+        let sign = self.s.m.bin(c, Bin::And, sign, k8000);
+        let abs = k(self, 0x7FFF_FFFF);
+        let a = self.s.m.bin(c, Bin::And, x, abs);
+        // Normal halves: rebiased, 13 bits rounded off, ties to even.
+        let (k13, k1) = (k(self, 13), k(self, 1));
+        let odd = self.s.m.bin(c, Bin::LShr, a, k13);
+        let odd = self.s.m.bin(c, Bin::And, odd, k1);
+        let rebias = k(self, 0x3800_0000 - 0xFFF);
+        let n = self.s.m.bin(c, Bin::Sub, a, rebias);
+        let n = self.s.m.bin(c, Bin::Add, n, odd);
+        let normal = self.s.m.bin(c, Bin::LShr, n, k13);
+        // Below 2^-14: whole 2^-24ths, nearest even.
+        let fa = self.unary(6, f);
+        let scale = self.s.m.f32(0x4B80_0000);
+        let t = self.s.m.bin(c, Bin::Mul, fa, scale);
+        let t = self.unary(26, t);
+        let small = self.s.m.cast(c, Cast::FpToUi, t, self.s.t.i32);
+        let below = k(self, 0x3880_0000);
+        let is_small = self.s.m.cmp(c, pred::IULT, a, below);
+        let m = self.s.m.select(c, is_small, small, normal);
+        // From 65520 on (and infinity): infinity; NaN: a quiet NaN.
+        let (big, inf) = (k(self, 0x477F_F000), k(self, 0x7C00));
+        let is_big = self.s.m.cmp(c, pred::IUGE, a, big);
+        let m = self.s.m.select(c, is_big, inf, m);
+        let (top, qnan) = (k(self, 0x7F80_0000), k(self, 0x7E00));
+        let nan = self.s.m.cmp(c, pred::IUGT, a, top);
+        let m = self.s.m.select(c, nan, qnan, m);
+        self.s.m.bin(c, Bin::Or, sign, m)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's

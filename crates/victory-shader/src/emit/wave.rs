@@ -9,7 +9,10 @@
 //! prefix of one operation over the lanes' (masked) inputs, which DXIL's
 //! wave operations compute over the host's active lanes. No instruction
 //! sequence is matched; any step the simulation does not model leaves the
-//! values it writes unknown.
+//! values it writes unknown. An f16 sum rounds at every step, so the order
+//! of its steps is its result: it is followed only where each step adds two
+//! aligned blocks of lanes that make one, as the console's tree does, and
+//! the host adds them in that order.
 
 use std::collections::HashMap;
 
@@ -88,6 +91,16 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// In the low half, the f16 sum of the low halves of `lanes`'
+    /// `mask ? src : ident`, each aligned block of 2n lanes the sum of its
+    /// two blocks of n (`v_add_f16`); in the high half, lane `high`'s.
+    F16Sum {
+        src: Value,
+        mask: Value,
+        ident: u32,
+        lanes: u64,
+        high: u32,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -101,6 +114,8 @@ pub(crate) enum Shape {
     Active(Op, Value, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
+    /// [`Sym::F16Sum`] over every lane: `src`, `mask`, `ident`, `high`.
+    F16Sum(Value, Value, u32, u32),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -226,6 +241,51 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
                 mask,
                 ident,
                 lanes: la | lb,
+            }
+        }
+        _ => Sym::Unknown,
+    }
+}
+
+/// `v_add_f16` of `a` and `b` into `dst`: the sums of two aligned blocks
+/// of n lanes that make one of 2n, else unknown; the high half stays
+/// `dst`'s.
+fn f16_sum(a: Sym, b: Sym, dst: Sym) -> Sym {
+    let part = |s: Sym| match s {
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } => Some(((src, mask, ident), lanes, lanes.trailing_zeros())),
+        Sym::F16Sum {
+            src,
+            mask,
+            ident,
+            lanes,
+            high,
+        } => Some(((src, mask, ident), lanes, high)),
+        _ => None,
+    };
+    // An aligned block of n lanes, n a power of two: its first lane and n.
+    let block = |lanes: u64| {
+        let (at, n) = (lanes.trailing_zeros(), lanes.count_ones());
+        (n.is_power_of_two() && at.is_multiple_of(n) && lanes == u64::MAX >> (64 - n) << at)
+            .then_some((at, n))
+    };
+    let (Some(x), Some(y), Some(d)) = (part(a), part(b), part(dst)) else {
+        return Sym::Unknown;
+    };
+    match (block(x.1), block(y.1)) {
+        (Some((at, n)), Some((bt, m))) if n == m && at ^ bt == n && x.0 == y.0 && x.0 == d.0 => {
+            let (src, mask, ident) = x.0;
+            Sym::F16Sum {
+                src,
+                mask,
+                ident,
+                lanes: x.1 | y.1,
+                high: d.2,
             }
         }
         _ => Sym::Unknown,
@@ -470,6 +530,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
+            ("v_add_f16", Some(a)) if v.opsel == 0 => {
+                let b = src(1).unwrap_or_default();
+                (0..wave as usize)
+                    .map(|l| b.get(l).map_or(Sym::Unknown, |&b| f16_sum(a[l], b, old[l])))
+                    .collect()
+            }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
@@ -532,6 +598,13 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::F16Sum {
+            src,
+            mask,
+            ident,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::F16Sum(src, mask, ident, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -575,6 +648,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::F16Sum {
+                src,
+                mask,
+                ident,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::F16Sum(src, mask, ident, high)),
             _ => None,
         };
     }
@@ -676,6 +756,46 @@ mod tests {
         assert_eq!(
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
+        );
+    }
+
+    #[test]
+    fn f16_sums_follow_only_the_consoles_tree() {
+        let (x, m) = (Value(1), Value(2));
+        let one = |l: u32| Sym::Red {
+            op: None,
+            src: x,
+            mask: m,
+            ident: 0,
+            lanes: 1 << l,
+        };
+        let sum = |lanes: u64, high: u32| Sym::F16Sum {
+            src: x,
+            mask: m,
+            ident: 0,
+            lanes,
+            high,
+        };
+        assert_eq!(f16_sum(one(1), one(0), one(0)), sum(0b11, 0));
+        assert_eq!(
+            f16_sum(sum(0b1100, 3), sum(0b11, 0), one(1)),
+            sum(0b1111, 1)
+        );
+        // Lanes 0 and 2, a pair and a lane, pairs 2-3 and 4-5 and a pair
+        // twice are no step of the tree.
+        assert_eq!(f16_sum(one(0), one(2), one(0)), Sym::Unknown);
+        assert_eq!(f16_sum(sum(0b11, 0), one(2), one(0)), Sym::Unknown);
+        assert_eq!(
+            f16_sum(sum(0b1100, 2), sum(0b11_0000, 4), one(2)),
+            Sym::Unknown
+        );
+        assert_eq!(f16_sum(sum(0b11, 1), sum(0b11, 0), one(0)), Sym::Unknown);
+        // The high half kept is the destination's.
+        let all = f16_sum(sum(u64::MAX << 32, 32), sum(u64::MAX >> 32, 0), one(5));
+        assert_eq!(all, sum(u64::MAX, 5));
+        assert_eq!(
+            per_lane(&[all; 64], u64::MAX),
+            Some(Shape::F16Sum(x, m, 0, 5))
         );
     }
 }

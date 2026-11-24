@@ -1231,3 +1231,115 @@ fn whole_wave_reductions_and_prefixes_where_lanes_split_are_the_console_waves() 
         }
     }
 }
+
+/// Whole-wave f16 sums (`v_add_f16`, which rounds every step): lanes
+/// whose index in their console wave is at least 24 times the wave's go in
+/// (`v_cmpx`, `s_cbranch_execz`); there each stores the sum over the lanes
+/// of a mask (index bit 1 clear) and the saved EXEC of dwords holding
+/// (1 + (211f mod 1024) / 1024) * 2^(bit 2 of f) in the low half and
+/// f + 1000 in the high, from 0x1234_0000. Each order of the additions,
+/// rounding toward zero or once at the end gives another sum. `barrier`: an `s_barrier` first, where the console
+/// waves meet.
+fn f16_sums(threads: [u32; 3], barrier: bool) -> Vec<u32> {
+    let mut w = prologue(threads);
+    if barrier {
+        w.push(sopp(0x0A, 0));
+    }
+    w.extend([vop2(0x0B, 11, 255, 3), 211]);
+    w.extend([vop2(0x1B, 11, 255, 11), 0x3FF]);
+    w.push(vop2(0x1A, 12, inline(8), 3));
+    w.extend([vop2(0x1B, 12, 255, 12), 0x400]);
+    w.push(vop2(0x1C, 11, v(12), 11));
+    w.extend([vop2(0x25, 11, 255, 11), 0x3C00]);
+    w.extend([vop2(0x25, 12, 255, 3), 1000]);
+    w.extend([vop2(0x1A, 12, inline(16), 12), vop2(0x1C, 11, v(12), 11)]);
+    w.extend([
+        vop2(0x1B, 12, inline(2), 3),
+        vopc(0xC2, ZERO, 12),
+        sop1(0x04, 24, VCC_LO),
+    ]);
+    w.extend(mov_k(5, DEAD));
+    w.extend([
+        vop2(0x16, 8, inline(6), 3),
+        vop2(0x0B, 8, inline(24), 8),
+        vop2(0x1B, 9, inline(63), 3),
+        SAVE_EXEC,
+        vopc(0xD3, v(8), 9),
+    ]);
+    let mut region = wave_reduction(0x32, 0x1234_0000, 11, 26);
+    region.push(vop1(0x001, 5, 26));
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    w.extend(store(5, 4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// `n` (in 1024ths: 0, or from 1024 on) rounded to the 11 significant
+/// bits of an f16, nearest even.
+fn f16_round(n: u32) -> u32 {
+    let shift = (32 - n.leading_zeros()).saturating_sub(11);
+    if shift == 0 {
+        return n;
+    }
+    let (q, r, half) = (n >> shift, n & ((1 << shift) - 1), 1 << (shift - 1));
+    let up = r > half || r == half && q & 1 == 1;
+    (q + u32::from(up)) << shift
+}
+
+/// The console's tree over `n`: each half summed alike, then the two.
+fn f16_tree(n: &[u32]) -> u32 {
+    match n {
+        [x] => *x,
+        _ => {
+            let (a, b) = n.split_at(n.len() / 2);
+            f16_round(f16_tree(a) + f16_tree(b))
+        }
+    }
+}
+
+#[test]
+fn whole_wave_f16_sums_round_each_step_of_the_consoles_tree() {
+    for (threads, barrier) in [
+        ([64, 1, 1], false),
+        ([32, 1, 1], false),
+        ([16, 16, 1], false),
+        ([16, 16, 1], true),
+    ] {
+        let total: u32 = threads.iter().product();
+        let (shader, waves, _) = build(&f16_sums(threads, barrier), threads, 0);
+        assert_eq!(waves, Waves::Lockstep, "{threads:?}");
+        let inside = |f: u32| f < total && f % 64 >= 24 * (f / 64);
+        let counted = |f: u32| inside(f) && f & 2 == 0;
+        let want = |f: u32| {
+            let wave = f / 64 * 64;
+            let n: Vec<u32> = (wave..wave + 64)
+                .map(|g| {
+                    if counted(g) {
+                        (1024 + ((211 * g) & 0x3FF)) << (g >> 2 & 1)
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let sum = f16_tree(&n);
+            // An f16 from 1024ths of 1 on: exponent and 10 bits.
+            let bits = match 31 - sum.leading_zeros() {
+                _ if sum == 0 => 0,
+                e => (e + 5) << 10 | sum >> (e - 10) & 0x3FF,
+            };
+            let high = if counted(wave) { wave + 1000 } else { 0x1234 };
+            high << 16 | bits
+        };
+        for (label, got) in run(&shader, total * SLOTS) {
+            for f in 0..total {
+                let w = if inside(f) { want(f) } else { DEAD };
+                assert_eq!(
+                    slots(&got, f, 1),
+                    [w],
+                    "{label} {threads:?} {barrier}: thread {f}"
+                );
+            }
+        }
+    }
+}
