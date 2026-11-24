@@ -7,6 +7,8 @@
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
 //!    an entry whose description differs, so neither is ever used.
+//!    Pipelines compiled with Aftermath's features on are kept in a library
+//!    of their own (the driver may compile them differently).
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -60,7 +62,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
+                .and_then(|d| std::fs::read(d.join(library_file())).ok())
                 .unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
@@ -69,6 +71,15 @@ fn library() -> Option<&'static Mutex<Library>> {
             library.map(Mutex::new)
         })
         .as_ref()
+}
+
+/// The library's file name, by the Aftermath features compiles run with.
+fn library_file() -> String {
+    #[cfg(feature = "diagnostics")]
+    if let Some(features) = crate::aftermath::features() {
+        return format!("host-pipelines-aftermath-{features:x}.bin");
+    }
+    LIBRARY_FILE.to_owned()
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -113,11 +124,11 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    // Diagnostics: with Aftermath on, the driver compiles every pipeline
-    // here, which is when it makes the shader debug information a crash
-    // dump's decoding needs (a stored pipeline skips the compile).
+    // Diagnostics: with Aftermath's shader debug information on, the driver
+    // compiles every pipeline here, which is when it makes the information
+    // a crash dump's decoding needs (a stored pipeline skips the compile).
     #[cfg(feature = "diagnostics")]
-    if crate::aftermath::on() {
+    if crate::aftermath::shader_info() {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     }
@@ -178,7 +189,7 @@ pub(crate) fn save(now: bool) {
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(

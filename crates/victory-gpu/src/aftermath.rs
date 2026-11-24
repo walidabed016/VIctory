@@ -42,11 +42,12 @@ const WATCH_DX: u32 = 1;
 /// those of a dump's shaders, when it is made.
 const DEFER_DEBUG_INFO: u32 = 1;
 /// `GFSDK_Aftermath_FeatureFlags`: markers, resource tracking, call stacks
-/// (only with the Aftermath monitor running), shader debug information,
-/// shader error reporting.
-const FEATURES: u32 = 0x1 | 0x2 | 0x4000_0000 | 0x8 | SHADER_ERRORS;
+/// (only with the Aftermath monitor running), shader error reporting.
+const FEATURES: u32 = 0x1 | 0x2 | 0x4000_0000 | SHADER_ERRORS;
 /// `GFSDK_Aftermath_FeatureFlags_EnableShaderErrorReporting`.
 const SHADER_ERRORS: u32 = 0x10;
+/// `GFSDK_Aftermath_FeatureFlags_GenerateShaderDebugInfo`.
+const SHADER_INFO: u32 = 0x8;
 /// `GFSDK_Aftermath_GpuCrashDumpDecoderFlags_ALL_INFO`.
 const ALL_INFO: u32 = 0x3fff;
 /// `GFSDK_Aftermath_GpuCrashDumpFormatterFlags_UTF8_OUTPUT`.
@@ -227,8 +228,9 @@ struct Aftermath {
     api: Api,
     /// Where dumps and shader debug information go.
     dir: PathBuf,
-    /// Whether the host device's features are on.
+    /// Whether the host device's features are on, and which.
     device: AtomicBool,
+    features: AtomicU32,
     /// The last crash dump and its file.
     dump: Mutex<Option<(PathBuf, Vec<u8>)>>,
     /// Shader debug information the driver handed over, by identifier.
@@ -297,6 +299,7 @@ fn load() -> Option<Aftermath> {
         api,
         dir,
         device: AtomicBool::new(false),
+        features: AtomicU32::new(0),
         dump: Mutex::new(None),
         debug_info: Mutex::default(),
         shaders: Mutex::default(),
@@ -321,17 +324,26 @@ pub(crate) fn initialize(device: &ID3D12Device, debug_layer: bool) {
     // `VICTORY_AFTERMATH_ERRORS=0`: without shader error reporting, so only
     // real hangs and page faults end the run (the reporting also stops it at
     // shader errors the driver otherwise lets pass).
-    let features = if std::env::var("VICTORY_AFTERMATH_ERRORS").is_ok_and(|v| v == "0") {
-        FEATURES & !SHADER_ERRORS
-    } else {
-        FEATURES
-    };
+    let mut features = FEATURES;
+    if std::env::var("VICTORY_AFTERMATH_ERRORS").is_ok_and(|v| v == "0") {
+        features &= !SHADER_ERRORS;
+    }
+    // `VICTORY_AFTERMATH_SHADER_INFO=1`: with shader debug information (the
+    // dxil:N lines), which makes the driver's compiles several times slower
+    // and keeps pipelines out of the pipeline library (runs 68-71: 20-340 s
+    // for compute pipelines that take 0.1-33 s without).
+    if std::env::var("VICTORY_AFTERMATH_SHADER_INFO").is_ok_and(|v| v == "1") {
+        features |= SHADER_INFO;
+    }
     let result = unsafe { (a.api.dx12_initialize)(VERSION, features, device.as_raw()) };
     if succeeded(result) {
+        a.features.store(features, Ordering::Relaxed);
         a.device.store(true, Ordering::Relaxed);
         tracing::info!(
+            shader_debug_information = features & SHADER_INFO != 0,
+            shader_error_reporting = features & SHADER_ERRORS != 0,
             "Aftermath on the host device: markers, resource tracking, call stacks (with the \
-             Aftermath monitor running), shader debug information, shader error reporting"
+             Aftermath monitor running)"
         );
     } else {
         tracing::warn!(
@@ -341,9 +353,17 @@ pub(crate) fn initialize(device: &ID3D12Device, debug_layer: bool) {
     }
 }
 
-/// Whether Aftermath's features are on for the host device.
-pub(crate) fn on() -> bool {
-    get().is_some_and(|a| a.device.load(Ordering::Relaxed))
+/// Aftermath's features on the host device, if they are on (they change
+/// what the driver compiles into a pipeline).
+pub(crate) fn features() -> Option<u32> {
+    get()
+        .filter(|a| a.device.load(Ordering::Relaxed))
+        .map(|a| a.features.load(Ordering::Relaxed))
+}
+
+/// Whether the driver makes shader debug information as it compiles.
+pub(crate) fn shader_info() -> bool {
+    features().is_some_and(|f| f & SHADER_INFO != 0)
 }
 
 /// Records the shaders of a host pipeline by the SDK's hash of their code,
@@ -963,7 +983,7 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU
         };
-        assert!(on(), "Aftermath refused the host device (see the log)");
+        assert!(features().is_some(), "Aftermath refused the host device (see the log)");
         // No bindings: the host root signature declares what the shader's
         // translation reads, and this one reads nothing.
         const SOURCE: &str = "[numthreads(64, 1, 1)] void main() {}";
