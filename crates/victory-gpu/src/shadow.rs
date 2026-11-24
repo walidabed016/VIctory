@@ -2052,6 +2052,68 @@ pub(crate) mod tests {
         });
     }
 
+    /// Two copies arm the same block in one submission, the second after
+    /// the title's write saved it and a refresh guarded it again (a step
+    /// that writes title memory lies between them): the second copy took
+    /// that write, so the block's saved bytes are not what it held, and its
+    /// copy-back must not take the write for the GPU's and put it back over
+    /// the title's next one (runs 57, 60 and 64, title+0x4e9b54a).
+    #[test]
+    fn a_block_saved_before_another_copy_arms_it_keeps_the_titles_later_write() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = (964 * SLAB) as usize - 256 * MIB;
+        // Copies across views: not used in place.
+        let made = views(at, &[6 * MIB; 4]);
+        assert_eq!(made.len(), 4, "no free address for test views");
+        register(usize::MAX - 12, at as u64, (8 * MIB) as u64);
+        register(usize::MAX - 13, (at + 4 * MIB) as u64, (8 * MIB) as u64);
+        let a = find(at as u64, (8 * MIB) as u64).unwrap();
+        let b = find((at + 4 * MIB) as u64, (8 * MIB) as u64).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b) && !a.in_place && !b.in_place);
+        let (da, db) = ([(at, 8 * MIB)], [(at + 4 * MIB, 8 * MIB)]);
+        let x = at + 5 * MIB + 100;
+        // SAFETY: our view (guarded: our handler opens the block).
+        let write = |w: usize, v: u32| unsafe { (w as *mut u32).write(v) };
+        crate::watch::forget_asked();
+        a.update(at, 8 * MIB);
+        a.writing(at, 8 * MIB);
+        write(x, 1);
+        crate::watch::forget_asked();
+        b.update(at + 4 * MIB, 8 * MIB);
+        b.writing(at + 4 * MIB, 8 * MIB);
+        assert_eq!(held(&b, x), Some(1));
+        // While the GPU runs, the title writes the word again, and the GPU
+        // writes a word elsewhere in each copy.
+        write(x, 2);
+        let gpu = [(&a, at + MIB), (&b, at + 10 * MIB)];
+        for (s, w) in gpu {
+            // SAFETY: inside the copy's memory.
+            unsafe {
+                s.host_at(w - s.start as usize, 4)
+                    .cast::<u32>()
+                    .write(0xfeed)
+            };
+        }
+        crate::watch::forget_asked();
+        a.copy_back(&da);
+        crate::watch::forget_asked();
+        b.copy_back(&db);
+        crate::watch::disarm();
+        // SAFETY: our view.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        assert_eq!(read(x), 2, "the title's write was undone");
+        for (_, w) in gpu {
+            assert_eq!(read(w), 0xfeed);
+        }
+        drop((a, b));
+        unregister(usize::MAX - 12, at as u64);
+        unregister(usize::MAX - 13, (at + 4 * MIB) as u64);
+        unmap(&made);
+    }
+
     /// The word a copy holds for title address `at` (0 where it has no
     /// memory).
     fn held(s: &Shadow, at: usize) -> Option<u32> {

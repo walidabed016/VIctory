@@ -764,7 +764,10 @@ fn save(g: &mut Guards, from: usize, to: usize) {
 /// held before the submission is the block's saved bytes or the block
 /// itself ([`before`]). Armed are the whole blocks guarded and not written
 /// since, nor since the copy took them (`copied`: the asking after which
-/// the copy took a page, 0 if never). Returns the asking now and the runs
+/// the copy took a page, 0 if never), nor saved since an earlier arming of
+/// the submission: guarded again since, the block holds a write its saved
+/// bytes lack, which a copy that took it would put back over the title's
+/// next write (runs 57, 60 and 64). Returns the asking now and the runs
 /// of blocks of the range not armed. Waits for the runtime's unmappings.
 pub(crate) fn arm(
     start: usize,
@@ -780,7 +783,7 @@ pub(crate) fn arm(
         for (a, b) in g.protected.within(a, b) {
             let mut run: Option<usize> = None;
             for block in a..=b {
-                let current = block < b && {
+                let current = block < b && !g.saved.contains_key(&block) && {
                     let taken = copied(block * BLOCK / PAGE);
                     let written = j.written.get(&(block * BLOCK / PAGE)).copied().unwrap_or(0);
                     taken != 0 && written <= taken
