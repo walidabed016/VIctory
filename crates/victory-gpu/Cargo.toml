@@ -17,6 +17,9 @@ victory-pipeline.workspace = true
 victory-shader.workspace = true
 victory-core.workspace = true
 
+[build-dependencies]
+blake3.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
