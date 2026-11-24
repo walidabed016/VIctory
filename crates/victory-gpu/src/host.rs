@@ -1332,7 +1332,8 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    let (from, to) = staging.memory();
+                    if batch.texture_due(staging, from, to) {
                         #[cfg(feature = "diagnostics")]
                         let _charged = crate::copystat::charge(crate::copystat::Caller::Texture);
                         staging.refresh();
@@ -1358,7 +1359,9 @@ const NEAR: usize = 4 << 20;
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
-/// once, it is checked again only after a step that writes title memory.
+/// once, it is checked again only after a step that writes title memory,
+/// or a copy into its memory (into any physical-page memory, which other
+/// views may show).
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -1367,8 +1370,9 @@ struct Batch {
     /// wrote since (`watch::wrote`). Each flush asked about the world's
     /// 174 MB heap whole again (~0.2 s per frame).
     done: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, usize, usize)>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Staging buffers (by address) refreshed since the last title write,
+    /// and the title memory each detiles.
+    textures: std::collections::HashMap<usize, (usize, usize)>,
 }
 
 impl Batch {
@@ -1389,20 +1393,30 @@ impl Batch {
         }
     }
 
-    /// Whether `staging` is still to be refreshed in this submission (and
-    /// notes it refreshed).
-    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    /// Whether `staging`, which detiles title memory `[from, to)`, is still
+    /// to be refreshed in this submission (and notes it refreshed).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>, from: usize, to: usize) -> bool {
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
+        self.textures.insert(key, (from, to)).is_none()
     }
 
     /// After a copy into title memory `[dst, dst + len)`: its pages count
     /// as written (ranges already asked about in this submission take them
-    /// again), and textures are checked again. Pending refreshes wait: the
-    /// world's ~7,000 small copies per frame each flushed them and made
-    /// every range be asked about again (~0.3 s per frame).
+    /// again), and textures in them are checked again; all are after a copy
+    /// into physical-page memory, whose pages other views may show (the
+    /// title's pool and tiled heap). Pending refreshes wait: the world's
+    /// ~7,000 small copies per frame each flushed them and made every range
+    /// be asked about again (~0.3 s per frame), and checking every texture
+    /// again after each hashed ~180 MB a frame for ~15 MB changed.
     fn title_copied(&mut self, dst: usize, len: usize) {
-        self.textures.clear();
-        crate::watch::wrote(dst, dst + len);
+        let end = dst + len;
+        if crate::watch::view(dst) || crate::watch::view(end.saturating_sub(1).max(dst)) {
+            self.textures.clear();
+        } else {
+            self.textures
+                .retain(|_, &mut (from, to)| to <= dst || end <= from);
+        }
+        crate::watch::wrote(dst, end);
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -2197,12 +2211,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
         // The first list sampling each texture checks it ...
-        assert!(batch.texture_due(&a));
-        assert!(batch.texture_due(&b));
+        assert!(batch.texture_due(&a, 0, 0));
+        assert!(batch.texture_due(&b, 0, 0));
         // ... later lists of the same submission do not.
-        assert!(!batch.texture_due(&a));
-        assert!(!batch.texture_due(&a.clone()));
-        assert!(!batch.texture_due(&b));
+        assert!(!batch.texture_due(&a, 0, 0));
+        assert!(!batch.texture_due(&a.clone(), 0, 0));
+        assert!(!batch.texture_due(&b, 0, 0));
     }
 
     /// Ranges of a loose-memory mirror slab merge only with ranges near
@@ -2232,18 +2246,73 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn title_writes_make_textures_due_again() {
+        let _serial = crate::watch::serial();
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
-        // A copy into title memory or work that may write it may have
-        // changed the texture's memory.
+        assert!(batch.texture_due(&a, 0, 0));
+        assert!(!batch.texture_due(&a, 0, 0));
+        // Work that may write title memory may have changed the texture's
+        // memory.
         batch.title_written();
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, 0, 0));
+        assert!(!batch.texture_due(&a, 0, 0));
         // A fresh submission starts over.
         let mut next = Batch::default();
-        assert!(next.texture_due(&a));
+        assert!(next.texture_due(&a, 0, 0));
+    }
+
+    /// A copy into write-watched title memory makes only the textures in
+    /// it due again; one into physical-page memory, which other views may
+    /// show, makes them all due again.
+    #[test]
+    fn title_copies_make_the_textures_they_write_due_again() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+            VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let _serial = crate::watch::serial();
+        // SAFETY: write-watched memory and a view of a section, ours.
+        let (p, v) = unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                1 << 20,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                1 << 20,
+                std::ptr::null(),
+            );
+            (
+                p,
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 1 << 20).Value as usize,
+            )
+        };
+        assert!(p != 0 && v != 0);
+        let mut batch = Batch::default();
+        let (a, b, c) = (Arc::new(1u32), Arc::new(2u32), Arc::new(3u32));
+        assert!(batch.texture_due(&a, p, p + 4096));
+        assert!(batch.texture_due(&b, p + 65536, p + 131072));
+        assert!(batch.texture_due(&c, v, v + 4096));
+        batch.title_copied(p + 70000, 16);
+        assert!(!batch.texture_due(&a, p, p + 4096));
+        assert!(batch.texture_due(&b, p + 65536, p + 131072));
+        assert!(!batch.texture_due(&c, v, v + 4096));
+        batch.title_copied(v + 8192, 16);
+        assert!(batch.texture_due(&a, p, p + 4096));
+        assert!(batch.texture_due(&b, p + 65536, p + 131072));
+        assert!(batch.texture_due(&c, v, v + 4096));
+        // SAFETY: ours.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// The hashing a submission does for textures in physical-page memory,
@@ -2265,7 +2334,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             let started = std::time::Instant::now();
             for _ in 0..LISTS {
                 for t in &textures {
-                    if !dedupe || batch.texture_due(t) {
+                    if !dedupe || batch.texture_due(t, 0, 0) {
                         std::hint::black_box(blake3::hash(t));
                         hashed += 1;
                     }

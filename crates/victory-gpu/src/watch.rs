@@ -267,7 +267,7 @@ pub(crate) fn resident(start: usize, end: usize) -> bool {
 /// (~0.3 us); asking `VirtualQuery` for every guarded asking walked the
 /// title's big views to their ends, ~0.3 s per world frame. Other pages are
 /// told apart without it where they are write-watched (private memory).
-fn view(at: usize) -> bool {
+pub(crate) fn view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_MAPPED, MEMORY_BASIC_INFORMATION};
     use windows_sys::Win32::System::ProcessStatus::{
         K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
@@ -277,18 +277,26 @@ fn view(at: usize) -> bool {
     // SAFETY: plain data, the address filled in below.
     let mut page: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
     page.VirtualAddress = at as *mut _;
+    const VALID: usize = 1;
     // SAFETY: one entry of the right size; the union's flags are set for
     // valid and invalid pages alike.
-    let shared = unsafe {
-        K32QueryWorkingSetEx(
+    let flags = unsafe {
+        match K32QueryWorkingSetEx(
             GetCurrentProcess(),
             (&raw mut page).cast(),
             size_of_val(&page) as u32,
-        ) != 0
-            && page.VirtualAttributes.Flags & SHARED != 0
+        ) {
+            0 => 0,
+            _ => page.VirtualAttributes.Flags,
+        }
     };
-    if shared {
+    if flags & SHARED != 0 {
         return true;
+    }
+    // Resident and not shared: private (a title copy's destination, ~9,000
+    // a frame, is told apart by this alone).
+    if flags & VALID != 0 {
+        return false;
     }
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
     // SAFETY: room for one answer; without the reset flag nothing changes.
@@ -867,6 +875,7 @@ mod tests {
         // SAFETY: ours.
         unsafe { (p as *mut u8).write(1) };
         assert!(resident(p, p + 4096), "touched");
+        assert!(!view(p), "private, touched");
         // SAFETY: ours.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
