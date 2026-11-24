@@ -218,6 +218,50 @@ pub(crate) fn query(
     n
 }
 
+/// Whether every kernel page of `[start, end)` is in the working set or a
+/// committed page of a view, as the working set tells (a fraction of a us
+/// a page, many pages a call; `VirtualQuery` walks the page tables to the
+/// region's end, ~10 ms from the middle of a 1 GiB view). False says
+/// nothing: private pages not touched yet are committed too.
+pub(crate) fn resident(start: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const VALID: usize = 1;
+    const SHARED: usize = 1 << 15;
+    let pages = start / KERNEL_PAGE..end.div_ceil(KERNEL_PAGE);
+    let mut asked: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = Vec::new();
+    for first in pages.clone().step_by(4096) {
+        asked.clear();
+        asked.extend((first..pages.end.min(first + 4096)).map(|page| {
+            // SAFETY: plain data, the address filled in here.
+            let mut entry: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+            entry.VirtualAddress = (page * KERNEL_PAGE) as *mut _;
+            entry
+        }));
+        // SAFETY: `asked` holds entries of the size given; the system fills
+        // in their flags.
+        let told = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                asked.as_mut_ptr().cast(),
+                size_of_val(asked.as_slice()) as u32,
+            ) != 0
+        };
+        let answered = |e: &PSAPI_WORKING_SET_EX_INFORMATION| {
+            // SAFETY: the union's flags are set for valid and invalid pages
+            // alike.
+            let flags = unsafe { e.VirtualAttributes.Flags };
+            flags & (VALID | SHARED) != 0
+        };
+        if !told || !asked.iter().all(answered) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `at` is view memory. A committed page of a view is shared in
 /// the working set's terms, which the system tells for the page alone
 /// (~0.3 us); asking `VirtualQuery` for every guarded asking walked the
@@ -771,6 +815,62 @@ mod tests {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
             VirtualFree(p as *mut _, 0, MEM_RELEASE);
             VirtualFree(h as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Committed memory is told by the working set where it answers (view
+    /// pages, touched pages), by `VirtualQuery` where it does not.
+    #[test]
+    fn committed_memory_is_told_by_the_working_set() {
+        use crate::texture::committed;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+        const LEN: usize = 256 << 20;
+        // SAFETY: a section of ours with its first half committed, mapped
+        // read-write; private memory committed and not touched.
+        let (v, p) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let v = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize;
+            assert_eq!(
+                VirtualAlloc(v as *const _, LEN / 2, MEM_COMMIT, PAGE_READWRITE) as usize,
+                v
+            );
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+            (v, p as usize)
+        };
+        let mid = v + LEN / 4;
+        assert!(
+            resident(mid, mid + (4 << 20)),
+            "committed view pages, not touched"
+        );
+        assert!(committed(mid as *const u8, 4 << 20));
+        assert!(!resident(v + LEN / 2 - 4096, v + LEN / 2 + 4096));
+        assert!(!committed((v + LEN / 2 - 4096) as *const u8, 8192));
+        assert!(!committed((v + LEN / 2) as *const u8, 4096));
+        assert!(!resident(p, p + BLOCK), "private, not touched: no answer");
+        assert!(committed(p as *const u8, BLOCK));
+        // SAFETY: ours.
+        unsafe { (p as *mut u8).write(1) };
+        assert!(resident(p, p + 4096), "touched");
+        // SAFETY: ours.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
         }
     }
 

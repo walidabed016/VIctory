@@ -278,11 +278,15 @@ impl Drop for Detiling {
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// unmapped until their pages arrive): resident or view pages as the
+/// working set tells, else as `VirtualQuery` does.
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     let mut p = at as usize;
     let end = p + len;
+    if crate::watch::resident(p, end) {
+        return true;
+    }
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
