@@ -1759,6 +1759,7 @@ impl Meter {
                     heap[1],
                     heap[2]
                 );
+                crate::descriptor::audit();
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

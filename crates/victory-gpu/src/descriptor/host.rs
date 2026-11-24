@@ -282,6 +282,13 @@ impl HostHeap {
         self.count
     }
 
+    /// Diagnostics: the record (view index and generation) each title slot
+    /// was last made from, 0 where none is (see [`HostHeap::mirror`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn made_keys(&self) -> Vec<u64> {
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///

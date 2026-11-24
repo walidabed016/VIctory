@@ -569,6 +569,105 @@ pub(crate) extern "system" fn copy(
     }
 }
 
+/// Diagnostics (`VICTORY_HEAP_AUDIT=1`, logged with the meter's lines):
+/// the title's shader-visible view heaps against the host slots made of
+/// them. A shader that loads a slot's index from memory (the GPU-driven
+/// culling programs) reads only what the host made there: buffer views are
+/// made only for draws that name them, and a slot the title fills by
+/// copying descriptor bytes is made again only when a draw names it. Per
+/// heap: buffer and texture views made, never made and outdated (the
+/// title's record changed since the host made the slot), and the title
+/// buffers the buffer views not made view, most slots first.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn audit() {
+    use std::collections::BTreeMap;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_AUDIT").is_some()) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, which
+        // takes the lock held here).
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get().filter(|_| !heap.samplers()) else {
+            continue;
+        };
+        let made = host.made_keys();
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        // Made, never made, outdated.
+        let (mut buffers, mut textures) = ([0u64; 3], [0u64; 3]);
+        let (mut empty, mut released) = (0u64, 0u64);
+        // Buffer views not made, by title buffer (start, bytes): slots that
+        // are shader resource, unordered access and constant views.
+        let mut missing: BTreeMap<(u64, u64), [u64; 3]> = BTreeMap::new();
+        for (index, &key) in made.iter().enumerate().take(heap.desc.count as usize) {
+            let handle = start + index as u64 * 32;
+            // SAFETY: a descriptor slot of a live heap.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag != VIEW_TAG {
+                empty += 1;
+                continue;
+            }
+            let Some((view, _)) = views.list.get(i as usize).filter(|(_, g)| *g == generation)
+            else {
+                released += 1;
+                continue;
+            };
+            let state = if key == u64::from(generation) << 32 | u64::from(i) {
+                0
+            } else if key == 0 {
+                1
+            } else {
+                2
+            };
+            if !view.is_buffer() {
+                textures[state] += 1;
+                continue;
+            }
+            buffers[state] += 1;
+            if state == 0 {
+                continue;
+            }
+            let bytes =
+                |r: usize| crate::resource::buffer_bytes(r as This).map(|(p, n)| (p as u64, n));
+            let (kind, title) = match view {
+                View::Shader(r, _) => (0, bytes(*r)),
+                View::Unordered(r, _, _) => (1, bytes(*r)),
+                View::Constant(address, size) => (2, Some((*address, u64::from(*size)))),
+                View::Placed(unordered, ..) => (usize::from(*unordered), host::buffer_range(view)),
+                _ => continue,
+            };
+            missing.entry(title.unwrap_or((0, 0))).or_default()[kind] += 1;
+        }
+        drop(views);
+        tracing::info!(
+            "heap audit: view heap {start:#x} ({} slots): buffer views {} made, {} never made, {} outdated; \
+             texture views {} made, {} never made, {} outdated; {} of released resources, {} empty",
+            made.len(),
+            buffers[0],
+            buffers[1],
+            buffers[2],
+            textures[0],
+            textures[1],
+            textures[2],
+            released,
+            empty
+        );
+        let mut missing: Vec<_> = missing.into_iter().collect();
+        missing.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+        tracing::info!(
+            "heap audit: buffer views not made view {} title buffers (shader resource, unordered, constant slots)",
+            missing.len()
+        );
+        for ((address, len), [srv, uav, cbv]) in missing.iter().take(16) {
+            tracing::info!("heap audit:   {address:#x}+{len:#x}: {srv} srv, {uav} uav, {cbv} cbv");
+        }
+    }
+    tracing::info!(ms = started.elapsed().as_millis() as u64, "heap audit done");
+}
+
 /// The view recorded at `handle`, if one is.
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
