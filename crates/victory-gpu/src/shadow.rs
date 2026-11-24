@@ -127,10 +127,11 @@ fn give_back(v: Vec<u8>) {
     }
 }
 
-/// Runs `f` over `0..n` in parts, on several threads where the parts
-/// cover `len` bytes of at least 16 MiB (one thread copies or compares
-/// ~10 GB/s; the host's memory takes several times that). The results in
-/// order.
+/// Runs `f` over `0..n` in parts, on the split threads
+/// ([`crate::texture::split`], started once: a thread's start and end run
+/// every title image's thread notices, ~110 ms) where the parts cover `len`
+/// bytes of at least 16 MiB (one thread copies or compares ~10 GB/s; the
+/// host's memory takes several times that). The results in order.
 fn split<T: Send>(n: usize, len: usize, f: impl Fn(std::ops::Range<usize>) -> T + Sync) -> Vec<T> {
     let threads = match len {
         0..0x100_0000 => 1,
@@ -140,16 +141,13 @@ fn split<T: Send>(n: usize, len: usize, f: impl Fn(std::ops::Range<usize>) -> T 
         return vec![f(0..n)];
     }
     let per = n.div_ceil(threads);
-    std::thread::scope(|s| {
-        let f = &f;
-        let parts: Vec<_> = (0..threads)
-            .map(|k| s.spawn(move || f((k * per).min(n)..((k + 1) * per).min(n))))
-            .collect();
-        parts
-            .into_iter()
-            .map(|p| p.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
-    })
+    let parts = (0..threads)
+        .map(|k| (k * per).min(n)..((k + 1) * per).min(n))
+        .collect();
+    crate::texture::split(parts, f)
+        .into_iter()
+        .map(|done| done.unwrap_or_else(|e| std::panic::resume_unwind(e)))
+        .collect()
 }
 
 /// What a copy held before a submission, for its copy-back: snapshots
@@ -2372,6 +2370,19 @@ pub(crate) mod tests {
         drop(s);
         unregister(usize::MAX - 15, at as u64);
         unmap(&made);
+    }
+
+    /// Big splits run on the split threads, started once, not on threads
+    /// of their own each time (a thread's start and end run the title
+    /// images' thread notices, ~110 ms in the game).
+    #[test]
+    fn big_splits_run_on_threads_started_once() {
+        let mut ran = std::collections::HashSet::new();
+        for _ in 0..20 {
+            ran.extend(split(64, 64 << 20, |_| std::thread::current().id()));
+        }
+        // The split threads and this one, and other tests' that took a part.
+        assert!(ran.len() <= 10, "{} threads", ran.len());
     }
 
     /// The word a copy holds for title address `at` (0 where it has no

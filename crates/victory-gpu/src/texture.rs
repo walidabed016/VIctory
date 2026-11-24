@@ -467,7 +467,7 @@ fn detile_split(
 /// title image's thread notices (their TLS callbacks and `DllMain`), which
 /// made a split that started its own threads cost ~110 ms whatever its
 /// size (run 68: 12.7 MB a frame copied in 360 ms and detiled in 320 ms).
-fn split<I: Send, R: Send>(
+pub(crate) fn split<I: Send, R: Send>(
     items: Vec<I>,
     f: impl Fn(I) -> R + Sync,
 ) -> Vec<std::thread::Result<R>> {
