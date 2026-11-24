@@ -610,8 +610,16 @@ impl State {
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
-                        .map(|s| (s.gpu(*address), s.left(*address)));
+                    let host = crate::shadow::find(*address, 1).map(|s| {
+                        // Host address, bytes left in the copy, the copy's
+                        // title start and its first word there.
+                        (
+                            s.gpu(*address),
+                            s.left(*address),
+                            *address - s.offset(*address),
+                            s.peek(*address),
+                        )
+                    });
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
             }

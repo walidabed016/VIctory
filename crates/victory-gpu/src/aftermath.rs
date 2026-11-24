@@ -44,7 +44,9 @@ const DEFER_DEBUG_INFO: u32 = 1;
 /// `GFSDK_Aftermath_FeatureFlags`: markers, resource tracking, call stacks
 /// (only with the Aftermath monitor running), shader debug information,
 /// shader error reporting.
-const FEATURES: u32 = 0x1 | 0x2 | 0x4000_0000 | 0x8 | 0x10;
+const FEATURES: u32 = 0x1 | 0x2 | 0x4000_0000 | 0x8 | SHADER_ERRORS;
+/// `GFSDK_Aftermath_FeatureFlags_EnableShaderErrorReporting`.
+const SHADER_ERRORS: u32 = 0x10;
 /// `GFSDK_Aftermath_GpuCrashDumpDecoderFlags_ALL_INFO`.
 const ALL_INFO: u32 = 0x3fff;
 /// `GFSDK_Aftermath_GpuCrashDumpFormatterFlags_UTF8_OUTPUT`.
@@ -316,7 +318,15 @@ pub(crate) fn initialize(device: &ID3D12Device, debug_layer: bool) {
         tracing::info!("Aftermath with the D3D12 debug layer (the SDK supports both together)");
     }
     // SAFETY: a live device.
-    let result = unsafe { (a.api.dx12_initialize)(VERSION, FEATURES, device.as_raw()) };
+    // `VICTORY_AFTERMATH_ERRORS=0`: without shader error reporting, so only
+    // real hangs and page faults end the run (the reporting also stops it at
+    // shader errors the driver otherwise lets pass).
+    let features = if std::env::var("VICTORY_AFTERMATH_ERRORS").is_ok_and(|v| v == "0") {
+        FEATURES & !SHADER_ERRORS
+    } else {
+        FEATURES
+    };
+    let result = unsafe { (a.api.dx12_initialize)(VERSION, features, device.as_raw()) };
     if succeeded(result) {
         a.device.store(true, Ordering::Relaxed);
         tracing::info!(
@@ -688,6 +698,9 @@ fn summary(api: &Api, decoder: Handle, json: &[u8], shaders: &HashMap<u64, Arc<S
             name(&ENGINE, fault.engine),
             name(&UNIT, fault.client),
         ));
+        // Which host copy of title memory the address is next to.
+        text.push_str(&crate::shadow::near(fault.va));
+        text.push_str(&crate::descriptor::host::near_heaps(fault.va));
     } else {
         text.push_str("; no page fault");
     }
