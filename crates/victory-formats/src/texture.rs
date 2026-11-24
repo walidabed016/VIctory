@@ -594,7 +594,26 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        let rows = None;
+        self.walk(tiled.len(), mip, slice, rows, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
+    }
+
+    /// As [`Layout::detile`], element rows `rows` of a mip with one depth
+    /// slice only, into `linear`, which holds just those rows: a big
+    /// subresource is detiled by several threads.
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        rows: std::ops::Range<u32>,
+        linear: &mut [u8],
+        row_pitch: usize,
+    ) -> Result<(), Error> {
+        let rows = Some(rows);
+        self.walk(tiled.len(), mip, slice, rows, linear.len(), row_pitch, 0, |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
@@ -609,18 +628,22 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        let rows = None;
+        self.walk(tiled.len(), mip, slice, rows, linear.len(), row_pitch, depth_pitch, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length):
+    /// of every row, or of rows `rows` (one depth slice), the first of them
+    /// at linear offset 0.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
         tiled_len: usize,
         mip: u32,
         slice: u32,
+        rows: Option<std::ops::Range<u32>>,
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
@@ -642,11 +665,16 @@ impl Layout {
         if !self.addressable() {
             return Err(Error::Unsupported);
         }
+        let rows = match rows {
+            None => 0..m.height,
+            Some(r) if depth == 1 && r.start < r.end && r.end <= m.height => r,
+            Some(_) => return Err(Error::Invalid),
+        };
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .zip((rows.len() - 1).checked_mul(row_pitch))
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -674,8 +702,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy(tiled_row as usize, linear_row, bytes);
@@ -875,6 +903,56 @@ mod tests {
         let l = Layout::new(&desc(64, 64, 1, 16, Swizzle::SW_64KB_D)).unwrap();
         assert_eq!(l.block, [64, 64, 1]);
         assert_eq!((l.size, l.alignment), (65536, 65536));
+    }
+
+    /// A mip detiled in pieces of rows gives the rows detiling it whole
+    /// does; ranges past the mip, empty ones, and 3D mips are refused.
+    #[test]
+    fn rows_detile_as_the_whole_mip_does() {
+        let cases = [
+            desc(300, 200, 3, 4, Swizzle::SW_64KB_D),
+            desc(250, 175, 2, 8, Swizzle::SW_4KB_S),
+            desc(130, 97, 2, 2, Swizzle::LINEAR),
+            desc(64, 64, 1, 16, Swizzle::SW_64KB_D_X),
+        ];
+        for d in cases {
+            let l = Layout::new(&d).unwrap();
+            if !l.addressable() {
+                continue;
+            }
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 7 + i / 251) as u8).collect();
+            for mip in 0..l.mips.len() as u32 {
+                let m = &l.mips[mip as usize];
+                let pitch = m.width as usize * d.element_bytes as usize + 12;
+                let mut whole = vec![0; pitch * m.height as usize];
+                l.detile(&tiled, mip, 0, &mut whole, pitch, 0).unwrap();
+                let cut = m.height / 3;
+                let mut pieces = vec![0; whole.len()];
+                let (a, b) = pieces.split_at_mut(cut as usize * pitch);
+                if cut > 0 {
+                    l.detile_rows(&tiled, mip, 0, 0..cut, a, pitch).unwrap();
+                }
+                l.detile_rows(&tiled, mip, 0, cut..m.height, b, pitch).unwrap();
+                assert_eq!(pieces, whole, "{d:?} mip {mip}");
+                let mut out = vec![0; whole.len()];
+                for rows in [cut..cut, 0..m.height + 1] {
+                    let refused = l.detile_rows(&tiled, mip, 0, rows.clone(), &mut out, pitch);
+                    assert_eq!(refused, Err(Error::Invalid), "{rows:?}");
+                }
+            }
+        }
+        let deep = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 8,
+            ..desc(32, 32, 1, 4, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
+        let mut out = vec![0; 32 * 4 * 32];
+        let tiled = vec![0; deep.size as usize];
+        assert_eq!(
+            deep.detile_rows(&tiled, 0, 0, 0..32, &mut out, 32 * 4),
+            Err(Error::Invalid)
+        );
     }
 
     /// Every element of every mip and slice lands on its own address, inside

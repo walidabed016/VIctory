@@ -224,7 +224,7 @@ impl Staging {
             last.read.resize(size, 0);
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            read(&mut last.read, start);
             #[cfg(feature = "diagnostics")]
             crate::copystat::cost(crate::copystat::Op::Copy, started, start, size as u64);
             self.detile(&last.read);
@@ -341,10 +341,13 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
+            let detiled = if f.Depth == 1 && len >= SPLIT {
+                detile_split(&self.layout, tiled, mip, slice, linear, pitch)
+            } else {
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            };
+            if let Err(e) = detiled {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
@@ -373,6 +376,66 @@ fn verify_every() -> u64 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
+    })
+}
+
+/// A copy or a subresource this big is split between threads: on one, the
+/// world's screen-sized texture that changes every frame (14.7 MB) took
+/// ~2.4 ms a frame to detile, and as long again to copy.
+const SPLIT: usize = 4 << 20;
+
+/// Threads a big copy or detiling is split between.
+fn threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+}
+
+/// Reads title memory at `from` into `to` (its length) as
+/// [`crate::host::copy_mapped`] does, unmapped pages as zeros; split
+/// between threads when big.
+fn read(to: &mut [u8], from: usize) {
+    if to.len() < SPLIT {
+        crate::host::copy_mapped(to.as_mut_ptr(), from as *const u8, to.len(), false);
+        return;
+    }
+    let per = to.len().div_ceil(threads()).next_multiple_of(4096);
+    std::thread::scope(|s| {
+        for (k, chunk) in to.chunks_mut(per).enumerate() {
+            let at = from + k * per;
+            s.spawn(move || {
+                crate::host::copy_mapped(chunk.as_mut_ptr(), at as *const u8, chunk.len(), false)
+            });
+        }
+    });
+}
+
+/// [`victory_formats::texture::Layout::detile`] of a big subresource with
+/// one depth slice, its rows split between threads.
+fn detile_split(
+    layout: &victory_formats::texture::Layout,
+    tiled: &[u8],
+    mip: u32,
+    slice: u32,
+    linear: &mut [u8],
+    pitch: usize,
+) -> Result<(), victory_formats::texture::Error> {
+    let height = layout.mips[mip as usize].height;
+    let per = height.div_ceil(threads() as u32).max(1);
+    std::thread::scope(|s| {
+        let mut rest = linear;
+        let mut parts = Vec::new();
+        for first in (0..height).step_by(per as usize) {
+            let end = (first + per).min(height);
+            let n = ((end - first) as usize * pitch).min(rest.len());
+            let (rows, tail) = std::mem::take(&mut rest).split_at_mut(n);
+            rest = tail;
+            parts.push(
+                s.spawn(move || layout.detile_rows(tiled, mip, slice, first..end, rows, pitch)),
+            );
+        }
+        parts.into_iter().try_for_each(|p| {
+            p.join()
+                .unwrap_or(Err(victory_formats::texture::Error::Invalid))
+        })
     })
 }
 
@@ -665,5 +728,42 @@ pub(crate) mod seen {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// A big subresource detiled on several threads, and a big read of memory
+    /// split between them, give what one thread does.
+    #[test]
+    fn big_copies_and_detilings_split_between_threads() {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 2048,
+            height: 1031,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        })
+        .unwrap();
+        let memory: Vec<u8> = (0..layout.size as usize)
+            .map(|i| (i * 13 + i / 4093) as u8)
+            .collect();
+        assert!(memory.len() >= SPLIT);
+        let mut tiled = vec![0; memory.len()];
+        read(&mut tiled, memory.as_ptr() as usize);
+        assert!(tiled == memory);
+        let pitch = 2048 * 4 + 256;
+        let mut one = vec![0; pitch * 1031];
+        layout.detile(&tiled, 0, 0, &mut one, pitch, 0).unwrap();
+        let mut split = vec![0; one.len()];
+        detile_split(&layout, &tiled, 0, 0, &mut split, pitch).unwrap();
+        assert!(split == one);
     }
 }
