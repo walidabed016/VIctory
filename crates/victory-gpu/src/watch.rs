@@ -18,7 +18,7 @@
 //! hashed, not guarded. A system call writing into a guarded block fails
 //! (none is known to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -273,17 +273,86 @@ const BLOCK: usize = PAGE;
 
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
+    protected: Blocks,
     /// Of those, the ones not written since a copy took them; and blocks
     /// not mapped at all (placeholders in the title's tiled heaps), which
     /// read as zeros until the runtime maps them ([`title_memory_remapped`]).
-    clean: BTreeSet<usize>,
+    clean: Blocks,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    protected: Blocks(BTreeMap::new()),
+    clean: Blocks(BTreeMap::new()),
 });
+
+/// A set of blocks as runs (first, end), apart and in order, so that a
+/// check of a range costs what it holds of runs, not its blocks (the
+/// world's root views reach 36 MiB of guarded memory from each bind).
+struct Blocks(BTreeMap<usize, usize>);
+
+impl Blocks {
+    /// The runs that hold blocks of `[from, to)`, whole.
+    fn touching(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let first = self
+            .0
+            .range(..from)
+            .next_back()
+            .filter(|(_, end)| **end > from);
+        first
+            .into_iter()
+            .chain(self.0.range(from..to))
+            .map(|(&a, &b)| (a, b))
+            .collect()
+    }
+
+    /// The runs of `[from, to)` it holds, cut to it.
+    fn within(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let runs = self.touching(from, to).into_iter();
+        runs.map(|(a, b)| (a.max(from), b.min(to))).collect()
+    }
+
+    /// The runs of `[from, to)` it does not hold.
+    fn gaps(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut gaps = Vec::new();
+        let mut at = from;
+        for (a, b) in self.within(from, to) {
+            if at < a {
+                gaps.push((at, a));
+            }
+            at = b;
+        }
+        if at < to {
+            gaps.push((at, to));
+        }
+        gaps
+    }
+
+    fn insert(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (mut from, mut to) = (from, to);
+        // Runs it overlaps or meets join it.
+        let met: Vec<(usize, usize)> = self.touching(from.saturating_sub(1), to + 1);
+        for (a, b) in met {
+            self.0.remove(&a);
+            (from, to) = (from.min(a), to.max(b));
+        }
+        self.0.insert(from, to);
+    }
+
+    fn remove(&mut self, from: usize, to: usize) {
+        for (a, b) in self.touching(from, to) {
+            self.0.remove(&a);
+            if a < from {
+                self.0.insert(a, from);
+            }
+            if b > to {
+                self.0.insert(to, b);
+            }
+        }
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -299,22 +368,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let mut written = Vec::new();
-    let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-                continue;
+    for (from, to) in g.clean.gaps(start / BLOCK, end.div_ceil(BLOCK)) {
+        written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
+        // Blocks still read-only were written through the runtime: clean
+        // again. The others are guarded again.
+        let mut at = from;
+        for (a, b) in g.protected.within(from, to) {
+            if at < a {
+                protect(&mut g, at, a);
             }
+            g.clean.insert(a, b);
+            at = b;
         }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+        if at < to {
+            protect(&mut g, at, to);
         }
     }
     Some(written)
@@ -352,8 +419,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         set
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.protected.insert(from, to);
+        g.clean.insert(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -368,7 +435,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let n = query(block * BLOCK, &mut info);
         if n != 0 && info.State != MEM_COMMIT {
-            g.clean.insert(block);
+            g.clean.insert(block, block + 1);
         }
     }
 }
@@ -377,19 +444,17 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    let runs = g.protected.within(start / BLOCK, end.div_ceil(BLOCK));
+    for &(from, to) in &runs {
+        g.protected.remove(from, to);
+        g.clean.remove(from, to);
+        for block in from..to {
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        }
     }
-    !blocks.is_empty()
+    !runs.is_empty()
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -405,16 +470,10 @@ pub fn writing(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-    }
+    let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    g.protected.remove(from, to);
     // Unmapped blocks are clean without being guarded.
-    let blocks: Vec<usize> = g.clean.range(range).copied().collect();
-    for block in blocks {
-        g.clean.remove(&block);
-    }
+    g.clean.remove(from, to);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -573,6 +632,81 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn block_runs_join_and_split() {
+        let mut b = Blocks(BTreeMap::new());
+        b.insert(10, 20);
+        b.insert(20, 25);
+        b.insert(30, 40);
+        b.insert(5, 12);
+        assert_eq!(b.within(0, 100), [(5, 25), (30, 40)]);
+        assert_eq!(b.gaps(0, 50), [(0, 5), (25, 30), (40, 50)]);
+        b.remove(8, 9);
+        b.remove(24, 31);
+        assert_eq!(b.within(0, 100), [(5, 8), (9, 24), (31, 40)]);
+        assert_eq!(b.within(7, 33), [(7, 8), (9, 24), (31, 33)]);
+        assert_eq!(b.gaps(7, 33), [(8, 9), (24, 31)]);
+        b.insert(0, 50);
+        assert_eq!(b.within(0, 100), [(0, 50)]);
+    }
+
+    /// Guards are kept as runs: a check over a big view reports the blocks
+    /// written since (by the title, faulting, or through the runtime) and
+    /// guards them again, the view staying one run.
+    #[test]
+    fn guarded_blocks_are_kept_as_runs() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        let _serial = serial();
+        const N: usize = 1024;
+        // SAFETY: a pagefile section of N blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (N * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, N * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let pages =
+            |from: usize, to: usize| (view / PAGE + from..view / PAGE + to).collect::<Vec<_>>();
+        assert_eq!(guard(view, view + N * BLOCK), Some(pages(0, N)));
+        // SAFETY: our view; our handler opens the guarded blocks.
+        unsafe {
+            ((view + 5 * BLOCK + 8) as *mut u32).write(1);
+            ((view + 6 * BLOCK) as *mut u32).write(2);
+        }
+        writing(view + 700 * BLOCK, 100);
+        let mut written = pages(5, 7);
+        written.extend(pages(700, 701));
+        assert_eq!(guard(view, view + N * BLOCK), Some(written));
+        assert_eq!(guard(view, view + N * BLOCK), Some(Vec::new()));
+        let first = view / BLOCK;
+        assert_eq!(
+            guards().protected.within(first, first + N),
+            [(first, first + N)]
+        );
+        assert_eq!(
+            guards().clean.within(first, first + N),
+            [(first, first + N)]
+        );
+        title_memory_remapped(view, N * BLOCK);
+        assert!(guards().protected.within(first, first + N).is_empty());
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
     }
 
     /// View memory is told apart from write-watched memory and placeholders
