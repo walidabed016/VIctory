@@ -1,7 +1,8 @@
-//! End-to-end tests of `ds_bpermute_b32` in wave32 compute programs:
-//! synthetic GFX10 programs lowered to DXIL, validated by `dxil.dll` when
-//! present, and run on the host GPU (and WARP when it takes
-//! `WaveSize(32)`). Each thread stores what the console's wave gives it.
+//! End-to-end tests of cross-lane code in wave32 compute programs
+//! (`ds_bpermute_b32`, whole-wave sections): synthetic GFX10 programs
+//! lowered to DXIL, validated by `dxil.dll` when present, and run on the
+//! host GPU (and WARP when it takes `WaveSize(32)`). Each thread stores
+//! what the console's wave gives it.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -11,6 +12,7 @@ use crate::native::{
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+const VCC_LO: u8 = 106;
 const EXEC_LO: u8 = 126;
 /// Inline constant 0.
 const ZERO: u16 = 128;
@@ -23,6 +25,10 @@ const DEAD: u32 = 0xDEAD;
 
 const fn inline(n: u16) -> u16 {
     128 + n
+}
+
+const fn v(n: u8) -> u16 {
+    256 + n as u16
 }
 
 const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
@@ -74,8 +80,8 @@ const fn cmpx_ne_0(v: u8) -> u32 {
 }
 
 /// Lowers a wave32 compute program of [`THREADS`] threads whose UAV table
-/// is at s0, and validates it.
-fn build(words: &[u32]) -> HostShader {
+/// is at s0.
+fn lower32(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -109,7 +115,7 @@ fn build(words: &[u32]) -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -120,7 +126,11 @@ fn build(words: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
     })
-    .expect("lower");
+}
+
+/// [`lower32`], which must take the program, validated.
+fn build(words: &[u32]) -> HostShader {
+    let lowered = lower32(words).expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -225,6 +235,125 @@ fn backward_permutes_read_lanes_of_the_wave_and_0_outside_exec() {
             ];
             let at = (x * SLOTS) as usize;
             assert_eq!(got[at..at + 3], want, "{label}: thread {x}");
+        }
+    }
+}
+
+/// A VOP3 instruction.
+const fn vop3(op: u16, vdst: u8, src: [u16; 3]) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
+        (src[0] as u32 & 0x1FF) | (src[1] as u32 & 0x1FF) << 9 | (src[2] as u32 & 0x1FF) << 18,
+    ]
+}
+
+/// `v_add_co_u32 vdst, vcc_lo, src0, src1` (VOP3b).
+const fn add_co(vdst: u8, src0: u16, src1: u16) -> [u32; 2] {
+    [
+        0x35 << 26 | 0x30F << 16 | (VCC_LO as u32) << 8 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9,
+    ]
+}
+
+/// `v_mov_b32 vdst, vsrc` with DPP8 lane selects `sel`, or (`sel` none)
+/// `row_mirror bound_ctrl:1`.
+const fn mov_dpp(vdst: u8, vsrc: u8, sel: Option<[u32; 8]>) -> [u32; 2] {
+    let Some(sel) = sel else {
+        return [
+            vop1(0x001, vdst, 0xFA),
+            vsrc as u32 | 0x140 << 8 | 1 << 19 | 0xF << 24 | 0xF << 28,
+        ];
+    };
+    let mut s = 0;
+    let mut i = 0;
+    while i < 8 {
+        s |= sel[i] << (3 * i);
+        i += 1;
+    }
+    [vop1(0x001, vdst, 0xE9), vsrc as u32 | s << 8]
+}
+
+/// A whole-wave 64-bit sum as the console compiler expands it in a wave32
+/// program: of v[6:7] in the lanes of the saved EXEC (s13), with v[2:5]
+/// and VCC; the low dword to s2, the high one to s3.
+fn wave_sum64() -> Vec<u32> {
+    let mut w = vec![
+        sop1(0x3D, 13, 193),
+        vop1(0x001, 2, ZERO),
+        vop1(0x001, 3, ZERO),
+    ];
+    w.extend(vop3(0x101, 2, [v(2), v(6), 13]));
+    w.extend(vop3(0x101, 3, [v(3), v(7), 13]));
+    let add = |w: &mut Vec<u32>| {
+        w.extend(add_co(2, v(4), v(2)));
+        w.push(vop2(0x28, 3, v(5), 3));
+    };
+    for sel in [
+        Some([1, 0, 3, 2, 5, 4, 7, 6]),
+        Some([2, 2, 0, 0, 6, 6, 4, 4]),
+        Some([4, 4, 4, 4, 0, 0, 0, 0]),
+        None,
+    ] {
+        w.extend(mov_dpp(4, 2, sel));
+        w.extend(mov_dpp(5, 3, sel));
+        add(&mut w);
+    }
+    w.extend(vop3(0x378, 4, [v(2), ZERO, ZERO]));
+    w.extend(vop3(0x378, 5, [v(3), ZERO, ZERO]));
+    add(&mut w);
+    w.extend(vop3(0x360, 2, [v(2), ZERO, 0]));
+    w.extend(vop3(0x360, 3, [v(3), ZERO, 0]));
+    w.push(sop1(0x03, EXEC_LO, 13));
+    w
+}
+
+#[test]
+fn a_whole_wave_64_bit_sum_gives_the_sum_of_the_low_dwords() {
+    // In each wave the lanes whose x & 3 is not 0 (`s_and_saveexec`,
+    // `s_cbranch_execz`) sum (0x9000_0000 + x, x) over the wave, and each
+    // stores the low dword (s2), or the high one (s3), which needs the
+    // carries and is refused.
+    let program = |high: bool| {
+        let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+        let shift = inline((SLOTS * 4).trailing_zeros() as u16);
+        w.push(vop2(0x1A, 9, shift, 0));
+        w.extend([vop2(0x25, 6, 255, 0), 0x9000_0000]);
+        w.push(vop1(0x001, 7, v(0)));
+        w.extend(mov_k(8, DEAD));
+        w.push(vop2(0x1B, 12, inline(3), 0));
+        w.extend([vopc(0xC5, ZERO, 12), sop1(0x3C, 12, VCC_LO)]);
+        let mut region = wave_sum64();
+        region.push(vop1(0x001, 8, if high { 3 } else { 2 }));
+        w.push(sopp(0x08, region.len() as i16));
+        w.extend(region);
+        w.push(sop1(0x03, EXEC_LO, 12));
+        w.extend(store(8, 9, 0));
+        w.push(S_ENDPGM);
+        w
+    };
+    let refused = lower32(&program(true)).err();
+    assert!(
+        matches!(
+            refused,
+            Some(crate::ShaderError::Unsupported {
+                what: "a whole-wave section step the simulation does not follow",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let shader = build(&program(false));
+    let on = |x: u32| x & 3 != 0;
+    for (label, got) in run(&shader) {
+        for x in 0..THREADS {
+            let wave = x & !31..(x & !31) + 32;
+            let want = if on(x) {
+                wave.filter(|&g| on(g))
+                    .fold(0u32, |s, g| s.wrapping_add(0x9000_0000 + g))
+            } else {
+                DEAD
+            };
+            assert_eq!(got[(x * SLOTS) as usize], want, "{label}: thread {x}");
         }
     }
 }
