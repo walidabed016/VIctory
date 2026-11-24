@@ -167,9 +167,8 @@ fn queue(p: Arc<Pending>) {
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
             let receiver = receiver.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+            let spawned =
+                victory_core::thread::spawn_host(&format!("victory-pipelines-{i}"), move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {

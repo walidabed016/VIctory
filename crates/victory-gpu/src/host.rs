@@ -2276,20 +2276,18 @@ impl Meter {
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
         SETTER.call_once(|| {
-            let _ = std::thread::Builder::new()
-                .name("victory-caption".into())
-                .spawn(|| {
-                    loop {
-                        let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
-                            // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-                        }
+            let _ = victory_core::thread::spawn_host("victory-caption", || {
+                loop {
+                    let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    match next {
+                        // SAFETY: a window handle and a NUL-terminated text.
+                        Some((hwnd, text)) => unsafe {
+                            let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
+                        },
+                        None => std::thread::sleep(std::time::Duration::from_millis(100)),
                     }
-                });
+                }
+            });
         });
     }
 }
@@ -2615,17 +2613,15 @@ pub(crate) fn transition(
 /// A window of the given client size, owned by its own message thread.
 fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("victory-window".into())
-        .spawn(move || {
-            let made = make_window(width, height);
-            let ok = made.is_ok();
-            let _ = sender.send(made.map(|h| h.0 as usize));
-            if ok {
-                pump();
-            }
-        })
-        .map_err(|_| windows::core::Error::empty())?;
+    victory_core::thread::spawn_host("victory-window", move || {
+        let made = make_window(width, height);
+        let ok = made.is_ok();
+        let _ = sender.send(made.map(|h| h.0 as usize));
+        if ok {
+            pump();
+        }
+    })
+    .map_err(|_| windows::core::Error::empty())?;
     let hwnd = receiver
         .recv()
         .map_err(|_| windows::core::Error::empty())??;

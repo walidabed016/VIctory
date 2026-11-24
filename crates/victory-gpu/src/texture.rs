@@ -482,24 +482,21 @@ pub(crate) fn split<I: Send, R: Send>(
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         for _ in 1..threads() {
-            let worker = std::thread::Builder::new()
-                .name("victory texture split".into())
-                .spawn(|| {
-                    loop {
-                        let mut waiting = queue();
-                        let job = loop {
-                            match waiting.pop_front() {
-                                Some(job) => break job,
-                                None => {
-                                    waiting =
-                                        QUEUED.wait(waiting).unwrap_or_else(|e| e.into_inner())
-                                }
+            let worker = victory_core::thread::spawn_host("victory texture split", || {
+                loop {
+                    let mut waiting = queue();
+                    let job = loop {
+                        match waiting.pop_front() {
+                            Some(job) => break job,
+                            None => {
+                                waiting = QUEUED.wait(waiting).unwrap_or_else(|e| e.into_inner())
                             }
-                        };
-                        drop(waiting);
-                        job();
-                    }
-                });
+                        }
+                    };
+                    drop(waiting);
+                    job();
+                }
+            });
             if worker.is_err() {
                 break;
             }
