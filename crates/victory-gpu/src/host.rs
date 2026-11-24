@@ -313,6 +313,30 @@ pub(crate) fn errors_of(f: impl FnOnce()) -> Option<Vec<String>> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn timed_commands_are_labelled_by_kind_and_pipeline() {
+        for (note, label) in [
+            (
+                "indirect kind 10 max 4096 at 0xdc799b400 [mesh 1fa93fcea4869fa8, pixel d603540bd3056c4b] | 1fa93fcea4869fa8: u4=0x10",
+                "indirect kind 10 [mesh 1fa93fcea4869fa8, pixel d603540bd3056c4b]",
+            ),
+            (
+                "dispatch 257x1x1 [compute cc6c9f45e334afb7] | cc6c9f45e334afb7: u4=0x1",
+                "dispatch [compute cc6c9f45e334afb7]",
+            ),
+            ("clamp kind 2 records 1", "clamp kind 2"),
+            ("copy resource 0x1 to 0x2", "copy resource"),
+            (
+                "texture upload 0x25bf47bcfd0 (128x128x128 f83 mips 8) sub 0 of 8",
+                "texture upload",
+            ),
+            ("resolve 0x1 to 0x2 format 28", "resolve"),
+        ] {
+            assert_eq!(timing_label(note), label);
+        }
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -405,6 +429,124 @@ pub(crate) fn dred_on() -> bool {
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
+
+/// GPU time of the commands lists noted, since the last frame-rate line
+/// (diagnostics, timing on): ms, count and the longest by command kind and
+/// pipeline; lists run, ms waited for them, ms between their first and last
+/// timestamps, ms in timed commands, commands timed and not.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct GpuTimes {
+    by_label: std::collections::HashMap<String, (f64, u64, f64)>,
+    lists: u64,
+    waited: f64,
+    span: f64,
+    timed: f64,
+    commands: u64,
+    untimed: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
+
+/// A noted command's kind and pipeline: "indirect kind 10 [mesh …]",
+/// "dispatch [compute …]", "clamp kind 2", "copy resource".
+#[cfg(feature = "diagnostics")]
+fn timing_label(note: &str) -> String {
+    let head = note.split(" | ").next().unwrap_or(note);
+    let mut words = head.split(' ');
+    let kind = match (words.next(), words.next(), words.next()) {
+        (Some(what @ ("indirect" | "clamp")), Some("kind"), Some(k)) => format!("{what} kind {k}"),
+        (Some(what @ ("dispatch" | "mesh" | "draw" | "indexed")), ..) => what.to_owned(),
+        (Some(a), Some(b), _) if b.starts_with(|c: char| c.is_ascii_alphabetic()) => {
+            format!("{a} {b}")
+        }
+        (Some(a), ..) => a.to_owned(),
+        _ => String::new(),
+    };
+    let pipeline = head
+        .find('[')
+        .and_then(|s| head[s..].find(']').map(|e| &head[s..=s + e]));
+    match pipeline {
+        Some(p) => format!("{kind} {p}"),
+        None => kind,
+    }
+}
+
+/// Shader names by hash from `VICTORY_SHADER_NAMES` (a hash list of
+/// `HASH <hash> @<offset> <name>` lines), for the GPU time lines.
+#[cfg(feature = "diagnostics")]
+fn shader_names() -> &'static std::collections::HashMap<String, String> {
+    static NAMES: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let Some(path) = std::env::var_os("VICTORY_SHADER_NAMES") else {
+            return Default::default();
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, ?path, "VICTORY_SHADER_NAMES unreadable");
+            String::new()
+        });
+        text.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                (words.next()? == "HASH").then_some(())?;
+                let hash = words.next()?.to_ascii_lowercase();
+                words.next()?;
+                let name = words.collect::<Vec<_>>().join(" ");
+                Some((hash, name.trim_end_matches("_Wrapped").to_owned()))
+            })
+            .collect()
+    })
+}
+
+/// Logs the GPU time per frame by command kind and the pipelines that
+/// took most, over `frames` frames (diagnostics, timing on).
+#[cfg(feature = "diagnostics")]
+fn log_gpu_times(frames: f64) {
+    let Some(t) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let frames = frames.max(1.0);
+    tracing::info!(
+        "GPU timing per frame: {:.1} lists, {:.1} ms waited for them, {:.1} ms from their first \
+         timestamp to their last, {:.1} ms in {:.0} timed commands ({:.0} more not timed)",
+        t.lists as f64 / frames,
+        t.waited / frames,
+        t.span / frames,
+        t.timed / frames,
+        t.commands as f64 / frames,
+        t.untimed as f64 / frames,
+    );
+    let mut kinds: std::collections::HashMap<&str, (f64, u64)> = Default::default();
+    for (label, (ms, n, _)) in &t.by_label {
+        let kind = label.split(" [").next().unwrap_or(label);
+        let e = kinds.entry(kind).or_default();
+        e.0 += ms;
+        e.1 += n;
+    }
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let kinds: Vec<String> = kinds
+        .iter()
+        .map(|(kind, (ms, n))| format!("{kind} {:.2} ms {:.1}x", ms / frames, *n as f64 / frames))
+        .collect();
+    tracing::info!("GPU time per frame by command: {}", kinds.join("; "));
+    let names = shader_names();
+    let mut labels: Vec<_> = t.by_label.iter().collect();
+    labels.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    for (label, (ms, n, longest)) in labels.into_iter().take(40) {
+        let named: Vec<&str> = label
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .filter(|w| w.len() == 16)
+            .filter_map(|hash| names.get(hash).map(String::as_str))
+            .collect();
+        tracing::info!(
+            "GPU time per frame: {:.2} ms in {:.1} commands (longest {longest:.2} ms): {label} {named:?}",
+            ms / frames,
+            *n as f64 / frames,
+        );
+    }
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -624,6 +766,12 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                runs[i].tally(frequency, started.elapsed());
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -929,34 +1077,74 @@ impl HostList {
             .as_ref()
     }
 
-    /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// The list's timestamps, read back after it ran (diagnostics, timing
+    /// on): one before each of its first `STAMPS - 1` noted commands, then
+    /// one at its end.
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
-        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+    fn timestamps(&self, notes: usize) -> Vec<u64> {
+        let (Some((_, back)), count) = (self.stamps(), notes.min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
         let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
         // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
+        unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
                 return Vec::new();
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
             back.Unmap(0, None);
             s
-        };
-        let mut times: Vec<(f64, String)> = (0..count)
-            .map(|i| {
-                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+        }
+    }
+
+    /// The noted commands that took longest on the GPU, longest first, as
+    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let stamps = self.timestamps(notes.len());
+        let mut times: Vec<(f64, String)> = stamps
+            .windows(2)
+            .zip(notes.iter())
+            .map(|(s, (note, _))| {
+                let ticks = s[1].saturating_sub(s[0]);
+                (
+                    ticks as f64 * 1e3 / frequency.max(1) as f64,
+                    note.chars().take(300).collect(),
+                )
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// Adds the list's command times to the frame's GPU time by command
+    /// and pipeline (diagnostics, timing on, after the list ran and was
+    /// waited for `waited`).
+    #[cfg(feature = "diagnostics")]
+    fn tally(&self, frequency: u64, waited: std::time::Duration) {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let stamps = self.timestamps(notes.len());
+        let ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
+        let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+        let t = times.get_or_insert_with(GpuTimes::default);
+        t.lists += 1;
+        t.waited += waited.as_secs_f64() * 1e3;
+        t.untimed += notes.len().saturating_sub(stamps.len().saturating_sub(1)) as u64;
+        if let (Some(first), Some(last)) = (stamps.first(), stamps.last()) {
+            t.span += ms(last.saturating_sub(*first));
+        }
+        for (s, (note, _)) in stamps.windows(2).zip(notes.iter()) {
+            let took = ms(s[1].saturating_sub(s[0]));
+            t.timed += took;
+            t.commands += 1;
+            let e = t.by_label.entry(timing_label(note)).or_default();
+            e.0 += took;
+            e.1 += 1;
+            e.2 = e.2.max(took);
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -1081,7 +1269,9 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
+        // Timing needs the texts, not the markers: breadcrumbs cost GPU
+        // time of their own.
+        if dred_on() || self.stamps().is_some() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
@@ -1091,12 +1281,15 @@ impl HostList {
             if let Some(marks) = &self.marks {
                 marks.mark(&what);
             }
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list
+                        .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1764,6 +1957,7 @@ impl Meter {
                 let span = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(span);
                 crate::shadow::log_roots(span);
+                log_gpu_times(span);
                 let seen = crate::indirect::SEEN.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "indirect records run per frame: mesh {:.0} with groups, {:.0} empty; draws {:.0}, {:.0} empty; dispatches {:.0}, {:.0} empty",

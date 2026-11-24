@@ -164,6 +164,8 @@ pub(crate) fn bound(
     }
     let l = &list.list;
     let constants = [kind, stride, records, u32::from(cfg!(feature = "diagnostics"))];
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("clamp kind {kind} records {records}"));
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
