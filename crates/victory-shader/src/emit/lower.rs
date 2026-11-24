@@ -8469,15 +8469,16 @@ impl<'a> Lower<'a> {
     /// compares in `b` that every such lane answers alike (against a
     /// constant the edge brings) rule out each block that reads it. A join it
     /// feeds on a forward edge reads it only where no lane bringing it there
-    /// reads that join: `facts` hold for every lane that brings `v` to `b`,
-    /// `seen` holds the joins being decided.
+    /// reads that join: `facts` hold for every lane that brings `v` to `b`.
+    /// A join can be reached along many paths, so `budget` bounds the joins
+    /// followed.
     fn unread_from(
         &self,
         v: Value,
         b: usize,
         n: usize,
         facts: &[(Bool, bool)],
-        seen: &mut Vec<Value>,
+        budget: &mut u32,
     ) -> bool {
         let (p, st) = (self.x.p, self.x.st);
         let along = |w: Value| match self.phi_at.get(&w) {
@@ -8587,14 +8588,14 @@ impl<'a> Lower<'a> {
                     if unreached(s, edge) || !self.read_phis.contains(&phi.value) {
                         continue;
                     }
-                    if self.rpo[r] <= self.rpo[s] || seen.contains(&phi.value) {
+                    if self.rpo[r] <= self.rpo[s] || *budget == 0 {
                         return false;
                     }
-                    seen.push(phi.value);
+                    *budget -= 1;
                     let mut carried = known.clone();
                     carried.push((st.reach[s], true));
                     carried.extend(edge);
-                    if !self.unread_from(phi.value, r, m, &carried, seen) {
+                    if !self.unread_from(phi.value, r, m, &carried, budget) {
                         return false;
                     }
                 }
@@ -8629,7 +8630,7 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let read = |l: &Self| {
                     l.read_phis.contains(&phi.value)
-                        && !l.unread_from(phi.value, b, n, &[], &mut vec![phi.value])
+                        && !l.unread_from(phi.value, b, n, &[], &mut 256)
                 };
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
