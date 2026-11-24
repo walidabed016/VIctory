@@ -500,8 +500,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer into the buffer's host
+/// copy ([`copy_to_buffer`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -525,8 +525,13 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            if dst.kind == FOOTPRINT
+                && src.kind != FOOTPRINT
+                && let Err(why) = copy_to_buffer(list, &dst, [x, y, z], &src, source_box)
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(why, "texture to buffer copy not made"));
+            }
             return;
         };
         let footprint = src.kind == FOOTPRINT;
@@ -612,6 +617,80 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Texture to buffer: the host texture is copied into the buffer's host
+/// copy, which goes back to title memory after the submission, as what
+/// shaders write does. The footprint names the host texture's format (the
+/// typeless one of a depth texture shaders read); the host places it on
+/// 512 bytes with rows on 256.
+#[cfg(windows)]
+fn copy_to_buffer(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    [x, y, z]: [u32; 3],
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) -> Result<(), &'static str> {
+    use windows::core::Interface;
+    let texture =
+        crate::resource::host_resource(src.resource).ok_or("source without a host texture")?;
+    if crate::resource::widened(src.resource) {
+        return Err("source is a widened 16-bit target");
+    }
+    // SAFETY: a live texture.
+    let format = unsafe { texture.GetDesc() }.Format.0 as u32;
+    let size = |f| crate::resource::element(f).map(|(bytes, _)| bytes);
+    let footprint = dst.footprint;
+    if size(format).is_none() || size(format) != size(footprint.format) {
+        return Err("footprint texels of another size than the host texture's");
+    }
+    let bytes = footprint.bytes().ok_or("footprint of an unknown format")?;
+    let (data, len) = crate::resource::buffer_bytes(dst.resource).ok_or("not into a buffer")?;
+    let end = footprint.offset.checked_add(bytes);
+    if end.is_none_or(|end| end > len) {
+        return Err("footprint outside its buffer");
+    }
+    let address = data as u64 + footprint.offset;
+    let shadow = crate::shadow::find(address, bytes).ok_or("no host copy of the buffer")?;
+    let offset = shadow.offset(address);
+    if !offset.is_multiple_of(512) || !footprint.row_pitch.is_multiple_of(256) {
+        return Err("footprint off the host's placement alignment");
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    shadow.refresh(list, address, bytes);
+    shadow.gpu_writes(list, address, bytes);
+    let mut to = *dst;
+    to.resource = shadow.buffer.as_raw().cast_const().cast();
+    to.footprint.offset = offset;
+    to.footprint.format = format;
+    let mut from = *src;
+    from.resource = texture.as_raw().cast_const().cast();
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "copy {:?} to buffer {:?} at {address:#x}+{bytes:#x} footprint {:?}",
+            src.resource, dst.resource, footprint
+        )
+    });
+    let host_box = (!source_box.is_null()).then(|| source_box.cast());
+    // SAFETY: an open list; both locations in the host's layout, naming
+    // live resources, the footprint inside the buffer's host copy; the box
+    // is the title's (same layout).
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            x,
+            y,
+            z,
+            (&raw const from).cast(),
+            host_box,
+        )
+    };
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -1428,6 +1507,52 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+    use crate::resource::PlacedFootprint;
+
+    /// A texture copied into a buffer reaches the buffer's title memory
+    /// after the submission, inside the footprint only.
+    #[test]
+    fn textures_copy_into_title_buffers() {
+        let _serial = crate::watch::serial();
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        // A 64x64 R8G8B8A8_UNORM texture the title fills, every byte 0x5a
+        // (the same in any tiling).
+        let memory = Box::leak(vec![0x5au8; 0x2_0000].into_boxed_slice());
+        let at = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 0, 0];
+        let texture = crate::resource::texture_at(at, &desc).expect("a host texture");
+        let buffer = Box::leak(vec![0u8; 0x8000].into_boxed_slice());
+        let title = crate::resource::buffer_at(buffer.as_ptr() as u64, 0x8000);
+        // SAFETY: plain data: the resource, a subresource index of 0.
+        let mut src: CopyLocation = unsafe { std::mem::zeroed() };
+        src.resource = texture;
+        // SAFETY: as above.
+        let mut dst: CopyLocation = unsafe { std::mem::zeroed() };
+        dst.resource = title;
+        dst.kind = 1;
+        // The footprint: offset 0x200, format, 64x64x1, rows of 256 bytes.
+        // 32 bytes in the footprint's layout.
+        let footprint: [u32; 8] = [0x200, 0, 28, 64, 64, 1, 256, 0];
+        let at = footprint.as_ptr().cast::<PlacedFootprint>();
+        // SAFETY: as above.
+        dst.footprint = unsafe { at.read_unaligned() };
+        let copy = |list: &crate::host::HostList, dst: &CopyLocation| {
+            copy_to_buffer(list, dst, [0, 0, 0], &src, std::ptr::null())
+        };
+        let list = host.new_list().unwrap();
+        assert_eq!(copy(&list, &dst), Ok(()));
+        // SAFETY: an open list.
+        unsafe { list.list.Close() }.unwrap();
+        host.execute(&[&list]);
+        assert!(buffer[0x200..0x4200].iter().all(|&b| b == 0x5a), "the copy");
+        let around = [&buffer[..0x200], &buffer[0x4200..]].concat();
+        assert!(around.iter().all(|&b| b == 0), "around it");
+        // A footprint off the host's 512-byte placement is refused.
+        dst.footprint.offset = 0x100;
+        assert!(copy(&host.new_list().unwrap(), &dst).is_err());
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

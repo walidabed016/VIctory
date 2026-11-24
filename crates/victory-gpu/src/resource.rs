@@ -346,11 +346,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
+    pub(crate) format: u32,
     width: u32,
     height: u32,
     depth: u32,
-    row_pitch: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -1285,6 +1285,29 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     resource(out).host.is_some().then_some(out)
+}
+
+/// A title buffer over the `len` bytes at `address` (tests).
+#[cfg(all(test, windows))]
+pub(crate) fn buffer_at(address: u64, len: u64) -> This {
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width: len,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let (null, mut out) = (std::ptr::null(), std::ptr::null());
+    let iid = &RESOURCE_IIDS[0];
+    let made = create_at_address(null, address, &desc, 0, std::ptr::null(), iid, &mut out);
+    assert_eq!(made, S_OK, "a buffer at {address:#x}");
+    out
 }
 
 pub(crate) extern "system" fn create_placed(
