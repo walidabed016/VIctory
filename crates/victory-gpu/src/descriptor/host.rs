@@ -723,8 +723,63 @@ fn on_copy(
     (made > 0).then_some(made)
 }
 
+/// Host copies of constant views of title memory not on 256 bytes (the
+/// console allows them; host constant views start on 256), by title
+/// address and size: 256-byte places in slabs of shared memory, filled
+/// from title memory when a submission reads the view (see
+/// `crate::draw`).
+/// shortcut: places are never given back; past [`ALIGNED_SLABS`] slabs
+/// such views are made null.
+struct Aligned {
+    /// Each slab and its host address and mapping.
+    slabs: Vec<(ID3D12Resource, u64, usize)>,
+    /// Bytes handed out of the last slab.
+    used: u64,
+    places: std::collections::HashMap<(u64, u32), (ID3D12Resource, u64, usize)>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are written
+// only at submission.
+unsafe impl Send for Aligned {}
+
+const ALIGNED_SLAB: u64 = 4 << 20;
+const ALIGNED_SLABS: usize = 16;
+
+/// The aligned host copy of the constant view of `size` bytes at title
+/// `address` ([`Aligned`]), made on first use: its buffer, host address
+/// and mapping.
+pub(crate) fn aligned_constant(address: u64, size: u32) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    static ALIGNED: Mutex<Option<Aligned>> = Mutex::new(None);
+    let mut aligned = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+    let a = aligned.get_or_insert_with(|| Aligned {
+        slabs: Vec::new(),
+        used: ALIGNED_SLAB,
+        places: std::collections::HashMap::new(),
+    });
+    let bytes = u64::from(size.clamp(1, LARGEST_CONSTANT).next_multiple_of(256));
+    if let Some((buffer, gpu, data)) = a.places.get(&(address, size)) {
+        return Some((buffer.clone(), *gpu, *data as *mut u8));
+    }
+    if a.used + bytes > ALIGNED_SLAB {
+        if a.slabs.len() == ALIGNED_SLABS {
+            once!("constant views off 256 bytes past their copies' room: made null");
+            return None;
+        }
+        let (buffer, data) = host()?.shared_buffer(ALIGNED_SLAB)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        a.slabs.push((buffer, gpu, data as usize));
+        a.used = 0;
+    }
+    let (buffer, gpu, data) = a.slabs.last()?.clone();
+    let place = (buffer, gpu + a.used, data + a.used as usize);
+    a.used += bytes;
+    a.places.insert((address, size), place.clone());
+    Some((place.0, place.1, place.2 as *mut u8))
+}
+
 /// Bytes of the host's largest constant buffer view.
-const LARGEST_CONSTANT: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+pub(crate) const LARGEST_CONSTANT: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
 
 /// The host size of a constant view of `size` bytes (the title's is
 /// `view`): 256-byte whole, at most [`LARGEST_CONSTANT`], which is all
@@ -1021,11 +1076,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
+                let (buffer, gpu, _) = aligned_constant(address, size)?;
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                    BufferLocation: gpu,
+                    SizeInBytes: constant_size(size, view),
+                };
+                // SAFETY: a slot of our heap; the range lies in the copy.
+                unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+                return Kept::of(&buffer, view_kind::CBV);
             }
             let size = constant_size(size, view);
             let blocks = on_copy(&shadow, shadow.offset(address), size / 256, 256, view)?;
@@ -1520,6 +1578,26 @@ mod tests {
         };
         assert_eq!(format(r), 86);
         assert!(!crate::resource::widened(r as crate::object::This));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A constant view of title memory off 256 bytes is made on its
+    /// aligned copy.
+    #[test]
+    fn constant_views_off_256_bytes_are_made() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = Box::leak(vec![0u8; 0x2_0000].into_boxed_slice());
+        let base = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        crate::resource::buffer_at(base, 0x1000);
+        let kept = make(&View::Constant(base + 0x80, 0x180), heap.cpu(0)).expect("a view");
+        let (buffer, ..) = aligned_constant(base + 0x80, 0x180).expect("its copy");
+        assert_eq!(kept.resource, Some(buffer));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

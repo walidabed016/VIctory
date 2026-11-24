@@ -1331,6 +1331,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
+        // A constant view off 256 bytes on the host reads its own copy.
+        if let View::Constant(_, size) = *view
+            && shadow.gpu(address) % 256 != 0
+            && let Some((_, _, data)) = crate::descriptor::host::aligned_constant(address, size)
+        {
+            let len = len.min(u64::from(crate::descriptor::host::LARGEST_CONSTANT));
+            list.defer_fill(data, address as *const u8, len as usize);
+        }
         if kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
         }
@@ -1758,6 +1766,38 @@ void main() {
         assert_eq!(got, want, "words and kinds read through slots 37 and 9");
     }
 
+    /// A constant view of title memory off 256 bytes reads an aligned
+    /// copy, filled from title memory when its list is submitted.
+    #[test]
+    fn constant_views_off_256_bytes_read_aligned_copies() {
+        let _serial = crate::watch::serial();
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let memory = Box::leak(vec![0u8; 0x2_0000].into_boxed_slice());
+        let base = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        let title = crate::resource::buffer_at(base, 0x1000);
+        let address = base + 0x80;
+        let shadow = crate::shadow::find(address, 0x80).expect("a host copy");
+        assert_ne!(shadow.gpu(address) % 256, 0, "off 256 bytes on the host");
+        for i in 0..0x80 {
+            // SAFETY: inside the leaked memory.
+            unsafe { ((address + i) as *mut u8).write(i as u8 ^ 0xa5) };
+        }
+        let list = host.new_list().unwrap();
+        readable(&list, ResourceType::Cbv, &View::Constant(address, 0x80));
+        // SAFETY: an open list.
+        unsafe { list.list.Close() }.unwrap();
+        host.execute(&[&list]);
+        let (_, gpu, data) =
+            crate::descriptor::host::aligned_constant(address, 0x80).expect("a copy");
+        assert_eq!(gpu % 256, 0);
+        // SAFETY: the copy's mapped bytes, filled at submission.
+        let copy = unsafe { std::slice::from_raw_parts(data, 0x80) };
+        assert!(copy.iter().enumerate().all(|(i, &b)| b == i as u8 ^ 0xa5));
+        let _ = title;
+    }
+
     /// A depth texture the title also writes as unordered gets those
     /// writes through its twin: the twin starts as the texture is and what
     /// the command writes into it goes back to the texture after.
@@ -1765,6 +1805,7 @@ void main() {
     fn unordered_writes_to_depth_textures_reach_them() {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
+        let _serial = crate::watch::serial();
         let Some(host) = crate::host::host() else {
             return; // no host GPU
         };
@@ -1850,6 +1891,7 @@ void main() {
     /// slots as null views, so the targets after them stay in theirs.
     #[test]
     fn missing_render_targets_keep_their_slots() {
+        let _serial = crate::watch::serial();
         let Some(host) = crate::host::host() else {
             return; // no host GPU
         };
