@@ -422,15 +422,14 @@ fn read(to: &mut [u8], from: usize) -> bool {
         return pieces(to, from);
     }
     let per = to.len().div_ceil(threads()).next_multiple_of(PIECE);
-    std::thread::scope(|s| {
-        let parts: Vec<_> = to
-            .chunks_mut(per)
-            .enumerate()
-            .map(|(k, chunk)| s.spawn(move || pieces(chunk, from + k * per)))
-            .collect();
-        // The scope waits for any part not joined here.
-        parts.into_iter().any(|p| p.join().unwrap_or(true))
-    })
+    let parts = to
+        .chunks_mut(per)
+        .enumerate()
+        .map(|(k, chunk)| (chunk, from + k * per))
+        .collect();
+    split(parts, |(chunk, from)| pieces(chunk, from))
+        .into_iter()
+        .any(|changed| changed.unwrap_or(true))
 }
 
 /// [`victory_formats::texture::Layout::detile`] of a big subresource with
@@ -445,23 +444,110 @@ fn detile_split(
 ) -> Result<(), victory_formats::texture::Error> {
     let height = layout.mips[mip as usize].height;
     let per = height.div_ceil(threads() as u32).max(1);
-    std::thread::scope(|s| {
-        let mut rest = linear;
-        let mut parts = Vec::new();
-        for first in (0..height).step_by(per as usize) {
-            let end = (first + per).min(height);
-            let n = ((end - first) as usize * pitch).min(rest.len());
-            let (rows, tail) = std::mem::take(&mut rest).split_at_mut(n);
-            rest = tail;
-            parts.push(
-                s.spawn(move || layout.detile_rows(tiled, mip, slice, first..end, rows, pitch)),
-            );
-        }
-        parts.into_iter().try_for_each(|p| {
-            p.join()
-                .unwrap_or(Err(victory_formats::texture::Error::Invalid))
-        })
+    let mut rest = linear;
+    let mut parts = Vec::new();
+    for first in (0..height).step_by(per as usize) {
+        let end = (first + per).min(height);
+        let n = ((end - first) as usize * pitch).min(rest.len());
+        let (rows, tail) = std::mem::take(&mut rest).split_at_mut(n);
+        rest = tail;
+        parts.push((first..end, rows));
+    }
+    split(parts, |(rows, linear)| {
+        layout.detile_rows(tiled, mip, slice, rows, linear, pitch)
     })
+    .into_iter()
+    .try_for_each(|done| done.unwrap_or(Err(victory_formats::texture::Error::Invalid)))
+}
+
+/// Runs `f` on each of `items` on the split threads, the caller among
+/// them: the results in order, a panic as its payload.
+///
+/// The threads start once and stay: a thread's start and end run every
+/// title image's thread notices (their TLS callbacks and `DllMain`), which
+/// made a split that started its own threads cost ~110 ms whatever its
+/// size (run 68: 12.7 MB a frame copied in 360 ms and detiled in 320 ms).
+fn split<I: Send, R: Send>(
+    items: Vec<I>,
+    f: impl Fn(I) -> R + Sync,
+) -> Vec<std::thread::Result<R>> {
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, MutexGuard, Once};
+    type Job = Box<dyn FnOnce() + Send>;
+    static QUEUE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+    static QUEUED: Condvar = Condvar::new();
+    fn queue() -> MutexGuard<'static, VecDeque<Job>> {
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        for _ in 1..threads() {
+            let worker = std::thread::Builder::new()
+                .name("victory texture split".into())
+                .spawn(|| {
+                    loop {
+                        let mut waiting = queue();
+                        let job = loop {
+                            match waiting.pop_front() {
+                                Some(job) => break job,
+                                None => {
+                                    waiting =
+                                        QUEUED.wait(waiting).unwrap_or_else(|e| e.into_inner())
+                                }
+                            }
+                        };
+                        drop(waiting);
+                        job();
+                    }
+                });
+            if worker.is_err() {
+                break;
+            }
+        }
+    });
+    let results: Vec<Mutex<Option<std::thread::Result<R>>>> =
+        items.iter().map(|_| Mutex::new(None)).collect();
+    let left = (Mutex::new(items.len()), Condvar::new());
+    {
+        let mut waiting = queue();
+        for (item, result) in items.into_iter().zip(&results) {
+            let (f, left) = (&f, &left);
+            let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item)));
+                *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(done);
+                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                *n -= 1;
+                if *n == 0 {
+                    left.1.notify_all();
+                }
+            });
+            // SAFETY: the job borrows from this call, which returns only
+            // once every job it queued has run; a job does not unwind.
+            waiting.push_back(unsafe {
+                std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job)
+            });
+        }
+    }
+    QUEUED.notify_all();
+    // The caller runs jobs too: they run even if no thread could start.
+    loop {
+        let job = queue().pop_front();
+        let Some(job) = job else { break };
+        job();
+    }
+    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *n > 0 {
+        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(n);
+    results
+        .into_iter()
+        .map(|r| {
+            r.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every job ran")
+        })
+        .collect()
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -800,5 +886,24 @@ mod tests {
         let mut split = vec![0; one.len()];
         detile_split(&layout, &tiled, 0, 0, &mut split, pitch).unwrap();
         assert!(split == one);
+    }
+
+    /// Splits run on threads started once, give their results in order, and
+    /// a part that panics as its payload.
+    #[test]
+    fn splits_run_on_the_same_threads() {
+        let mut ran = std::collections::HashSet::new();
+        for _ in 0..50 {
+            for id in split((0..16).collect(), |_: u32| std::thread::current().id()) {
+                ran.insert(id.unwrap());
+            }
+        }
+        // The workers and this thread, and another test's that took a job.
+        assert!(ran.len() <= threads() + 1, "{} threads", ran.len());
+        let done = split(vec![1, 2, 3], |x| {
+            assert!(x != 2);
+            x
+        });
+        assert!(matches!(done[..], [Ok(1), Err(_), Ok(3)]));
     }
 }
