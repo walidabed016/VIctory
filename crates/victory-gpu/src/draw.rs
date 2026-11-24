@@ -603,6 +603,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // Its groups may write arguments later indirect executions read.
+        crate::indirect::close(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1162,9 +1164,9 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        // Opened first: a segment's clamp binds a compute pipeline of its own.
+        if !crate::indirect::open(list, (kind, stride, max)) {
+            why("not bounded (no clamp, or a stride not a multiple of 4)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1182,7 +1184,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1193,24 +1194,33 @@ impl State {
             }
             return false;
         }
+        let records = args.gpu(arguments);
+        let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        let Some((clamped, at, count_at)) =
+            crate::indirect::add(list, (kind, stride, max), records, count)
+        else {
+            why("not bounded (arguments or count not 4-byte aligned)");
+            return false;
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // SAFETY: an open list with everything set; the clamped records'
+        // buffer is the list's own, the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                &clamped,
+                at,
+                count_at.map(|_| &clamped),
+                count_at.unwrap_or(0),
             )
         };
-        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
+            // Its groups may write arguments later executions read.
+            crate::indirect::close(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

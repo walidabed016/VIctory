@@ -386,6 +386,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Its indirect executions' clamps (`indirect`).
+    clamps: Mutex<crate::indirect::Clamps>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -690,6 +692,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                clamps: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1169,6 +1172,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.clamps().reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1305,6 +1309,10 @@ impl HostList {
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
         }
+    }
+
+    pub(crate) fn clamps(&self) -> std::sync::MutexGuard<'_, crate::indirect::Clamps> {
+        self.clamps.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
