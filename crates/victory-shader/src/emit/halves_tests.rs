@@ -374,8 +374,9 @@ fn cross_lane_reads_after_lanes_split_and_in_a_uniform_loop_match_64_lane_waves(
 }
 
 #[test]
-fn a_cross_lane_read_some_lanes_skip_keeps_64_lane_waves() {
-    // Two console waves: no lockstep (one console wave per group).
+fn a_cross_lane_read_some_lanes_skip_is_the_console_waves_in_turn() {
+    // Two console waves, the second skipping the read: they never meet, so
+    // they run in lockstep one after the other.
     let threads = [128, 1, 1];
     let mut w = prologue(threads);
     w.extend([SAVE_EXEC, V_CMPX_EQ_U32_0_V0, sopp(0x08, 3)]);
@@ -383,11 +384,11 @@ fn a_cross_lane_read_some_lanes_skip_keeps_64_lane_waves() {
     w.extend([vop1(0x001, 5, 14), RESTORE_EXEC]);
     w.extend(store(5, 4, 0));
     w.push(S_ENDPGM);
-    let (_, waves, _) = build(&w, threads, 0);
-    assert_eq!(
-        waves,
-        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
-    );
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    for (label, got) in run(&shader, 128 * SLOTS) {
+        assert_eq!(got[0], 40, "{label}: thread 0");
+    }
 }
 
 #[test]
@@ -575,13 +576,18 @@ fn a_cross_lane_read_by_the_programs_barrier_after_a_lane_loop_runs_on_halves() 
 }
 
 #[test]
-fn a_cross_lane_read_after_a_lane_loop_with_no_barrier_keeps_64_lane_waves() {
+fn a_cross_lane_read_after_a_lane_loop_with_no_barrier_is_the_console_waves_in_turn() {
+    // The halves do not meet after the loop, but the two console waves
+    // never meet either: they run in lockstep one after the other.
     let threads = [128, 1, 1];
-    let (_, waves, _) = build(&after_a_lane_loop(threads, false), threads, 0);
-    assert_eq!(
-        waves,
-        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
-    );
+    let (shader, waves, _) = build(&after_a_lane_loop(threads, false), threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    for (label, got) in run(&shader, 128 * SLOTS) {
+        for f in 0..128u32 {
+            let want = f / 64 * 64 + 31 + 2 * (f % 4);
+            assert_eq!(got[(f * SLOTS) as usize], want, "{label}: thread {f}");
+        }
+    }
 }
 
 /// Each thread writes index + 1000 to LDS[index] and index + 2000 to a
@@ -929,5 +935,94 @@ fn lanes_outside_exec_take_slot_0_in_a_waterfall_in_lockstep() {
     assert!(
         outside.iter().all(|&i| i == 0),
         "slots outside EXEC: {outside:x?}"
+    );
+}
+
+/// Lanes whose index in their console wave is at least 24 times the
+/// wave's index go in (`v_cmpx`, `s_cbranch_execz`): all of wave 0, lanes
+/// 24-63 of wave 1, the upper half alone of wave 2 and none of wave 3,
+/// which skips the region. Each there stores how many of them have bit 1
+/// (`s_bcnt1` of a mask written there), how many of those lie below it
+/// (`v_mbcnt`), the first (`s_ff1`), the first lane's v11
+/// (`v_readfirstlane`) and lane 50's (`v_readlane`). With `barrier`, an
+/// `s_barrier` first.
+fn waves_apart(threads: [u32; 3], barrier: bool) -> Vec<u32> {
+    let mut w = prologue(threads);
+    if barrier {
+        w.push(sopp(0x0A, 0));
+    }
+    for r in [5, 6, 7, 10, 12] {
+        w.extend(mov_k(r, DEAD));
+    }
+    w.extend([vop2(0x25, 11, 255, 3), 256]);
+    w.extend([
+        vop2(0x16, 8, inline(6), 3),
+        vop2(0x0B, 8, inline(24), 8),
+        vop2(0x1B, 9, inline(63), 3),
+        vop2(0x1B, 13, inline(2), 3),
+        SAVE_EXEC,
+        vopc(0xD3, v(8), 9),
+    ]);
+    let mut region = vec![
+        vopc(0xC5, ZERO, 13),
+        sop1(0x10, 12, VCC_LO),
+        vop1(0x001, 5, 12),
+    ];
+    region.extend(vop3(0x365, 6, VCC_LO as u16, ZERO));
+    region.extend(vop3(0x366, 6, VCC_HI as u16, v(6)));
+    region.extend([sop1(0x14, 13, VCC_LO), vop1(0x001, 7, 13)]);
+    region.extend([vop1(0x002, 14, v(11)), vop1(0x001, 10, 14)]);
+    region.extend(vop3(0x360, 15, v(11), inline(50)));
+    region.push(vop1(0x001, 12, 15));
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    for (k, r) in [5u8, 6, 7, 10, 12].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+fn check_waves_apart(threads: [u32; 3]) {
+    let (shader, waves, _) = build(&waves_apart(threads, false), threads, 0);
+    assert_eq!(waves, Waves::Lockstep, "{threads:?}");
+    let total: u32 = threads.iter().product();
+    let inside = |f: u32| f % 64 >= 24 * (f / 64);
+    for (label, got) in run(&shader, total * SLOTS) {
+        for f in 0..total {
+            let wave = f / 64 * 64;
+            let want = if inside(f) {
+                let lanes = || (wave..wave + 64).filter(|&g| inside(g));
+                let marked: Vec<u32> = lanes().filter(|&g| g & 2 != 0).collect();
+                let below = marked.iter().filter(|&&g| g < f).count() as u32;
+                let first = lanes().next().unwrap();
+                [
+                    marked.len() as u32,
+                    below,
+                    marked[0] % 64,
+                    256 + first,
+                    256 + wave + 50,
+                ]
+            } else {
+                [DEAD; 5]
+            };
+            assert_eq!(slots(&got, f, 5), want, "{label} {threads:?}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn waves_of_a_group_that_branch_apart_are_the_console_waves_in_turn() {
+    check_waves_apart([16, 16, 1]);
+    check_waves_apart([8, 16, 1]);
+}
+
+#[test]
+fn waves_of_a_group_with_a_barrier_keep_64_lane_waves() {
+    let threads = [16, 16, 1];
+    let (_, waves, _) = build(&waves_apart(threads, true), threads, 0);
+    assert_eq!(
+        waves,
+        Waves::Wave64("a lane mask read as data where the two 32-lane halves do not meet")
     );
 }

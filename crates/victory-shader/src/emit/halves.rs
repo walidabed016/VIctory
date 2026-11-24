@@ -34,6 +34,13 @@
 //!   EXEC and the lane masks are values (the wave's ballots), and each
 //!   vector instruction runs under the thread's own EXEC bit, so every
 //!   block meets.
+//! * **In turn.** A group of several console waves that never meet (no
+//!   LDS, no barrier, nothing in a loop through which one could wait for
+//!   another) runs in lockstep too: the host group is one console wave,
+//!   whose halves play the group's waves one after the other (console
+//!   thread = turn * 64 + its own); the console's `s_endpgm` ends a turn.
+//!   Waves that never wait for each other may run in any order on the
+//!   console, this one included.
 //! * **LDS of a one-wave group.** The console compiler leaves out barriers
 //!   when the group is one wave, which its two halves no longer are: every
 //!   LDS access gets a barrier before it, so they happen in program order

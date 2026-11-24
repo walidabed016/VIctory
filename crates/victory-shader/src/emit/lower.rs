@@ -80,8 +80,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
         return lower_as(parts, Split::No);
     }
     // On 32-lane halves where the translation shows it exact: lane by lane,
-    // else, for a group of one console wave, in that wave's own control
-    // flow; else on the console's 64-lane waves with the reason.
+    // else, for a group of one console wave or of waves that never meet,
+    // in each wave's own control flow; else on the console's 64-lane waves
+    // with the reason.
     let why = |e| match e {
         ShaderError::Unsupported { what, .. } => what,
         _ => "an error on 32-lane halves",
@@ -93,7 +94,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let StageIo::Cs(cs) = parts.native.io else {
         unreachable!("wave64 lanes are compute")
     };
-    if cs.threads.iter().product::<u32>() <= 64 {
+    if cs.threads.iter().product::<u32>() <= 64 || apart_waves(parts) {
         match lower_as(parts, Split::Lockstep) {
             Ok(l) => return Ok(l),
             Err(e) => reason = why(e),
@@ -113,7 +114,8 @@ enum Split {
     /// As two 32-lane halves, each lane on its own way through the program.
     Halves,
     /// As two 32-lane halves following the console wave's own branches,
-    /// EXEC a value; groups of one console wave.
+    /// EXEC a value; groups of one console wave, or of several that never
+    /// meet, played in turn ([`Serial`]).
     Lockstep,
 }
 
@@ -396,6 +398,45 @@ fn wave64_lanes(x: &Parts) -> bool {
     x.native.wave64 && (reads_console_lanes(x) || one_wave && cs.lds_bytes() > 0)
 }
 
+/// Whether the console waves of a wave64 compute group never meet, so that
+/// one host group can play them one after the other: whole console waves,
+/// no LDS or GDS, no `s_barrier`, and in loops nothing through which a
+/// wave could wait for another (an atomic, a coherent `glc` or `dlc`
+/// access, a cache invalidation).
+fn apart_waves(x: &Parts) -> bool {
+    let StageIo::Cs(cs) = x.native.io else {
+        return false;
+    };
+    let threads: u32 = cs.threads.iter().product();
+    let looped = super::halves::looping_blocks(x.p, x.st);
+    let shares = |i: &Inst| match &i.fields {
+        Fields::Ds { .. } => !matches!(
+            i.name(),
+            "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32"
+        ),
+        Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
+        _ => i.name() == "s_barrier",
+    };
+    let waits = |i: &Inst| {
+        let coherent = match &i.fields {
+            Fields::Smem { cache, .. }
+            | Fields::Buffer { cache, .. }
+            | Fields::Image { cache, .. }
+            | Fields::Flat { cache, .. } => cache.glc || cache.dlc,
+            _ => false,
+        };
+        coherent || i.name().contains("atomic") || i.name().ends_with("_inv")
+    };
+    threads.is_multiple_of(64)
+        && cs.lds_bytes() == 0
+        && x.p.blocks.iter().enumerate().all(|(b, block)| {
+            block
+                .insts
+                .iter()
+                .all(|i| !shares(i) && !(looped[b] && waits(i)))
+        })
+}
+
 /// The low dwords of the lane masks some instruction reads as data.
 fn data_masks(p: &Program, st: &Structured) -> HashSet<Value> {
     let mut out = HashSet::new();
@@ -442,13 +483,28 @@ struct Halves {
     /// and every lane mask a value, each vector instruction under the
     /// thread's own bit of EXEC; so every block meets.
     lockstep: bool,
+    /// Lockstep in a group of several console waves that never meet.
+    serial: Option<Serial>,
+}
+
+/// Lockstep for a group of several console waves that never meet
+/// ([`apart_waves`]): the host group is one console wave, whose halves
+/// play the group's waves one after the other, around a loop over them.
+#[derive(Debug, Clone, Copy)]
+struct Serial {
+    /// The console's group.
+    threads: [u32; 3],
+    /// Its console waves.
+    waves: u32,
+    /// The DXIL block where a wave's turn ends (made by [`Lower::turns`]).
+    next: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct HalfIds {
     /// The console thread's index in the group.
     thread: V,
-    /// Its console lane (0-63), half (0 or 1) and wave in the group.
+    /// Its console lane (0-63), half (0 or 1) and wave in the host group.
     lane: V,
     half: V,
     wave: V,
@@ -555,6 +611,16 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
                 if split != Split::No && wave == 64 {
                     s.wave_size = Some(32);
+                    // Several console waves in lockstep: the host group is
+                    // one, which plays them in turn.
+                    let serial = (lockstep && !one_wave).then(|| {
+                        s.threads = Some([64, 1, 1]);
+                        Serial {
+                            threads: cs.threads,
+                            waves: threads / 64,
+                            next: None,
+                        }
+                    });
                     // A wave's lanes have their own x index. (In lockstep
                     // every lane goes where its wave does: none is alone.)
                     let distinct = (!lockstep
@@ -595,6 +661,7 @@ impl<'a> Lower<'a> {
                         ids: None,
                         dwords: 0,
                         lockstep,
+                        serial,
                     });
                 }
             }
@@ -1141,6 +1208,13 @@ impl<'a> Lower<'a> {
         self.find_sections();
         if self.halves.is_some() && self.console_lanes {
             self.halves_prologue().map_err(|w| unsupported(0, w))?;
+        }
+        if self.halves.as_ref().is_some_and(|h| h.serial.is_some()) {
+            if self.counters.contains_key(&order[0]) {
+                return Err(unsupported(0, "a loop back to the start of waves in turn"));
+            }
+            self.turns();
+            self.block[order[0]] = Some(self.cur);
         }
         self.inputs()?;
         for &(_, v) in &p.inputs {
@@ -2340,7 +2414,10 @@ impl<'a> Lower<'a> {
     /// Component `c` of the thread id of the thread with index `f` in the
     /// group, computed in block `at`.
     fn group_coord(&mut self, at: usize, f: V, c: u8) -> V {
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = match self.halves.as_ref().and_then(|h| h.serial) {
+            Some(s) => s.threads,
+            None => self.s.threads.expect("compute"),
+        };
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         match c {
             0 => self.s.m.bin(at, Bin::URem, f, xk),
@@ -2437,6 +2514,53 @@ impl<'a> Lower<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Lockstep in turn ([`Serial`]): a loop over the console group's
+    /// waves around the program, made after the halves' prologue; this
+    /// thread plays console thread turn * 64 + its own, and where the
+    /// console wave ends, its turn does. A group barrier ends each turn, so
+    /// every thread has read one wave's exchanges before any writes the
+    /// next one's.
+    fn turns(&mut self) {
+        let Some((serial, ids)) = self.halves.as_ref().and_then(|h| Some((h.serial?, h.ids?)))
+        else {
+            return;
+        };
+        let entry = self.cur;
+        let (head, next, done) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(entry, Term::Br(head));
+        let turn = self.s.m.phi(head, self.s.t.i32);
+        self.cur = next;
+        self.group_barrier();
+        let one = self.s.m.i32(1);
+        let after = self.s.m.bin(next, Bin::Add, turn, one);
+        let waves = self.s.m.i32(serial.waves);
+        let more = self.s.m.cmp(next, pred::IULT, after, waves);
+        self.s.m.terminate(next, Term::CondBr(more, head, done));
+        self.s.m.terminate(done, Term::Ret);
+        let zero = self.s.m.i32(0);
+        self.s.m.set_phi(turn, vec![(zero, entry), (after, next)]);
+        let k6 = self.s.m.i32(6);
+        let first = self.s.m.bin(head, Bin::Shl, turn, k6);
+        let thread = self.s.m.bin(head, Bin::Add, first, ids.thread);
+        if let Some(h) = &mut self.halves {
+            h.ids = Some(HalfIds { thread, ..ids });
+            h.serial = Some(Serial {
+                next: Some(next),
+                ..serial
+            });
+        }
+        self.cur = head;
+    }
+
+    /// Lockstep in turn: the block where the console wave's turn ends.
+    fn next_turn(&self) -> Option<usize> {
+        self.halves.as_ref()?.serial?.next
     }
 
     /// Halves: each half gives `words` (the same in all its lanes) and each
@@ -8222,7 +8346,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                self.next_turn().map_or(Term::Ret, Term::Br)
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -8304,7 +8428,8 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, p, next, limit)
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
+    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through (in turn,
+    /// its console wave's turn ends there).
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
             return a;
@@ -8315,7 +8440,8 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let end = self.next_turn().map_or(Term::Ret, Term::Br);
+        self.s.m.terminate(a, end);
         self.abort = Some(a);
         a
     }
