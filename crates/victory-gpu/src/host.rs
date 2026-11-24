@@ -392,19 +392,29 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
-    /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
-    /// and at the end, and where they are read back.
+    /// With `VICTORY_GPU_TIMING`: GPU timestamps at its start, before each
+    /// noted command, at its end and around its prelude (see `STAMPS`), and
+    /// where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Whether its prelude last recorded was timed (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    prelude_timed: std::sync::atomic::AtomicBool,
     /// With Aftermath on: the list's context for its event markers, which
     /// carry the same texts.
     #[cfg(feature = "diagnostics")]
     marks: Option<crate::aftermath::Marks>,
 }
 
-/// Timestamps per list (diagnostics); commands past them are not timed.
+/// Timestamps per list (diagnostics): its start, one before each noted
+/// command (commands past `NOTED` are not timed), its end; the last two
+/// are its prelude's start and end.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+#[cfg(feature = "diagnostics")]
+const NOTED: usize = STAMPS as usize - 4;
+#[cfg(feature = "diagnostics")]
+const PRELUDE: u32 = STAMPS - 2;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -447,6 +457,59 @@ struct GpuTimes {
     timed: f64,
     commands: u64,
     untimed: u64,
+    /// Of the waits, ms, as in [`Split`]; and waiting for the tile
+    /// mappings queued before a submission's lists.
+    submit: f64,
+    launch: f64,
+    prelude: f64,
+    lead: f64,
+    wake: f64,
+    tiles: f64,
+}
+
+/// A timed list's submission on the CPU (QueryPerformanceCounter ticks):
+/// before and after ExecuteCommandLists, when the wait ended, and the
+/// queue's clock calibration then (GPU ticks, CPU ticks).
+#[cfg(feature = "diagnostics")]
+struct Submitted {
+    before: i64,
+    after: i64,
+    woke: i64,
+    calibration: Option<(u64, u64)>,
+}
+
+/// A timed list's wait, ms (diagnostics): in ExecuteCommandLists, from
+/// calling it to the GPU's first timestamp (zero without the queue's clock
+/// calibration), in its prelude, from its start to its first noted command,
+/// from its start to its end, from its end to the wait's end (zero without
+/// the calibration).
+#[cfg(feature = "diagnostics")]
+#[derive(Debug, Default)]
+struct Split {
+    submit: f64,
+    launch: f64,
+    prelude: f64,
+    lead: f64,
+    span: f64,
+    wake: f64,
+}
+
+/// The CPU's performance counter now (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn qpc() -> i64 {
+    let mut now = 0;
+    // SAFETY: writes the counter.
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut now) };
+    now
+}
+
+/// Ticks of [`qpc`] per second (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn qpc_frequency() -> i64 {
+    let mut f = 0;
+    // SAFETY: writes the frequency.
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+    f.max(1)
 }
 
 #[cfg(feature = "diagnostics")]
@@ -512,13 +575,22 @@ fn log_gpu_times(frames: f64) {
     let frames = frames.max(1.0);
     tracing::info!(
         "GPU timing per frame: {:.1} lists, {:.1} ms waited for them, {:.1} ms from their first \
-         timestamp to their last, {:.1} ms in {:.0} timed commands ({:.0} more not timed)",
+         timestamp to their last, {:.1} ms in {:.0} timed commands ({:.0} more not timed); of the \
+         waits: {:.1} ms in ExecuteCommandLists, {:.1} ms from calling it to the GPU's first \
+         timestamp, {:.1} ms in preludes, {:.1} ms from lists' start to their first noted command, \
+         {:.1} ms from lists' end to the wait's end; {:.1} ms waiting for tile mappings",
         t.lists as f64 / frames,
         t.waited / frames,
         t.span / frames,
         t.timed / frames,
         t.commands as f64 / frames,
         t.untimed as f64 / frames,
+        t.submit / frames,
+        t.launch / frames,
+        t.prelude / frames,
+        t.lead / frames,
+        t.wake / frames,
+        t.tiles / frames,
     );
     let mut kinds: std::collections::HashMap<&str, (f64, u64)> = Default::default();
     for (label, (ms, n, _)) in &t.by_label {
@@ -688,7 +760,7 @@ impl Host {
             prelude.Close()?;
             #[cfg(feature = "diagnostics")]
             let marks = crate::aftermath::Marks::new(&list);
-            Ok(HostList {
+            let list = HostList {
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -703,8 +775,13 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
+                prelude_timed: Default::default(),
+                #[cfg(feature = "diagnostics")]
                 marks,
-            })
+            };
+            #[cfg(feature = "diagnostics")]
+            list.stamp_start();
+            Ok(list)
         }
     }
 
@@ -745,6 +822,23 @@ impl Host {
         // Loose-memory windows copied for the first time get their tiles.
         crate::shadow::map_windows(&self.queue);
         let prepared = std::time::Instant::now();
+        // Diagnostics: the tile mappings just queued, waited for on their own.
+        #[cfg(feature = "diagnostics")]
+        if timing() {
+            *submitted += 1;
+            // SAFETY: the fence and event are ours.
+            let waited = unsafe {
+                self.queue
+                    .Signal(&self.fence, *submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
+                    .map(|()| WaitForSingleObject(self.event, INFINITE))
+            };
+            if waited.is_ok() {
+                let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+                times.get_or_insert_with(GpuTimes::default).tiles +=
+                    prepared.elapsed().as_secs_f64() * 1e3;
+            }
+        }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -761,9 +855,14 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
+            #[cfg(feature = "diagnostics")]
+            let before = qpc();
+            // SAFETY: closed lists.
+            unsafe { self.queue.ExecuteCommandLists(group) };
+            #[cfg(feature = "diagnostics")]
+            let after = qpc();
+            // SAFETY: the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -777,18 +876,37 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if timing() {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                runs[i].tally(frequency, started.elapsed());
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                let woke = qpc();
+                let waited = started.elapsed();
+                let (mut gpu, mut cpu) = (0, 0);
+                // SAFETY: plain queries.
+                let (frequency, calibrated) = unsafe {
+                    (
+                        self.queue.GetTimestampFrequency().unwrap_or(1),
+                        self.queue.GetClockCalibration(&mut gpu, &mut cpu).is_ok(),
+                    )
+                };
+                let calibration = calibrated.then_some((gpu, cpu));
+                let split = runs[i].tally(
+                    frequency,
+                    waited,
+                    &Submitted {
+                        before,
+                        after,
+                        woke,
+                        calibration,
+                    },
+                );
+                if waited > std::time::Duration::from_millis(50) {
+                    let commands = runs[i]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(ms = waited.as_millis(), commands, ?split, "slow host list");
+                    for (ms, op) in runs[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
             }
             let _ = (i, started);
@@ -1088,23 +1206,27 @@ impl HostList {
     }
 
     /// The list's timestamps, read back after it ran (diagnostics, timing
-    /// on): one before each of its first `STAMPS - 1` noted commands, then
-    /// one at its end.
+    /// on): its start, one before each of its first `NOTED` noted
+    /// commands, its end; and its prelude's start and end if a prelude ran.
     #[cfg(feature = "diagnostics")]
-    fn timestamps(&self, notes: usize) -> Vec<u64> {
-        let (Some((_, back)), count) = (self.stamps(), notes.min(STAMPS as usize - 1)) else {
-            return Vec::new();
+    fn timestamps(&self, notes: usize) -> (Vec<u64>, Option<[u64; 2]>) {
+        let (Some((_, back)), count) = (self.stamps(), notes.min(NOTED)) else {
+            return (Vec::new(), None);
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
-        // SAFETY: a read-back buffer the finished list resolved into.
+        // SAFETY: a read-back buffer the finished lists resolved into.
         unsafe {
-            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
+            if back.Map(0, None, Some(&mut data)).is_err() {
+                return (Vec::new(), None);
             }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
-            back.Unmap(0, None);
-            s
+            let all = data.cast::<u64>();
+            let s = std::slice::from_raw_parts(all, count + 2).to_vec();
+            let prelude = self
+                .prelude_timed
+                .load(Ordering::Relaxed)
+                .then(|| [*all.add(PRELUDE as usize), *all.add(PRELUDE as usize + 1)]);
+            back.Unmap(0, Some(&D3D12_RANGE::default()));
+            (s, prelude)
         }
     }
 
@@ -1113,8 +1235,10 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let stamps = self.timestamps(notes.len());
+        let (stamps, _) = self.timestamps(notes.len());
         let mut times: Vec<(f64, String)> = stamps
+            .get(1..)
+            .unwrap_or_default()
             .windows(2)
             .zip(notes.iter())
             .map(|(s, (note, _))| {
@@ -1131,22 +1255,52 @@ impl HostList {
     }
 
     /// Adds the list's command times to the frame's GPU time by command
-    /// and pipeline (diagnostics, timing on, after the list ran and was
-    /// waited for `waited`).
+    /// and pipeline, and splits the wait for it (diagnostics, timing on,
+    /// after the list ran and was waited for `waited`).
     #[cfg(feature = "diagnostics")]
-    fn tally(&self, frequency: u64, waited: std::time::Duration) {
+    fn tally(&self, frequency: u64, waited: std::time::Duration, submitted: &Submitted) -> Split {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let stamps = self.timestamps(notes.len());
+        let (stamps, prelude) = self.timestamps(notes.len());
         let ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
+        // CPU times and GPU timestamps as ms since ExecuteCommandLists was
+        // called.
+        let since = |qpc: i64| (qpc - submitted.before) as f64 * 1e3 / qpc_frequency() as f64;
+        let on_cpu = submitted.calibration.map(|(gpu, cpu)| {
+            move |stamp: u64| {
+                since(cpu as i64)
+                    + stamp.wrapping_sub(gpu) as i64 as f64 * 1e3 / frequency.max(1) as f64
+            }
+        });
+        let mut split = Split {
+            submit: since(submitted.after),
+            ..Split::default()
+        };
+        if let (Some(&start), Some(&end)) = (stamps.first(), stamps.last()) {
+            split.prelude = prelude.map_or(0.0, |[from, to]| ms(to.saturating_sub(from)));
+            split.lead = ms(stamps[1].saturating_sub(start));
+            split.span = ms(end.saturating_sub(start));
+            if let Some(on_cpu) = on_cpu {
+                split.launch = on_cpu(prelude.map_or(start, |p| p[0]));
+                split.wake = since(submitted.woke) - on_cpu(end);
+            }
+        }
         let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
         let t = times.get_or_insert_with(GpuTimes::default);
         t.lists += 1;
         t.waited += waited.as_secs_f64() * 1e3;
-        t.untimed += notes.len().saturating_sub(stamps.len().saturating_sub(1)) as u64;
-        if let (Some(first), Some(last)) = (stamps.first(), stamps.last()) {
-            t.span += ms(last.saturating_sub(*first));
-        }
-        for (s, (note, _)) in stamps.windows(2).zip(notes.iter()) {
+        t.submit += split.submit;
+        t.launch += split.launch;
+        t.prelude += split.prelude;
+        t.lead += split.lead;
+        t.span += split.span;
+        t.wake += split.wake;
+        t.untimed += notes.len().saturating_sub(NOTED) as u64;
+        for (s, (note, _)) in stamps
+            .get(1..)
+            .unwrap_or_default()
+            .windows(2)
+            .zip(notes.iter())
+        {
             let took = ms(s[1].saturating_sub(s[0]));
             t.timed += took;
             t.commands += 1;
@@ -1155,16 +1309,34 @@ impl HostList {
             e.1 += 1;
             e.2 = e.2.max(took);
         }
+        split
+    }
+
+    /// Diagnostics, timing on: the timestamp of the list's start (just
+    /// opened).
+    #[cfg(feature = "diagnostics")]
+    fn stamp_start(&self) {
+        if let Some((heap, _)) = self.stamps() {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0) };
+        }
     }
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let count = self
+                .notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+                .min(NOTED) as u32;
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                self.list
+                    .EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count + 1);
+                self.list
+                    .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 2, back, 0);
             }
         }
         // SAFETY: our list.
@@ -1197,6 +1369,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        #[cfg(feature = "diagnostics")]
+        self.stamp_start();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1268,6 +1442,13 @@ impl HostList {
                 before.extend(move_to(copy, real, COPY_DEST));
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let stamps = self
+            .stamps()
+            .filter(|_| !(before.is_empty() && due.is_empty()));
+        #[cfg(feature = "diagnostics")]
+        self.prelude_timed
+            .store(stamps.is_some(), Ordering::Relaxed);
         if before.is_empty() && due.is_empty() {
             return None;
         }
@@ -1277,6 +1458,10 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                #[cfg(feature = "diagnostics")]
+                if let Some((heap, _)) = stamps {
+                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, PRELUDE);
+                }
                 if !before.is_empty() {
                     list.ResourceBarrier(&before);
                 }
@@ -1285,6 +1470,18 @@ impl HostList {
                 }
                 if !after.is_empty() {
                     list.ResourceBarrier(&after);
+                }
+                #[cfg(feature = "diagnostics")]
+                if let Some((heap, back)) = stamps {
+                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, PRELUDE + 1);
+                    list.ResolveQueryData(
+                        heap,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        PRELUDE,
+                        2,
+                        back,
+                        u64::from(PRELUDE) * 8,
+                    );
                 }
                 list.Close()
             })
@@ -1317,10 +1514,15 @@ impl HostList {
         // Timing needs the texts, not the markers: breadcrumbs cost GPU
         // time of their own.
         if dred_on() || self.stamps().is_some() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if let Some((heap, _)) = self.stamps()
+                && at < NOTED
+            {
                 // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+                unsafe {
+                    self.list
+                        .EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at as u32 + 1)
+                };
             }
             let what = what();
             if let Some(marks) = &self.marks {
