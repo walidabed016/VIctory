@@ -410,6 +410,38 @@ fn lanes_sample_the_texture_their_if_else_arm_chose() {
 }
 
 #[test]
+fn lanes_sample_the_texture_their_if_else_arm_chose_after_many_early_exits() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    // Ahead of the if/else, twenty exits of the lanes where two compares
+    // both hold (none does): the lanes' paths to the sample then hold forty
+    // conditions ahead of the arms' own, more cases than one by one ruling
+    // out a lane that skips both arms takes.
+    const EXITS: usize = 20;
+    let end = 6 * EXITS + WATERFALL_JOINED_WAVE32.len() - 1;
+    let mut words = Vec::new();
+    for i in 0..EXITS as u32 {
+        words.extend([
+            0x7D82_00A0 + i, // v_cmp_lt_u32 vcc_lo, 32 + i, v0
+            0xD4C1_0032,
+            0x0002_00A0 + i, // v_cmp_lt_u32_e64 s50, 32 + i, v0
+            0x8732_326A,     // s_and_b32 s50, vcc_lo, s50
+            0x8A7E_327E,     // s_andn2_b32 exec_lo, exec_lo, s50
+        ]);
+        let skip = (end - words.len() - 1) as u32;
+        words.push(0xBF88_0000 | skip); // s_cbranch_execz -> s_endpgm
+    }
+    words.extend(WATERFALL_JOINED_WAVE32);
+    let shader = build(&words, false);
+    let results = sampled(&shader);
+    assert!(!results.is_empty(), "no SM 6.6 device");
+    for (label, red) in results {
+        // Lanes below 16 took the first texture, the others the second.
+        let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
     let shader = build(WATERFALL_JOINED_MIXED_WAVE32, false);

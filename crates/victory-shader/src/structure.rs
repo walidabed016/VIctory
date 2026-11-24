@@ -229,10 +229,18 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    /// [`Self::meet`], remembering the sets of conditions no lane meets:
+    /// splits on the atoms before a contradiction keep reaching the same
+    /// ones.
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        never: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
@@ -241,10 +249,15 @@ impl Bools {
         if all.is_empty() || *budget == 0 {
             return true;
         }
+        all.sort_unstable();
+        all.dedup();
+        if never.contains(&all) {
+            return false;
+        }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let met = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -252,8 +265,12 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, never)
+        });
+        if !met {
+            never.insert(all);
+        }
+        met
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
