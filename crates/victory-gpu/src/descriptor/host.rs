@@ -31,6 +31,7 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
+    /// Held a little longer once the slot is rewritten (see [`HostHeap::keep`]).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
@@ -341,12 +342,19 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's), in
     /// records of `record[0]` bytes from byte `record[1]` of its host view,
-    /// a view of kind `record[2]` (see [`HostHeap::strides`]).
+    /// a view of kind `record[2]` (see [`HostHeap::strides`]). The
+    /// resource it viewed before is released once the submission running
+    /// now has finished ([`crate::host::Host::retire`]).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>, record: [u32; 3]) {
         use std::sync::atomic::{AtomicU32, Ordering};
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
+            if let Some(old) = std::mem::replace(slot, resource)
+                && slot.as_ref() != Some(&old)
+                && let Some(host) = host()
+            {
+                host.retire(old);
+            }
             if let Some((_, data)) = self.strides {
                 // SAFETY: the slot's record in the mapped buffer; shaders
                 // read it only.
@@ -1723,6 +1731,46 @@ mod tests {
             };
             assert_eq!((srv.Format, uav.Format), (format, format));
         }
+    }
+
+    /// A host copy a slot stops viewing outlives the submission running when
+    /// the slot is rewritten, which may have read it: shaders that load slot
+    /// indices from memory read slots no list names, so no list holds the
+    /// copy (run 54's page fault in the decal classification).
+    #[test]
+    fn copies_a_slot_stops_viewing_outlive_the_running_submission() {
+        use windows::core::Interface;
+        let _serial = crate::watch::serial();
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let title = Title::new();
+        heap.make_at(0, &title.srv(39, 0, 1, 0, 1024));
+        let copy = heap.kept.lock().unwrap()[0]
+            .clone()
+            .expect("the slot's copy");
+        // The title releases the buffer: only the slot holds its copy.
+        drop(title);
+        let refs = |r: &ID3D12Resource| {
+            // SAFETY: a live object; the reference taken is given back.
+            unsafe {
+                let raw = r.as_raw();
+                let vtable = *raw.cast::<*const windows::core::IUnknown_Vtbl>();
+                ((*vtable).AddRef)(raw);
+                ((*vtable).Release)(raw)
+            }
+        };
+        let held = refs(&copy);
+        heap.make_null(0);
+        assert_eq!(refs(&copy), held, "released when the slot was rewritten");
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list.
+        unsafe { list.list.Close() }.unwrap();
+        host.execute(&[&list]);
+        assert_eq!(refs(&copy), held - 1, "held after a submission ran");
     }
 
     /// Buffer views the title writes into a shader-visible heap get host

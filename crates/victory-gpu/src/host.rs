@@ -41,6 +41,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Resources heap slots stopped viewing (see [`Host::retire`]).
+    retired: Mutex<Vec<ID3D12Resource>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -224,6 +226,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            retired: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -556,10 +559,22 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
+    /// Keeps `resource`, which a heap slot stopped viewing, until the
+    /// submission running now (if one is) has finished: it may still read
+    /// the slot's old view. Shaders that load slot indices from memory read
+    /// slots no list names, so no list holds what they read.
+    pub(crate) fn retire(&self, resource: ID3D12Resource) {
+        self.retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(resource);
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|e| e.into_inner()));
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -622,6 +637,9 @@ impl Host {
             }
             let _ = (i, started);
         }
+        // Retired before this submission: no submission still runs that
+        // read them.
+        drop(retired);
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
