@@ -8170,6 +8170,125 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// Whether no lane that enters block `b` from its `n`th predecessor reads
+    /// `v`, a value joined there, so that what the edge brings never matters:
+    /// compares in `b` that every such lane answers alike (against a
+    /// constant the edge brings) rule out each block that reads it.
+    fn unread_from(&self, v: Value, b: usize, n: usize) -> bool {
+        let (p, st) = (self.x.p, self.x.st);
+        let along = |w: Value| match self.phi_at.get(&w) {
+            Some(&(pb, i)) if pb == b => p.blocks[b].phis[i].args[n],
+            _ => w,
+        };
+        let immediate = |op: &Operand| match *op {
+            Operand::Const(code) => crate::resource::inline(code),
+            Operand::Literal(k) => Some(k),
+            _ => None,
+        };
+        // A move of a constant every lane reaching it runs.
+        let constant = |w: Value| {
+            let (db, di) = p.blocks.iter().enumerate().find_map(|(db, block)| {
+                let di = block
+                    .insts
+                    .iter()
+                    .position(|d| d.writes.iter().any(|&(_, x)| x == w))?;
+                Some((db, di))
+            })?;
+            let d = &p.blocks[db].insts[di];
+            match &d.fields {
+                Fields::Sop { src, .. } if d.name() == "s_mov_b32" => immediate(src.first()?),
+                Fields::Valu(f)
+                    if d.name() == "v_mov_b32"
+                        && st.guards[db][di].is_none()
+                        && (f.neg, f.abs, f.clamp, f.omod) == (0, 0, false, 0)
+                        && f.sdwa.is_none()
+                        && f.dpp.is_none() =>
+                {
+                    immediate(f.src.first()?)
+                }
+                _ => None,
+            }
+        };
+        let mut known = Vec::new();
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let Fields::Valu(f) = &inst.fields else {
+                continue;
+            };
+            let Some((op, ty)) = inst
+                .name()
+                .strip_prefix("v_cmp_")
+                .and_then(|t| t.split_once('_'))
+            else {
+                continue;
+            };
+            if st.guards[b][i].is_some() || f.sdwa.is_some() || f.dpp.is_some() || f.src.len() != 2
+            {
+                continue;
+            }
+            let Some(&bit) = inst.writes.iter().find_map(|(_, w)| st.masks.get(w)) else {
+                continue;
+            };
+            let operand = |op: &Operand| match *op {
+                Operand::Vector { reg, .. } => constant(along(inst.read(Reg::V(reg))?)),
+                Operand::Scalar { code, .. } => constant(along(inst.read(Reg::S(code))?)),
+                _ => immediate(op),
+            };
+            let (Some(x), Some(y)) = (operand(&f.src[0]), operand(&f.src[1])) else {
+                continue;
+            };
+            let order = match ty {
+                "u32" => x.cmp(&y),
+                "i32" => (x as i32).cmp(&(y as i32)),
+                _ => continue,
+            };
+            let holds = match op {
+                "eq" => order.is_eq(),
+                "ne" => order.is_ne(),
+                "lt" => order.is_lt(),
+                "le" => order.is_le(),
+                "gt" => order.is_gt(),
+                "ge" => order.is_ge(),
+                _ => continue,
+            };
+            known.push((bit, holds));
+        }
+        if known.is_empty() {
+            return false;
+        }
+        let unreached = |r: usize, edge: Option<(Bool, bool)>| {
+            let mut all = known.clone();
+            all.push((st.reach[r], true));
+            all.extend(edge);
+            !st.bools.meet(&all)
+        };
+        for (r, block) in p.blocks.iter().enumerate() {
+            let reads = block
+                .insts
+                .iter()
+                .any(|i| i.reads.iter().any(|&(_, x)| x == v));
+            if reads && !unreached(r, None) {
+                return false;
+            }
+            for phi in &block.phis {
+                for (m, _) in phi.args.iter().enumerate().filter(|&(_, &a)| a == v) {
+                    let s = block.preds[m];
+                    let edge = match st.exits[s] {
+                        LaneExit::Branch {
+                            when,
+                            taken,
+                            not_taken,
+                        } if taken != not_taken => Some((when, taken == r)),
+                        _ => None,
+                    };
+                    if !unreached(s, edge) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
@@ -8194,15 +8313,17 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                let read =
+                    |l: &Self| l.read_phis.contains(&phi.value) && !l.unread_from(phi.value, b, n);
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if read(self) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _) if read(self) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
-                    _ if self.read_phis.contains(&phi.value) => {
+                    _ if read(self) => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),

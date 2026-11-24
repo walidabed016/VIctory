@@ -121,6 +121,8 @@ mod heap;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
+mod join_tests;
+#[cfg(all(test, windows))]
 mod kind_tests;
 mod lower;
 mod sampler;
