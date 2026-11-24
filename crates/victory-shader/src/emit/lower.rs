@@ -8810,11 +8810,60 @@ impl<'a> Lower<'a> {
             all.extend(edge);
             !st.bools.meet(&all)
         };
+        let only_user = |x: Value| {
+            let mut users = p
+                .blocks
+                .iter()
+                .flat_map(|bl| &bl.insts)
+                .filter(move |u| u.reads.iter().any(|&(_, y)| y == x));
+            let joined = p
+                .blocks
+                .iter()
+                .any(|bl| bl.phis.iter().any(|phi| phi.args.contains(&x)));
+            match (users.next(), users.next()) {
+                (Some(u), None) if !joined => Some(u),
+                _ => None,
+            }
+        };
+        // A compare of `v` whose answer only selects a mask that an OR with a
+        // mask set in every such lane of block `r` overrides.
+        let absorbed = |r: usize, i: &Inst| {
+            let Some(sel) = i
+                .name()
+                .starts_with("s_cmp_")
+                .then(|| i.write(Reg::Scc))
+                .flatten()
+                .and_then(only_user)
+                .filter(|s| matches!(s.name(), "s_cselect_b32" | "s_cselect_b64"))
+            else {
+                return false;
+            };
+            let Some(or) = sel.writes.first().and_then(|&(_, w)| only_user(w)) else {
+                return false;
+            };
+            let set = |&(_, x): &(Reg, Value)| {
+                st.masks.get(&x).is_some_and(|&bit| {
+                    let mut all = known.clone();
+                    all.extend([(st.reach[r], true), (bit, false)]);
+                    !st.bools.meet(&all)
+                })
+            };
+            matches!(or.name(), "s_or_b32" | "s_or_b64")
+                && sel
+                    .writes
+                    .iter()
+                    .all(|&(_, w)| only_user(w).is_some_and(|u| std::ptr::eq(u, or)))
+                && or
+                    .reads
+                    .iter()
+                    .filter(|&&(_, x)| !sel.writes.iter().any(|&(_, w)| w == x))
+                    .any(set)
+        };
         for (r, block) in p.blocks.iter().enumerate() {
             let reads = block
                 .insts
                 .iter()
-                .any(|i| i.reads.iter().any(|&(_, x)| x == v));
+                .any(|i| i.reads.iter().any(|&(_, x)| x == v) && !absorbed(r, i));
             if reads && !unreached(r, None) {
                 return false;
             }

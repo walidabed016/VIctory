@@ -73,9 +73,11 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
 /// second skips that), as the ped pixel programs' unrolled decal loop does,
 /// and the read tests the first join's compare. With `joins` 2, the first
 /// turn's path to that join has a join of its own where s3 also arrives
-/// unwritten, so s3 reaches the second join along two paths. Each thread
-/// stores v5.
-fn two_turns(skipped: u8, joins: u8) -> Vec<u32> {
+/// unwritten, so s3 reaches the second join along two paths. With
+/// `compare`, the first join also compares s3 with 0, as the ped pixel
+/// programs do, and ORs the mask that answer selects with `v1 != -1`
+/// before branching on it. Each thread stores v5.
+fn two_turns(skipped: u8, joins: u8, compare: bool) -> Vec<u32> {
     // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0; v4 = v0 * 4; s4 = 0; v5 = 0.
     let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
     w.extend([vop2(0x1A, 4, u16::from(TWO), 0), sop1(0x03, 4, ZERO)]);
@@ -98,10 +100,21 @@ fn two_turns(skipped: u8, joins: u8) -> Vec<u32> {
     let join = w.len();
     w[skip] = sopp(0x05, skip, join);
     // v_cmp_eq_u32 vcc, -1, v1; s_andn2_b64 vcc, exec, vcc; s_cbranch_vccnz next.
-    w.extend([
-        vopc(0xC2, u16::from(ONES), 1),
-        sop2(0x15, VCC_LO, EXEC_LO, VCC_LO),
-    ]);
+    w.push(vopc(0xC2, u16::from(ONES), 1));
+    if compare {
+        // s_cmp_eq_u32 s3, 0; s_cselect_b64 s[12:13], exec, 0;
+        // s_xor_b64 s[14:15], vcc, -1; s_or_b64 s[12:13], s[12:13], s[14:15];
+        // s_and_b64 vcc, exec, s[12:13].
+        w.extend([
+            sopc(0x06, 3, ZERO),
+            sop2(0x0B, 12, EXEC_LO, ZERO),
+            sop2(0x13, 14, VCC_LO, ONES),
+            sop2(0x11, 12, 12, 14),
+            sop2(0x0F, VCC_LO, EXEC_LO, 12),
+        ]);
+    } else {
+        w.push(sop2(0x15, VCC_LO, EXEC_LO, VCC_LO));
+    }
     if joins > 0 {
         // s[6:7] = vcc; s_cmp_eq_u32 s4, 0; s_cbranch_scc0 second; s3 = 0x100;
         // second: vcc = s[6:7].
@@ -297,7 +310,7 @@ fn run(shader: &HostShader) -> Vec<(&'static str, Vec<u32>)> {
 
 #[test]
 fn a_mask_joined_with_data_runs_where_only_the_data_is_read() {
-    let shader = lower_cs(&two_turns(ZERO, 0)).expect("lower");
+    let shader = lower_cs(&two_turns(ZERO, 0, false)).expect("lower");
     let want: Vec<u32> = (0..THREADS)
         .map(|x| 0x100 + if x < 16 { 2 } else { 0 })
         .collect();
@@ -308,7 +321,7 @@ fn a_mask_joined_with_data_runs_where_only_the_data_is_read() {
 
 #[test]
 fn a_mask_a_second_join_passes_on_runs_where_only_the_data_is_read() {
-    let shader = lower_cs(&two_turns(ZERO, 1)).expect("lower");
+    let shader = lower_cs(&two_turns(ZERO, 1, false)).expect("lower");
     let want: Vec<u32> = (0..THREADS)
         .map(|x| 0x100 + if x < 16 { 2 } else { 0 })
         .collect();
@@ -319,7 +332,18 @@ fn a_mask_a_second_join_passes_on_runs_where_only_the_data_is_read() {
 
 #[test]
 fn a_mask_reaching_a_join_along_two_paths_runs_where_only_the_data_is_read() {
-    let shader = lower_cs(&two_turns(ZERO, 2)).expect("lower");
+    let shader = lower_cs(&two_turns(ZERO, 2, false)).expect("lower");
+    let want: Vec<u32> = (0..THREADS)
+        .map(|x| 0x100 + if x < 16 { 2 } else { 0 })
+        .collect();
+    for (label, got) in run(&shader) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_mask_a_compare_reads_where_an_or_overrides_its_answer_runs() {
+    let shader = lower_cs(&two_turns(ZERO, 0, true)).expect("lower");
     let want: Vec<u32> = (0..THREADS)
         .map(|x| 0x100 + if x < 16 { 2 } else { 0 })
         .collect();
@@ -341,12 +365,12 @@ fn a_table_address_joined_from_two_paths_reads_each_paths_dword() {
 
 #[test]
 fn a_mask_joined_with_data_is_refused_where_a_lane_bringing_it_reads_it() {
-    for joins in 0..3 {
-        match lower_cs(&two_turns(ONES, joins)) {
+    for (joins, compare) in [(0, false), (1, false), (2, false), (0, true)] {
+        match lower_cs(&two_turns(ONES, joins, compare)) {
             Err(ShaderError::Unsupported { what, .. }) => {
-                assert_eq!(what, "a lane mask read as data", "joins {joins}");
+                assert_eq!(what, "a lane mask read as data", "joins {joins} {compare}");
             }
-            other => panic!("joins {joins}: {:?}", other.map(|_| ())),
+            other => panic!("joins {joins} {compare}: {:?}", other.map(|_| ())),
         }
     }
 }
