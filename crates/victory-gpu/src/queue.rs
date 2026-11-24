@@ -272,6 +272,8 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::note_present(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }

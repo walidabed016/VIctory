@@ -16,17 +16,80 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated), and the
+/// world frames of `VICTORY_CAPTURE_WORLD`: saved too, and their draws
+/// traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    let list = LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
         list.split(',')
             .filter_map(|f| f.trim().parse().ok())
             .collect()
+    });
+    list.contains(&n)
+        || world().is_some_and(|(_, every)| {
+            world_frame(
+                FIRST_WORLD.load(std::sync::atomic::Ordering::Relaxed),
+                every,
+                n,
+            )
+        })
+}
+
+/// `VICTORY_CAPTURE_WORLD=N[,M]`: the draws a frame runs on the host that
+/// mark the world's start (it moves between runs by thousands of frames),
+/// and every how many frames the world is captured again.
+fn world() -> Option<(u64, u64)> {
+    static PARSED: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *PARSED.get_or_init(|| {
+        let value = std::env::var("VICTORY_CAPTURE_WORLD").ok()?;
+        let mut parts = value.split(',').map(|p| p.trim().parse::<u64>());
+        let draws = parts.next()?.ok()?;
+        let every = parts.next().and_then(Result::ok).unwrap_or(0);
+        Some((draws, every))
     })
-    .contains(&n)
+}
+
+/// The first world frame, 0 until a frame has run `VICTORY_CAPTURE_WORLD`'s
+/// draws.
+static FIRST_WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// World captures after the first, `every` frames apart.
+const WORLD_AGAIN: u64 = 4;
+
+/// Whether frame `n` is a world frame: `start`, then every `every` frames,
+/// [`WORLD_AGAIN`] times.
+fn world_frame(start: u64, every: u64, n: u64) -> bool {
+    if start == 0 || n < start {
+        return false;
+    }
+    let after = n - start;
+    after == 0 || every != 0 && after.is_multiple_of(every) && after / every <= WORLD_AGAIN
+}
+
+/// At the present of frame `frame`: the first frame that ran
+/// `VICTORY_CAPTURE_WORLD`'s draws on the host makes the next one the first
+/// world frame (this one's targets were not noted while it was built).
+pub(crate) fn note_present(frame: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let Some((draws, every)) = world() else {
+        return;
+    };
+    let drawn = crate::draw::drawn();
+    let ran = drawn - DRAWN.swap(drawn, Ordering::Relaxed);
+    if frame > 1 && ran >= draws && FIRST_WORLD.load(Ordering::Relaxed) == 0 {
+        FIRST_WORLD.store(frame + 1, Ordering::Relaxed);
+        tracing::info!(
+            frame,
+            draws = ran,
+            first = frame + 1,
+            every,
+            again = WORLD_AGAIN,
+            "VICTORY_CAPTURE_WORLD: the world started; capturing from the next frame"
+        );
+    }
 }
 
 /// Whether frame `n` is saved.
@@ -559,6 +622,19 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn world_frames_are_the_start_then_every_mth_four_more_times() {
+        let frames: Vec<u64> = (0..2000)
+            .filter(|&n| super::world_frame(1000, 100, n))
+            .collect();
+        assert_eq!(frames, [1000, 1100, 1200, 1300, 1400]);
+        let once: Vec<u64> = (0..2000)
+            .filter(|&n| super::world_frame(1000, 0, n))
+            .collect();
+        assert_eq!(once, [1000]);
+        assert!(!(0..2000).any(|n| super::world_frame(0, 100, n)));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
