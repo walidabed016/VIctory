@@ -424,9 +424,13 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_access(t as This, true);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_access(self.depth as This, true);
         }
         true
     }
@@ -1270,6 +1274,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
+            crate::capture::note_access(*resource as This, false);
+            #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -1284,7 +1290,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            {
+                crate::capture::note_target(*resource as This);
+                crate::capture::note_access(*resource as This, true);
+            }
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}

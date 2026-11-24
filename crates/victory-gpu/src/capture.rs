@@ -208,6 +208,13 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// With `VICTORY_DUMP_TARGETS`: the title resources the pipelines that run
+/// in the frame being built (a listed one) read and write, as (resource,
+/// written, pipeline name), to name at the present who wrote and who read
+/// each dumped target.
+static ACCESSES: std::sync::Mutex<std::collections::BTreeSet<(usize, bool, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
@@ -226,10 +233,42 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
-/// At the present of frame `frame`: saves the noted targets.
+/// Notes that the pipeline being bound reads or writes (`write`)
+/// `resource` in the frame being built.
+pub(crate) fn note_access(resource: crate::object::This, write: bool) {
+    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let pipeline = crate::descriptor::host::BINDING.get() as crate::object::This;
+    let name = crate::pipeline::host_pipeline(pipeline)
+        .map_or_else(|| format!("{pipeline:?}"), |p| p.name.clone());
+    let mut accesses = ACCESSES.lock().unwrap_or_else(|e| e.into_inner());
+    accesses.insert((resource as usize, write, name));
+}
+
+/// At the present of frame `frame`: saves the noted targets, and logs the
+/// pipelines that wrote and read each.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let accesses = std::mem::take(&mut *ACCESSES.lock().unwrap_or_else(|e| e.into_inner()));
+    for (i, (resource, _)) in targets.iter().enumerate() {
+        let programs = |write: bool| -> Vec<&str> {
+            accesses
+                .iter()
+                .filter(|(r, w, _)| r == resource && *w == write)
+                .map(|(_, _, name)| name.as_str())
+                .collect()
+        };
+        tracing::info!(
+            frame,
+            index = i,
+            resource = ?(*resource as crate::object::This),
+            writers = ?programs(true),
+            readers = ?programs(false),
+            "target programs"
+        );
+    }
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
