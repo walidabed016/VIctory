@@ -208,6 +208,11 @@ fn audit_on() -> bool {
     })
 }
 
+/// Tests: a title write [`Shadow::write_back`] makes in its race window,
+/// after the copy took title bytes and before it asks the guards.
+#[cfg(test)]
+static BEFORE_ASKING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 /// Whether copies of view memory that shaders write arm its blocks instead
 /// of taking snapshots ([`Shadow::arm`]); `VICTORY_EAGER_SNAPSHOTS` turns
 /// it off.
@@ -829,7 +834,7 @@ impl Shadow {
                     n as u64,
                 );
             }
-            synced.push((start + at) / PAGE);
+            synced.push(i);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::cost(
@@ -838,18 +843,46 @@ impl Shadow {
             start + from,
             (to - from) as u64,
         );
+        #[cfg(test)]
+        if let Some(race) = BEFORE_ASKING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            race();
+        }
         // Pages made equal to title memory are current in the copy, so our
         // own write is not taken for the title's; others keep what they had
-        // (a title write there shows at the next refresh).
+        // (a title write there shows at the next refresh). Only those still
+        // equal once guarded again: the title may have written one since the
+        // copy took it (unguarded once we wrote it), and the asking takes that
+        // write as well, which no copy holds yet (run 67's audit).
         let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
         if first < last
             && !synced.is_empty()
             && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
             && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
         {
+            let current = split(synced.len(), synced.len() * PIECE, |part| {
+                let mut title = vec![0u8; PIECE];
+                part.filter_map(|k| {
+                    let (at, host, n) = pieces[synced[k]];
+                    let page = (start + at) / PAGE;
+                    // SAFETY: inside the copy's memory, which only this
+                    // thread writes.
+                    let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
+                    let title = &mut title[..n];
+                    let equal = (first..last).contains(&page)
+                        && crate::host::read_into((start + at) as *const u8, title)
+                        && *title == *host;
+                    equal.then_some(page)
+                })
+                .collect::<Vec<_>>()
+            })
+            .concat();
             let base = start / PAGE;
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+            for page in current {
                 copied[page - base] = now;
             }
         }
@@ -2282,6 +2315,62 @@ pub(crate) mod tests {
         drop((a, b));
         unregister(usize::MAX - 12, at as u64);
         unregister(usize::MAX - 13, (at + 4 * MIB) as u64);
+        unmap(&made);
+    }
+
+    /// The title writes a block while copy-back runs, after the copy took
+    /// the block's bytes and before it asks the guards: the copy does not
+    /// count as current there, so the next refresh takes the write, and the
+    /// next copy-back keeps it rather than put the copy's older bytes over
+    /// it (run 67's audit: blocks armed clean, unsaved, with title memory
+    /// unlike the copy).
+    #[test]
+    fn a_title_write_during_copy_back_reaches_the_copy() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = (965 * SLAB) as usize - 256 * MIB;
+        // Copies across views: not used in place.
+        let made = views(at, &[6 * MIB; 4]);
+        assert_eq!(made.len(), 4, "no free address for test views");
+        register(usize::MAX - 15, at as u64, (16 * MIB) as u64);
+        let s = find(at as u64, (16 * MIB) as u64).unwrap();
+        assert!(!s.in_place);
+        let declared = [(at, 16 * MIB)];
+        let (x, y) = (at + 5 * MIB + 64, at + 9 * MIB);
+        // SAFETY: our views (guarded: our handler opens the block).
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        // The GPU writes x; the title writes next to it while copy-back runs.
+        crate::watch::forget_asked();
+        s.update(at, 16 * MIB);
+        s.writing(at, 16 * MIB);
+        // SAFETY: inside the copy's memory.
+        unsafe { s.host_at(x - at, 4).cast::<u32>().write(0xfeed) };
+        // SAFETY: as above.
+        *BEFORE_ASKING.lock().unwrap() =
+            Some(Box::new(move || unsafe { ((x + 8) as *mut u32).write(7) }));
+        crate::watch::forget_asked();
+        s.copy_back(&declared);
+        crate::watch::disarm();
+        // The next submission: the GPU writes elsewhere.
+        crate::watch::forget_asked();
+        s.update(at, 16 * MIB);
+        assert_eq!(
+            held(&s, x + 8),
+            Some(7),
+            "the copy missed the title's write"
+        );
+        s.writing(at, 16 * MIB);
+        // SAFETY: inside the copy's memory.
+        unsafe { s.host_at(y - at, 4).cast::<u32>().write(0xbeef) };
+        crate::watch::forget_asked();
+        s.copy_back(&declared);
+        crate::watch::disarm();
+        assert_eq!(read(x + 8), 7, "the title's write was undone");
+        assert_eq!((read(x), read(y)), (0xfeed, 0xbeef));
+        drop(s);
+        unregister(usize::MAX - 15, at as u64);
         unmap(&made);
     }
 
