@@ -2679,8 +2679,10 @@ impl<'a> Lower<'a> {
                     _ => return Err("an LDS read of bytes or halves"),
                 };
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let p = dword(self, offset);
+                let (p, inside) = dword(self, offset);
                 let w = self.s.m.load(c, p);
+                let z = self.s.m.i32(0);
+                let w = self.s.m.select(c, inside, w, z);
                 let o = self.s.m.i32(offset);
                 let at = self.s.m.bin(c, Bin::Add, a, o);
                 let align = self.s.m.i32(if bits == 8 { 3 } else { 2 });
@@ -2758,11 +2760,13 @@ impl<'a> Lower<'a> {
                 let mask = self.s.m.bin(c, Bin::Shl, field, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, mask, ones);
-                let p = dword(self, offset);
+                let (p, inside) = dword(self, offset);
                 use super::bitcode::Rmw;
                 let at = self.begin_guarded(guard);
+                let only = self.begin_guarded(Some(inside));
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
+                self.end_guarded(only, &[]);
                 self.end_guarded(at, &[]);
                 return Ok(());
             };
