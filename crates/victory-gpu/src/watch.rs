@@ -858,6 +858,24 @@ pub(crate) fn before(block: usize, asked: u64) -> Option<Vec<u8>> {
     })
 }
 
+/// Diagnostics: how block `block`, armed at asking `asked`, stands.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn describe(block: usize, asked: u64) -> String {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let g = guards();
+    let page = block * BLOCK / PAGE;
+    format!(
+        "armed at asking {asked} (now {}): saved {}, armed {}, guarded {}, clean {}, written at {:?}, shows page {:?}",
+        j.asked,
+        g.saved.contains_key(&block),
+        g.armed.contains(block),
+        g.protected.contains(block),
+        g.clean.contains(block),
+        j.written.get(&page),
+        g.shown.as_ref().and_then(|s| s.page.get(&block)),
+    )
+}
+
 /// After a submission's copy-back: nothing is armed.
 pub(crate) fn disarm() {
     let mut g = guards();

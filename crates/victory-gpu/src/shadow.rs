@@ -91,6 +91,10 @@ pub(crate) struct Shadow {
     kept: Mutex<BTreeMap<usize, Vec<u8>>>,
     /// The buffer is title memory itself ([`in_place`]): nothing to copy.
     in_place: bool,
+    /// With [`audit_on`] (diagnostics): the copy's bytes of the ranges
+    /// armed, by offset, as eager snapshots hold them ([`Shadow::audit`]).
+    #[cfg(feature = "diagnostics")]
+    audit: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -185,6 +189,23 @@ impl Was<'_> {
             .find(|&&(a, b, _)| a <= at && at + n <= b)
             .map(|&(.., asked)| Before::Armed(asked))
     }
+}
+
+/// Diagnostics: `VICTORY_SNAPSHOT_AUDIT` takes eager snapshots beside the
+/// copy-on-write ones and logs where copy-back would write other bytes
+/// with them ([`Shadow::audit`]).
+#[cfg(feature = "diagnostics")]
+fn audit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SNAPSHOT_AUDIT").is_some();
+        if on {
+            tracing::info!(
+                "copy-on-write snapshots audited against eager ones (VICTORY_SNAPSHOT_AUDIT)"
+            );
+        }
+        on
+    })
 }
 
 /// Whether copies of view memory that shaders write arm its blocks instead
@@ -290,6 +311,8 @@ impl Shadow {
             armed: Mutex::default(),
             kept: Mutex::default(),
             in_place,
+            #[cfg(feature = "diagnostics")]
+            audit: Mutex::default(),
         }
     }
 
@@ -422,6 +445,8 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         if from < to && armed_snapshots() && crate::watch::view(self.start as usize + from) {
+            #[cfg(feature = "diagnostics")]
+            self.audit_snapshot(from, to);
             self.arm(from, to);
             return;
         }
@@ -504,6 +529,103 @@ impl Shadow {
         );
     }
 
+    /// Diagnostics, with [`audit_on`]: takes the copy's bytes of offsets
+    /// `[from, to)` not taken yet, as an eager snapshot holds them.
+    #[cfg(feature = "diagnostics")]
+    fn audit_snapshot(&self, from: usize, to: usize) {
+        if !audit_on() {
+            return;
+        }
+        let mut audit = self.audit.lock().unwrap_or_else(|e| e.into_inner());
+        let mut taken: Vec<(usize, usize)> = audit
+            .iter()
+            .map(|(a, b)| (*a, a + b.len()))
+            .filter(|&(a, b)| a < to && from < b)
+            .collect();
+        taken.sort_unstable();
+        let mut at = from;
+        let mut gaps = Vec::new();
+        for (a, b) in taken {
+            if at < a {
+                gaps.push((at, a));
+            }
+            at = at.max(b);
+        }
+        if at < to {
+            gaps.push((at, to));
+        }
+        for (a, b) in gaps {
+            let mut bytes = pooled(b - a);
+            self.gather(a, b, &mut bytes);
+            audit.push((a, bytes));
+        }
+    }
+
+    /// Diagnostics, with [`audit_on`]: logs where copy-back of the copy's
+    /// offsets `[at, at + host.len())` would write other bytes than with an
+    /// eager snapshot. `lazy` is what copy-back takes the copy to have held
+    /// there (none: it writes nothing), `how` where that came from.
+    #[cfg(feature = "diagnostics")]
+    fn audit(&self, at: usize, host: &[u8], lazy: Option<&[u8]>, how: impl FnOnce() -> String) {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if !audit_on() {
+            return;
+        }
+        let n = host.len();
+        let audit = self.audit.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((taken, eager)) = audit
+            .iter()
+            .find(|(t, b)| *t <= at && at + n <= t + b.len())
+        else {
+            return;
+        };
+        let eager = &eager[at - taken..at - taken + n];
+        let start = self.start as usize;
+        let mut title = vec![0u8; n];
+        if !crate::host::read_into((start + at) as *const u8, &mut title) {
+            return;
+        }
+        let writes = |before: &[u8], i: usize| host[i] != before[i] && title[i] != host[i];
+        let (mut differ, mut first, mut by_lazy, mut by_eager) = (0, None, 0, 0);
+        for i in 0..n {
+            let (l, e) = (lazy.is_some_and(|l| writes(l, i)), writes(eager, i));
+            by_lazy += usize::from(l);
+            by_eager += usize::from(e);
+            if l != e {
+                differ += 1;
+                first.get_or_insert(i);
+            }
+        }
+        let Some(first) = first else {
+            return;
+        };
+        let k = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+        if k > 1000 && !k.is_multiple_of(1000) {
+            return;
+        }
+        let i = first & !3;
+        let word = |b: &[u8]| {
+            b.get(i..i + 4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        };
+        tracing::warn!(
+            pieces = k,
+            frame = crate::frame::current(),
+            asking = crate::watch::asking(),
+            copy = format_args!("{:#x}+{:#x}", self.start, self.len),
+            at = format_args!("{:#x}", start + at + first),
+            differ,
+            by_lazy,
+            by_eager,
+            host = ?word(host),
+            lazy = ?lazy.and_then(word),
+            eager = ?word(eager),
+            title = ?word(&title),
+            how = %how(),
+            "copy-back with the copy-on-write snapshot writes other bytes than with the eager one"
+        );
+    }
+
     /// The copy's bytes of title block `block` (64 KiB), cut to the buffer.
     fn block_bytes(&self, block: usize) -> Vec<u8> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -562,6 +684,15 @@ impl Shadow {
         // disarms them all).
         kept.clear();
         armed.clear();
+        #[cfg(feature = "diagnostics")]
+        for (_, bytes) in self
+            .audit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            give_back(bytes);
+        }
         // Every submitted step that declared the ranges is done with them
         // (one submission runs at a time), and the snapshots with the last.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -632,6 +763,14 @@ impl Shadow {
                     let block = (start + at) / PAGE;
                     let Some(bytes) = crate::watch::before(block, asked) else {
                         #[cfg(feature = "diagnostics")]
+                        self.audit(
+                            at,
+                            // SAFETY: as below.
+                            unsafe { std::slice::from_raw_parts(host as *const u8, n) },
+                            None,
+                            || format!("missed: {}", crate::watch::describe(block, asked)),
+                        );
+                        #[cfg(feature = "diagnostics")]
                         crate::copystat::cost(
                             crate::copystat::Op::Missed,
                             std::time::Instant::now(),
@@ -646,6 +785,20 @@ impl Shadow {
                 }
                 None => continue,
             };
+            #[cfg(feature = "diagnostics")]
+            self.audit(
+                at,
+                // SAFETY: as below.
+                unsafe { std::slice::from_raw_parts(host as *const u8, n) },
+                Some(old),
+                || match was.at(at, n) {
+                    Some(Before::Armed(asked)) => {
+                        crate::watch::describe((start + at) / PAGE, asked)
+                    }
+                    _ if was.kept.contains_key(&((start + at) / PAGE)) => "kept".into(),
+                    _ => "snapshot".into(),
+                },
+            );
             // SAFETY: as above.
             let host = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, n) };
             let title = &mut title[..n];
@@ -862,7 +1015,25 @@ impl Shadow {
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         for (taken, bytes) in before.iter_mut() {
-            let (a, b) = ((from - start).max(*taken), (to - start).min(*taken + bytes.len()));
+            let (a, b) = (
+                (from - start).max(*taken),
+                (to - start).min(*taken + bytes.len()),
+            );
+            if a < b {
+                self.fill(a, &mut bytes[a - *taken..b - *taken]);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        for (taken, bytes) in self
+            .audit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            let (a, b) = (
+                (from - start).max(*taken),
+                (to - start).min(*taken + bytes.len()),
+            );
             if a < b {
                 self.fill(a, &mut bytes[a - *taken..b - *taken]);
             }
