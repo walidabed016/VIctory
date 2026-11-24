@@ -87,6 +87,13 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader taking triangles and emitting one triangle strip
+    /// of at most this many vertices.
+    pub geometry: Option<u32>,
+    /// The outputs each input scalar reaches: per input scalar, a mask of
+    /// output scalars in 32-bit words. Unset: every output depends on
+    /// every input.
+    pub dependencies: Option<Vec<u32>>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -152,6 +159,8 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
+            dependencies: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -521,8 +530,9 @@ impl Shader {
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
-            // shortcut: every output is declared to depend on every input; the
-            // exact sets need a dependence pass. Drivers read this state.
+            // shortcut: unless the shader gives them, every output is declared
+            // to depend on every input; the exact sets need a dependence
+            // pass. Drivers read this state.
             let scalars = |els: &[SigElement]| {
                 els.iter()
                     .filter_map(|e| e.row.map(|r| r * 4 + u32::from(e.col + e.cols)))
@@ -535,15 +545,24 @@ impl Shader {
             if self.mesh.is_some() {
                 view.push(scalars(&self.prims));
             }
-            for _ in 0..ni {
-                for k in 0..no.div_ceil(32) {
-                    let bits = (no - 32 * k).min(32);
-                    view.push(if bits == 32 {
-                        u32::MAX
-                    } else {
-                        (1 << bits) - 1
-                    });
+            match &self.dependencies {
+                Some(d) => view.extend(d),
+                None => {
+                    for _ in 0..ni {
+                        for k in 0..no.div_ceil(32) {
+                            let bits = (no - 32 * k).min(32);
+                            view.push(if bits == 32 {
+                                u32::MAX
+                            } else {
+                                (1 << bits) - 1
+                            });
+                        }
+                    }
                 }
+            }
+            // A geometry shader's streams 1 to 3: no outputs.
+            if self.geometry.is_some() {
+                view.extend([0; 3]);
             }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
@@ -599,6 +618,13 @@ impl Shader {
                 }
             }
         }
+        // Geometry state (tag 1): triangles in, at most n vertices out in
+        // stream 0 as a triangle strip, one instance.
+        if let Some(n) = self.geometry {
+            props.push(i32c(&mut self, 1));
+            let state = [3, n, 1, 5, 1].map(|v| Some(i32c(&mut self, v)));
+            props.push(self.m.md_node(state.to_vec()));
+        }
         if let Some(n) = self.wave_size {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
@@ -620,9 +646,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -682,6 +709,8 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            geometry: self.geometry,
+            dependencies: self.dependencies.as_deref(),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

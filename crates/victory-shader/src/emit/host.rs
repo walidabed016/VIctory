@@ -270,6 +270,17 @@ impl Host {
         vs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_with_stages(root, vs, None, ps)
+    }
+
+    /// As [`Host::pipeline_with`], with a geometry shader if given.
+    pub fn pipeline_with_stages(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -297,6 +308,10 @@ impl Host {
                 pShaderBytecode: vs.as_ptr().cast(),
                 BytecodeLength: vs.len(),
             },
+            GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, |gs| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
+                BytecodeLength: gs.len(),
+            }),
             PS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),

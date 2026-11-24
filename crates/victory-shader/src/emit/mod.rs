@@ -127,6 +127,7 @@ mod join_tests;
 #[cfg(all(test, windows))]
 mod kind_tests;
 mod lower;
+mod rectangles;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
@@ -144,6 +145,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use heap::{HeapIndices, heap_indices};
+pub use rectangles::rectangles;
 pub use sampler::StaticSampler;
 pub use shader::{
     ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_RECORD_BYTES, VIEW_STRIDE_SPACE, view_kind,
@@ -360,15 +362,7 @@ pub fn emit_with_waves(
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
-        e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
-            // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
-            (0 | 6 | 7, 9) => 2,
-            (0, _) => 1,
-            _ => 0,
-        };
+        e.interp = default_interp(e);
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
@@ -438,6 +432,20 @@ pub fn emit_with_waves(
         heap_unknown: heaps.unknown.len() as u32,
     };
     Ok((shader, l.waves))
+}
+
+/// The interpolation DXC declares by default for a value passed between
+/// stages.
+fn default_interp(e: &container::SigElement) -> u8 {
+    match (e.kind, e.comp) {
+        (3, _) => 4,
+        // Constant, as DXC declares it (the AMD compiler crashed on a
+        // front face without a mode).
+        (13, _) => 1,
+        (0 | 6 | 7, 9) => 2,
+        (0, _) => 1,
+        _ => 0,
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
