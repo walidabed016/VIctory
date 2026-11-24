@@ -701,7 +701,7 @@ fn on_copy(
     view: impl FnOnce() -> String,
 ) -> Option<u32> {
     // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = unsafe { shadow.resource().GetDesc() }.Width;
     let left = u32::try_from(width.saturating_sub(start) / element).unwrap_or(u32::MAX);
     let made = count.min(left);
     #[cfg(feature = "diagnostics")]
@@ -960,10 +960,10 @@ fn buffer_srv(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            .CreateShaderResourceView(shadow.resource(), Some(&desc), at)
     };
     Some(Kept {
-        resource: Some(shadow.buffer.clone()),
+        resource: Some(shadow.resource().clone()),
         lead,
         kind: if raw {
             view_kind::RAW_SRV
@@ -1002,7 +1002,7 @@ fn buffer_uav(
     }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    let flags = unsafe { shadow.resource().GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
@@ -1046,11 +1046,15 @@ fn buffer_uav(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+        host.device.CreateUnorderedAccessView(
+            shadow.resource(),
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
     };
     Some(Kept {
-        resource: Some(shadow.buffer.clone()),
+        resource: Some(shadow.resource().clone()),
         lead,
         kind: if raw {
             view_kind::RAW_UAV
@@ -1152,7 +1156,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Kept::of(&shadow.buffer, view_kind::CBV)
+            Kept::of(shadow.resource(), view_kind::CBV)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;

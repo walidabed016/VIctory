@@ -61,6 +61,11 @@ enum Memory {
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// The copy in VRAM that shaders use instead when copies have twins
+    /// ([`twins_on`]); `buffer` stays the CPU's view of it. A mirror
+    /// slab's is a reserved buffer whose windows get VRAM as submissions
+    /// use them ([`map_windows`]).
+    twin: Option<ID3D12Resource>,
     memory: Memory,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -95,6 +100,11 @@ pub(crate) struct Shadow {
     /// armed, by offset, as eager snapshots hold them ([`Shadow::audit`]).
     #[cfg(feature = "diagnostics")]
     audit: Mutex<Vec<(usize, Vec<u8>)>>,
+    /// Title ranges the CPU wrote into `buffer` since the twin took them
+    /// ([`upload_twins`]).
+    dirty: Mutex<Vec<(usize, usize)>>,
+    /// Listed for the next upload ([`touched`]).
+    listed: AtomicBool,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -244,6 +254,24 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// The buffer shaders use: the twin, else the host copy.
+    pub(crate) fn resource(&self) -> &ID3D12Resource {
+        self.twin.as_ref().unwrap_or(&self.buffer)
+    }
+
+    /// Title memory `[from, to)` of a mirror slab is used by the submission
+    /// being prepared: its windows' twins get VRAM and are brought up to
+    /// date before it runs ([`map_windows`]).
+    pub(crate) fn want(&self, from: usize, to: usize) {
+        if self.twin.is_none() || !self.mirror() || from >= to {
+            return;
+        }
+        let w = WINDOW as usize;
+        mirror_state()
+            .wanted
+            .extend((from / w..to.div_ceil(w)).map(|w| w as u64));
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -294,8 +322,8 @@ impl Shadow {
 
     fn new(
         buffer: ID3D12Resource,
+        twin: Option<ID3D12Resource>,
         memory: Memory,
-        gpu: u64,
         start: u64,
         len: u64,
         in_place: bool,
@@ -304,8 +332,11 @@ impl Shadow {
             true => 0,
             false => (start + len).div_ceil(PAGE as u64) - start / PAGE as u64,
         };
+        // SAFETY: live buffers.
+        let gpu = unsafe { twin.as_ref().unwrap_or(&buffer).GetGPUVirtualAddress() };
         Shadow {
             buffer,
+            twin,
             memory,
             gpu,
             start,
@@ -321,6 +352,8 @@ impl Shadow {
             in_place,
             #[cfg(feature = "diagnostics")]
             audit: Mutex::default(),
+            dirty: Mutex::default(),
+            listed: AtomicBool::new(false),
         }
     }
 
@@ -436,6 +469,18 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
+    /// The copy's offsets of the ranges `declared` (address, bytes),
+    /// merged.
+    fn merged(&self, declared: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        merge(
+            declared
+                .iter()
+                .map(|&(address, len)| self.inside(address, len))
+                .filter(|(from, to)| from < to)
+                .collect(),
+        )
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// one snapshot per region of the copy and submission, grown to cover
@@ -447,6 +492,7 @@ impl Shadow {
         if self.in_place {
             return;
         }
+        self.want(address, address + len);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -653,19 +699,7 @@ impl Shadow {
     /// declared ranges hold it (the world's overlap dozens of times).
     /// Returns the bytes written.
     pub(crate) fn copy_back(&self, declared: &[(usize, usize)]) -> usize {
-        let mut ranges: Vec<(usize, usize)> = declared
-            .iter()
-            .map(|&(address, len)| self.inside(address, len))
-            .filter(|(from, to)| from < to)
-            .collect();
-        ranges.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-        for (from, to) in ranges {
-            match merged.last_mut() {
-                Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                _ => merged.push((from, to)),
-            }
-        }
+        let merged = self.merged(declared);
         let start = self.start as usize;
         if self.in_place {
             // Shaders wrote title memory; copies and textures of it that
@@ -817,7 +851,7 @@ impl Shadow {
             // title's bytes in turn. Only the words the GPU changed go back:
             // the title writes the piece while we compare it, and writing it
             // whole put the bytes we read back over those writes.
-            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let (mut runs, mut taken): (Vec<(usize, usize)>, bool) = (Vec::new(), false);
             let words = title
                 .chunks_mut(4)
                 .zip(host.chunks_mut(4))
@@ -830,6 +864,7 @@ impl Shadow {
                         gpu = true;
                     }
                 }
+                taken |= *h != *t;
                 h.copy_from_slice(t);
                 let (a, b) = (4 * k, 4 * k + t.len());
                 match runs.last_mut() {
@@ -874,6 +909,12 @@ impl Shadow {
                 );
             }
             synced.push(i);
+            if taken && self.twin.is_some() {
+                self.dirty
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((start + at, start + at + n));
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::cost(
@@ -949,6 +990,7 @@ impl Shadow {
         // earlier frames: indirect arguments the title had cleared read as
         // millions of groups.
         if self.mirror() {
+            self.want(from, to);
             return self.update_mirror(from, to);
         }
         self.update_free(from, to)
@@ -1085,6 +1127,12 @@ impl Shadow {
                 crate::host::copy_mapped(host, (start + at) as *const u8, n, false);
             }
         }
+        if self.twin.is_some() {
+            self.dirty
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((from, to));
+        }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         for (taken, bytes) in before.iter_mut() {
             let (a, b) = (
@@ -1197,18 +1245,18 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
     if entry.shadow.is_none()
         && let Some((buffer, start, len)) = in_place(key.0, entry.end - key.0)
     {
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        crate::host::name(&buffer, || format!("title memory in place {start:#x}+{len:#x}"));
+        crate::host::name(&buffer, || {
+            format!("title memory in place {start:#x}+{len:#x}")
+        });
         if len >= 16 << 20 {
             tracing::info!(start = format_args!("{start:#x}"), len, "large buffer used in place");
         } else {
             tracing::debug!(start = format_args!("{start:#x}"), len, "buffer used in place");
         }
         let memory = Memory::Linear(start as *mut u8);
+        let shadow = Shadow::new(buffer, None, memory, start as u64, len as u64, true);
         #[cfg(feature = "diagnostics")]
-        made(gpu, len as u64, start as u64, len as u64);
-        let shadow = Shadow::new(buffer, memory, gpu, start as u64, len as u64, true);
+        made(shadow.gpu, len as u64, start as u64, len as u64);
         entry.shadow = Some(Arc::new(shadow));
     }
     if entry.shadow.is_none() {
@@ -1221,8 +1269,12 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
             return Some(None);
         };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let twin = twins_on()
+            .then(|| vram_buffer(len.next_multiple_of(1 << 16)))
+            .flatten();
+        if let Some(twin) = &twin {
+            crate::host::name(twin, || format!("title buffer twin {:#x}+{len:#x}", key.0));
+        }
         if len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
@@ -1236,9 +1288,9 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
                 "buffer copied to the host"
             );
         }
+        let shadow = Shadow::new(buffer, twin, Memory::Linear(data), key.0, len, false);
         #[cfg(feature = "diagnostics")]
-        made(gpu, len.next_multiple_of(1 << 16), key.0, len);
-        let shadow = Shadow::new(buffer, Memory::Linear(data), gpu, key.0, len, false);
+        made(shadow.gpu, len.next_multiple_of(1 << 16), key.0, len);
         entry.shadow = Some(Arc::new(shadow));
     }
     Some(entry.shadow.clone())
@@ -1437,14 +1489,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let twin = twins_on().then(|| vram_buffer(len)).flatten();
+    if let Some(twin) = &twin {
+        crate::host::name(twin, || format!("title memory twin {start:#x}+{len:#x}"));
+    }
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
-    let mut shadow = Shadow::new(buffer, Memory::Linear(data), gpu, start, len, false);
+    let mut shadow = Shadow::new(buffer, twin, Memory::Linear(data), start, len, false);
     shadow.loose = true;
     let shadow = Arc::new(shadow);
     map.insert((start, len), shadow.clone());
@@ -1479,6 +1533,23 @@ struct Mirror {
     used: u32,
     /// (slab, window) pairs whose tiles are not mapped yet.
     unmapped: Vec<(u64, u64)>,
+    /// VRAM heaps for the slabs' twins, each with a buffer over it.
+    vram: Vec<(ID3D12Heap, ID3D12Resource)>,
+    /// Window number → VRAM heap and slot of its twin, and the submission
+    /// that last used it.
+    twinned: BTreeMap<u64, (usize, u32, u64)>,
+    /// VRAM slots windows gone cold gave back.
+    vram_free: Vec<VramSlot>,
+    /// Slots used in the last VRAM heap.
+    vram_used: u32,
+    /// Windows the submission being prepared uses ([`Shadow::want`]).
+    wanted: std::collections::BTreeSet<u64>,
+    /// Windows given VRAM for this submission: their twins take them whole.
+    fresh: Vec<u64>,
+    /// Twin tiles to map onto a VRAM slot, or to unmap: slab, window, slot.
+    retile: Vec<(u64, u64, Option<VramSlot>)>,
+    /// Submissions prepared.
+    now: u64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the pool memory is written only
@@ -1491,6 +1562,14 @@ static MIRROR: Mutex<Mirror> = Mutex::new(Mirror {
     heaps: Vec::new(),
     used: 0,
     unmapped: Vec::new(),
+    vram: Vec::new(),
+    twinned: BTreeMap::new(),
+    vram_free: Vec::new(),
+    vram_used: 0,
+    wanted: std::collections::BTreeSet::new(),
+    fresh: Vec::new(),
+    retile: Vec::new(),
+    now: 0,
 });
 
 fn mirror_state() -> std::sync::MutexGuard<'static, Mirror> {
@@ -1602,6 +1681,364 @@ impl Mirror {
         self.unmapped.extend(shown.into_iter().map(|k| (k, w)));
         Some(slot)
     }
+
+    /// Before a submission: gives the windows it uses VRAM for their
+    /// twins (past the budget, windows unused longest give theirs back) and
+    /// notes the tiles to map.
+    fn twin_windows(&mut self) {
+        self.now += 1;
+        let now = self.now;
+        let mut new = Vec::new();
+        for w in std::mem::take(&mut self.wanted) {
+            match self.twinned.get_mut(&w) {
+                Some(t) => t.2 = now,
+                None if self.windows.contains_key(&w) => new.push(w),
+                None => {}
+            }
+        }
+        if new.is_empty() {
+            return;
+        }
+        let budget = twin_budget();
+        let over = (self.twinned.len() + new.len()).saturating_sub(budget);
+        if over > 0 {
+            let mut cold: Vec<(u64, u64)> = self
+                .twinned
+                .iter()
+                .filter(|(_, t)| t.2 + COLD < now)
+                .map(|(&w, t)| (t.2, w))
+                .collect();
+            cold.sort_unstable();
+            for (_, w) in cold.into_iter().take(over) {
+                if let Some((heap, slot, _)) = self.twinned.remove(&w) {
+                    self.vram_free.push((heap, slot));
+                    for k in self.twin_slabs(w) {
+                        self.retile.push((k, w, None));
+                    }
+                }
+            }
+        }
+        // Windows past the budget, or past the VRAM the host gives, stay
+        // in system memory, which their twins show ([`map_windows`]).
+        for w in new {
+            if self.twinned.len() >= budget {
+                break;
+            }
+            let Some(slot) = self.vram_slot() else {
+                break;
+            };
+            self.twinned.insert(w, (slot.0, slot.1, now));
+            for k in self.twin_slabs(w) {
+                self.retile.push((k, w, Some(slot)));
+            }
+            self.fresh.push(w);
+        }
+    }
+
+    /// A VRAM slot for a window's twin: one a cold window gave back, else
+    /// the next of the last VRAM heap, else of a new one.
+    fn vram_slot(&mut self) -> Option<VramSlot> {
+        const SLOTS: u32 = (POOL_HEAP / WINDOW) as u32;
+        if let Some(slot) = self.vram_free.pop() {
+            return Some(slot);
+        }
+        if self.vram.is_empty() || self.vram_used == SLOTS {
+            if NO_VRAM.load(Ordering::Relaxed) {
+                return None;
+            }
+            let Some(heap) = vram_heap() else {
+                NO_VRAM.store(true, Ordering::Relaxed);
+                return None;
+            };
+            self.vram.push(heap);
+            self.vram_used = 0;
+        }
+        self.vram_used += 1;
+        Some((self.vram.len() - 1, self.vram_used - 1))
+    }
+
+    /// The slabs with twins that show window `w`.
+    fn twin_slabs(&self, w: u64) -> Vec<u64> {
+        slabs_showing(w)
+            .filter(|k| self.slabs.get(k).is_some_and(|s| s.twin.is_some()))
+            .collect()
+    }
+}
+
+/// Whether host copies have VRAM twins that shaders use: the copies live
+/// in system memory, which shaders read at 4.5–8 GB/s and write at ~0.1
+/// GB/s over this host's PCIe link, against ~930 GB/s in VRAM (VICT-9's
+/// probe). What the CPU writes into a copy goes to its twin before the
+/// submission ([`upload_twins`]), and what shaders wrote comes back before
+/// copy-back ([`download_twins`]). `VICTORY_NO_VRAM_TWINS` turns them off.
+pub(crate) fn twins_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_VRAM_TWINS").is_none();
+        if !on {
+            tracing::info!("host copies have no VRAM twins (VICTORY_NO_VRAM_TWINS)");
+        }
+        on
+    })
+}
+
+/// Mirror windows with VRAM twins past which windows unused for [`COLD`]
+/// submissions give theirs back: `VICTORY_TWIN_MIB` MiB of them (4096).
+fn twin_budget() -> usize {
+    static WINDOWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WINDOWS.get_or_init(|| {
+        let mib = std::env::var("VICTORY_TWIN_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096);
+        mib / (WINDOW >> 20) as usize
+    })
+}
+
+/// Submissions a window's twin stays unused before it may give its VRAM
+/// back (~10 frames).
+const COLD: u64 = 200;
+
+/// A VRAM slot of the mirror's twins: its heap and place in it.
+type VramSlot = (usize, u32);
+
+/// The host gave no VRAM heap for the mirror's twins: windows not
+/// twinned yet stay in system memory.
+static NO_VRAM: AtomicBool = AtomicBool::new(false);
+
+/// A VRAM heap for the mirror's twins, with a buffer over it.
+fn vram_heap() -> Option<(ID3D12Heap, ID3D12Resource)> {
+    let host = host()?;
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: POOL_HEAP,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+    };
+    let (mut heap, mut buffer): (Option<ID3D12Heap>, Option<ID3D12Resource>) = (None, None);
+    // SAFETY: plain creation of a heap and a buffer over all of it.
+    let made = unsafe {
+        host.device.CreateHeap(&desc, &mut heap).and_then(|()| {
+            let h = heap.as_ref().ok_or_else(windows::core::Error::empty)?;
+            host.device.CreatePlacedResource(
+                h,
+                0,
+                &buffer_desc(POOL_HEAP),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        })
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, "no VRAM for more mirror twins: further windows stay in system memory");
+        return None;
+    }
+    let buffer = buffer?;
+    crate::host::name(&buffer, || "title memory mirror twin pool".into());
+    Some((heap?, buffer))
+}
+
+/// A buffer of `len` bytes in VRAM that shaders write: the twin of a host
+/// copy.
+fn vram_buffer(len: u64) -> Option<ID3D12Resource> {
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of a buffer.
+    let made = unsafe {
+        host()?.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &buffer_desc(len),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, len, "no VRAM twin: the host copy stays in system memory");
+    }
+    buffer
+}
+
+/// A reserved buffer of `len` bytes, none of it mapped.
+fn reserved(len: u64) -> Option<ID3D12Resource> {
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of a reserved buffer.
+    let made = unsafe {
+        host()?.device.CreateReservedResource(
+            &buffer_desc(len),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, len, "no reserved buffer");
+    }
+    buffer
+}
+
+/// Copies whose host copy the CPU wrote, for the next [`upload_twins`].
+static TOUCHED: Mutex<Vec<Arc<Shadow>>> = Mutex::new(Vec::new());
+
+/// The CPU may have written `s`'s host copy (a refresh, a copy-back): its
+/// twin takes what it wrote before the next submission runs.
+pub(crate) fn touched(s: &Arc<Shadow>) {
+    if s.twin.is_some() && !s.listed.swap(true, Ordering::Relaxed) {
+        TOUCHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(s.clone());
+    }
+}
+
+/// Before a submission runs, after [`map_windows`]: records into `list`
+/// the copies into twins of what the CPU wrote into host copies since the
+/// last ([`touched`]), and of the mirror windows given VRAM, whole.
+/// Returns the bytes copied.
+pub(crate) fn upload_twins(list: &ID3D12GraphicsCommandList) -> u64 {
+    let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut m = mirror_state();
+    let w = WINDOW as usize;
+    let fresh: std::collections::BTreeSet<u64> = std::mem::take(&mut m.fresh).into_iter().collect();
+    let mut windows: Vec<(u64, usize, usize)> = fresh.iter().map(|&k| (k, 0, w)).collect();
+    let mut bytes = 0;
+    for s in &touched {
+        s.listed.store(false, Ordering::Relaxed);
+        let ranges = std::mem::take(&mut *s.dirty.lock().unwrap_or_else(|e| e.into_inner()));
+        let Some(twin) = &s.twin else {
+            continue;
+        };
+        let start = s.start as usize;
+        for (from, to) in merge(ranges) {
+            if s.mirror() {
+                let mut at = from;
+                while at < to {
+                    let next = ((at / w + 1) * w).min(to);
+                    let k = (at / w) as u64;
+                    if !fresh.contains(&k) {
+                        windows.push((k, at % w, next - at + at % w));
+                    }
+                    at = next;
+                }
+                continue;
+            }
+            // SAFETY: an open list; both buffers hold the range.
+            unsafe {
+                list.CopyBufferRegion(
+                    twin,
+                    (from - start) as u64,
+                    &s.buffer,
+                    (from - start) as u64,
+                    (to - from) as u64,
+                )
+            };
+            bytes += (to - from) as u64;
+        }
+    }
+    windows.sort_unstable();
+    let mut runs: Vec<(u64, usize, usize)> = Vec::with_capacity(windows.len());
+    for (k, a, b) in windows {
+        match runs.last_mut() {
+            Some(r) if r.0 == k && a <= r.2 => r.2 = r.2.max(b),
+            _ => runs.push((k, a, b)),
+        }
+    }
+    for (k, a, b) in runs {
+        let (Some(&(vh, vs, _)), Some(&(h, s))) = (m.twinned.get(&k), m.windows.get(&k)) else {
+            continue;
+        };
+        // SAFETY: an open list; the pool buffers hold both windows' slots.
+        unsafe {
+            list.CopyBufferRegion(
+                &m.vram[vh].1,
+                (vs as usize * w + a) as u64,
+                &m.heaps[h].1,
+                (s as usize * w + a) as u64,
+                (b - a) as u64,
+            )
+        };
+        bytes += (b - a) as u64;
+    }
+    bytes
+}
+
+/// A copy and the ranges a submission's shaders declared writing in it:
+/// title address and bytes.
+pub(crate) type Declared = (Arc<Shadow>, Vec<(usize, usize)>);
+
+/// After a submission ran: records into `list` the copies of the ranges
+/// its shaders wrote (`back`: copies and the ranges declared, address and
+/// bytes) from the twins to the host copies, where copy-back compares
+/// them. Returns the bytes copied.
+pub(crate) fn download_twins(list: &ID3D12GraphicsCommandList, back: &[Declared]) -> u64 {
+    let m = mirror_state();
+    let w = WINDOW as usize;
+    let mut bytes = 0;
+    for (s, declared) in back {
+        let Some(twin) = &s.twin else {
+            continue;
+        };
+        let start = s.start as usize;
+        for (from, to) in s.merged(declared) {
+            if !s.mirror() {
+                // SAFETY: an open list; both buffers hold the range.
+                unsafe {
+                    list.CopyBufferRegion(
+                        &s.buffer,
+                        from as u64,
+                        twin,
+                        from as u64,
+                        (to - from) as u64,
+                    )
+                };
+                bytes += (to - from) as u64;
+                continue;
+            }
+            let (mut at, end) = (start + from, start + to);
+            while at < end {
+                let next = ((at / w + 1) * w).min(end);
+                let k = (at / w) as u64;
+                if let (Some(&(vh, vs, _)), Some(&(h, slot))) =
+                    (m.twinned.get(&k), m.windows.get(&k))
+                {
+                    // SAFETY: an open list; the pool buffers hold both
+                    // windows' slots.
+                    unsafe {
+                        list.CopyBufferRegion(
+                            &m.heaps[h].1,
+                            (slot as usize * w + at % w) as u64,
+                            &m.vram[vh].1,
+                            (vs as usize * w + at % w) as u64,
+                            (next - at) as u64,
+                        )
+                    };
+                    bytes += (next - at) as u64;
+                }
+                at = next;
+            }
+        }
+    }
+    bytes
+}
+
+/// Ranges sorted and joined where they overlap or meet.
+fn merge(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
 }
 
 /// A pool heap of the mirror in system memory, with a buffer over it
@@ -1659,32 +2096,22 @@ fn mirror(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(slab) = m.slabs.get(&k) {
         return Some(slab.clone());
     }
-    let host = host()?;
     let (start, len) = (k * SLAB, SLAB + OVERLAP);
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation of a reserved buffer.
-    let made = unsafe {
-        host.device.CreateReservedResource(
-            &buffer_desc(len),
-            D3D12_RESOURCE_STATE_COMMON,
-            None,
-            &mut buffer,
-        )
-    };
-    let buffer = match (made, buffer) {
-        (Ok(()), Some(buffer)) => buffer,
-        (made, _) => {
-            MIRROR_FAILED.store(true, Ordering::Relaxed);
-            tracing::warn!(?made, "loose memory goes to windows: no mirror slab");
-            return None;
-        }
+    let Some(buffer) = reserved(len) else {
+        MIRROR_FAILED.store(true, Ordering::Relaxed);
+        tracing::warn!("loose memory goes to windows: no mirror slab");
+        return None;
     };
     crate::host::name(&buffer, || {
         format!("title memory mirror {start:#x}+{len:#x}")
     });
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let mut slab = Shadow::new(buffer, Memory::Mirror, gpu, start, len, false);
+    let twin = twins_on().then(|| reserved(len)).flatten();
+    if let Some(twin) = &twin {
+        crate::host::name(twin, || {
+            format!("title memory mirror twin {start:#x}+{len:#x}")
+        });
+    }
+    let mut slab = Shadow::new(buffer, twin, Memory::Mirror, start, len, false);
     slab.loose = true;
     let slab = Arc::new(slab);
     let shown: Vec<u64> = m
@@ -1693,6 +2120,15 @@ fn mirror(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .map(|(&w, _)| w)
         .collect();
     m.unmapped.extend(shown.into_iter().map(|w| (k, w)));
+    if slab.twin.is_some() {
+        let twinned: Vec<(u64, (usize, u32))> = m
+            .twinned
+            .range(start / WINDOW..(start + len) / WINDOW)
+            .map(|(&w, &(heap, slot, _))| (w, (heap, slot)))
+            .collect();
+        m.retile
+            .extend(twinned.into_iter().map(|(w, slot)| (k, w, Some(slot))));
+    }
     m.slabs.insert(k, slab.clone());
     tracing::info!(
         start = format_args!("{start:#x}"),
@@ -1707,6 +2143,10 @@ fn mirror(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// GPU reads zeros there).
 pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
     let mut m = mirror_state();
+    if twins_on() {
+        m.twin_windows();
+        map_twins(&mut m, queue);
+    }
     if m.unmapped.is_empty() {
         return;
     }
@@ -1714,21 +2154,27 @@ pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
     pairs.sort_unstable();
     pairs.dedup();
     let tiles = (WINDOW / TILE) as u32;
-    // One call per slab and pool heap: the windows' first tiles in each.
+    // One call per slab (or its twin, which shows the windows without VRAM
+    // of their own as well) and pool heap: the windows' first tiles in each.
     type Call = (Vec<D3D12_TILED_RESOURCE_COORDINATE>, Vec<u32>);
-    let mut calls: BTreeMap<(u64, usize), Call> = BTreeMap::new();
+    let mut calls: BTreeMap<(u64, bool, usize), Call> = BTreeMap::new();
     for (k, w) in pairs {
         let Some(&(heap, slot)) = m.windows.get(&w) else {
             continue;
         };
-        let call = calls.entry((k, heap)).or_default();
-        call.0.push(D3D12_TILED_RESOURCE_COORDINATE {
-            X: ((w * WINDOW - k * SLAB) / TILE) as u32,
-            ..Default::default()
-        });
-        call.1.push(slot * tiles);
+        let twin = m.slabs.get(&k).is_some_and(|s| s.twin.is_some()) && !m.twinned.contains_key(&w);
+        for onto in std::iter::once(false).chain(twin.then_some(true)) {
+            let call = calls.entry((k, onto, heap)).or_default();
+            call.0.push(D3D12_TILED_RESOURCE_COORDINATE {
+                X: ((w * WINDOW - k * SLAB) / TILE) as u32,
+                ..Default::default()
+            });
+            call.1.push(slot * tiles);
+        }
     }
-    for ((k, heap), (at, from)) in calls {
+    for ((k, onto, heap), (at, from)) in calls {
+        let slab = &m.slabs[&k];
+        let resource = slab.twin.as_ref().filter(|_| onto).unwrap_or(&slab.buffer);
         let n = at.len();
         let sizes = vec![
             D3D12_TILE_REGION_SIZE {
@@ -1742,7 +2188,7 @@ pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
         // in the buffer, the ranges in the heap.
         unsafe {
             queue.UpdateTileMappings(
-                &m.slabs[&k].buffer,
+                resource,
                 n as u32,
                 Some(at.as_ptr()),
                 Some(sizes.as_ptr()),
@@ -1751,6 +2197,46 @@ pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
                 Some(flags.as_ptr()),
                 Some(from.as_ptr()),
                 Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            )
+        };
+    }
+}
+
+/// The twins' tiles [`Mirror::twin_windows`] noted: each mapped onto its
+/// window's VRAM slot, or back onto its host memory.
+fn map_twins(m: &mut Mirror, queue: &ID3D12CommandQueue) {
+    let tiles = (WINDOW / TILE) as u32;
+    for (k, w, slot) in std::mem::take(&mut m.retile) {
+        let Some(twin) = m.slabs.get(&k).and_then(|s| s.twin.as_ref()) else {
+            continue;
+        };
+        let (heap, slot) = match (slot, m.windows.get(&w)) {
+            (Some((heap, slot)), _) => (&m.vram[heap].0, slot),
+            (None, Some(&(heap, slot))) => (&m.heaps[heap].0, slot),
+            (None, None) => continue,
+        };
+        let at = D3D12_TILED_RESOURCE_COORDINATE {
+            X: ((w * WINDOW - k * SLAB) / TILE) as u32,
+            ..Default::default()
+        };
+        let size = D3D12_TILE_REGION_SIZE {
+            NumTiles: tiles,
+            ..Default::default()
+        };
+        // SAFETY: a reserved buffer and a heap of ours; the region lies in
+        // the buffer, the range in the heap.
+        unsafe {
+            queue.UpdateTileMappings(
+                twin,
+                1,
+                Some(&at),
+                Some(&size),
+                heap,
+                1,
+                Some(&D3D12_TILE_RANGE_FLAG_NONE),
+                Some(&(slot * tiles)),
+                Some(&tiles),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             )
         };
@@ -2498,6 +2984,72 @@ pub(crate) mod tests {
         drop(s);
         unregister(usize::MAX - 17, at as u64);
         unmap(&made);
+    }
+
+    /// With VRAM twins, shaders use the twins of a buffer's copy and of a
+    /// mirror slab: what the CPU wrote into the copies reaches the twins
+    /// before the submission runs, and what the GPU wrote there comes back
+    /// to title memory after.
+    #[test]
+    fn a_submission_runs_on_the_twins_of_copies() {
+        let _serial = crate::watch::serial();
+        if !gpu() || !twins_on() {
+            return;
+        }
+        let host = host().unwrap();
+        let at = title_memory(501, 256 * MIB, 32 * MIB, 32 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        // Small enough not to be used in place.
+        register(usize::MAX - 14, at as u64, 512 << 10);
+        let buffer = find(at as u64, 512 << 10).unwrap();
+        let slab = find((at + 20 * MIB) as u64, 1).unwrap();
+        assert!(buffer.twin.is_some() && !buffer.mirror());
+        assert!(slab.twin.is_some() && slab.mirror());
+        let scratch = vram_buffer(64 << 10).unwrap();
+        let list = host.new_list().unwrap();
+        // In each, the GPU copies 4 KiB of the copy over the next 4 KiB.
+        let places = [(&buffer, at + (64 << 10)), (&slab, at + 20 * MIB)];
+        for (s, a) in places {
+            s.refresh(&list, a as u64, 8192);
+            s.gpu_writes(&list, (a + 4096) as u64, 4096);
+            let (twin, o) = (s.resource(), s.offset(a as u64));
+            // SAFETY: an open list; our buffers, the ranges inside them.
+            unsafe {
+                list.list.CopyBufferRegion(&scratch, 0, twin, o, 4096);
+                list.list.ResourceBarrier(&[
+                    crate::host::transition(
+                        twin,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                    crate::host::transition(
+                        &scratch,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                ]);
+                list.list
+                    .CopyBufferRegion(twin, o + 4096, &scratch, 0, 4096);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &scratch,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        for (_, a) in places {
+            for w in (a..a + 4096).step_by(4) {
+                // SAFETY: our test memory.
+                let got = unsafe { ((w + 4096) as *const u32).read() };
+                assert_eq!(got, word(w), "at {:#x}", w + 4096);
+            }
+        }
+        drop((buffer, slab));
+        unregister(usize::MAX - 14, at as u64);
+        release(at);
     }
 
     /// The word a copy holds for title address `at` (0 where it has no

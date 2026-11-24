@@ -192,7 +192,7 @@ fn world_frame() {
                     // SAFETY: an open list; live buffers, the range inside both.
                     unsafe {
                         list.list
-                            .CopyBufferRegion(&copy.buffer, offset, &upload, 0, 64 << 10)
+                            .CopyBufferRegion(copy.resource(), offset, &upload, 0, 64 << 10)
                     };
                 }
             }

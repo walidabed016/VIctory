@@ -664,7 +664,7 @@ fn copy_to_buffer(
     shadow.refresh(list, address, bytes);
     shadow.gpu_writes(list, address, bytes);
     let mut to = *dst;
-    to.resource = shadow.buffer.as_raw().cast_const().cast();
+    to.resource = shadow.resource().as_raw().cast_const().cast();
     to.footprint.offset = offset;
     to.footprint.format = format;
     let mut from = *src;
