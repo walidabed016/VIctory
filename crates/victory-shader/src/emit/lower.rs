@@ -2632,16 +2632,22 @@ impl<'a> Lower<'a> {
             self.group_barrier();
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as dword-aligned.
+        // A dword past the program's allocation reads 0 and takes no write,
+        // as on the console (the host's group-shared memory would fault):
+        // its pointer (dword 0's then) and whether it lies inside.
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let size = l.s.m.i32(l.s.lds_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, size);
+            let z = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, z);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -2711,8 +2717,10 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let z = self.s.m.i32(0);
+                    let x = self.s.m.select(self.cur, inside, x, z);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -2767,8 +2775,10 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, inside) = dword(self, off);
+                let only = self.begin_guarded(Some(inside));
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(only, &[]);
             }
             self.end_guarded(at, &[]);
             return Ok(());
@@ -2803,8 +2813,17 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        // Past the allocation an atomic changes nothing and returns 0.
+        let (p, inside) = dword(self, offset);
+        let z = self.s.m.i32(0);
+        let (run, outside) = match guard {
+            Some(g) => (
+                self.s.m.bin(self.cur, Bin::And, g, inside),
+                self.s.m.select(self.cur, g, z, outside),
+            ),
+            None => (inside, z),
+        };
+        let at = self.begin_guarded(Some(run));
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.

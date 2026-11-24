@@ -577,3 +577,68 @@ fn a_cross_lane_read_after_a_lane_loop_with_no_barrier_keeps_64_lane_waves() {
         Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
     );
 }
+
+/// Each thread writes index + 1000 to LDS[index] and index + 2000 to a
+/// dword past the program's 128, LDS[index + 128] as CS_SortRayTiles does
+/// from its third group on (it indexes LDS by the thread's id in the
+/// dispatch), or with `near` LDS[index % 4 + 128]; after a barrier it
+/// stores LDS[index], that dword and what `ds_add_rtn` returns there. The
+/// console drops writes past the allocation and reads 0 there. `lanes`
+/// adds a `v_mbcnt` (a program of console lanes, on halves).
+fn past_the_lds(threads: [u32; 3], lanes: bool, near: bool) -> Vec<u32> {
+    let mut w = prologue(threads);
+    if lanes {
+        w.extend(vop3(0x365, 13, ONES, ZERO));
+    }
+    w.push(vop2(0x1A, 5, inline(2), 3));
+    if near {
+        w.push(vop2(0x1B, 6, inline(3), 3));
+        w.push(vop2(0x1A, 6, inline(2), 6));
+        w.extend([vop2(0x25, 6, 255, 6), 512]);
+    } else {
+        w.extend([vop2(0x25, 6, 255, 5), 512]);
+    }
+    w.extend([vop2(0x25, 7, 255, 3), 1000]);
+    w.extend([vop2(0x25, 12, 255, 3), 2000]);
+    w.extend(ds(0x0D, 0, 5, 7, 0));
+    w.extend(ds(0x0D, 0, 6, 12, 0));
+    w.push(sopp(0x0A, 0));
+    w.extend(ds(0x36, 8, 5, 0, 0));
+    w.extend(ds(0x36, 9, 6, 0, 0));
+    w.push(vop1(0x001, 10, inline(1)));
+    w.extend(ds(0x20, 11, 6, 10, 0));
+    for (k, r) in [8u8, 9, 11].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+fn check_past_the_lds(lanes: bool, near: bool, want: Waves) {
+    let threads = [128, 1, 1];
+    let (shader, waves, _) = build(&past_the_lds(threads, lanes, near), threads, 512);
+    assert_eq!(waves, want);
+    for (label, got) in run(&shader, 128 * SLOTS) {
+        for f in 0..128u32 {
+            let at = (f * SLOTS) as usize;
+            assert_eq!(got[at..at + 3], [f + 1000, 0, 0], "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn lds_past_the_allocation_reads_0_and_takes_no_writes() {
+    check_past_the_lds(false, false, Waves::Any);
+}
+
+#[test]
+fn lds_past_the_allocation_reads_0_and_takes_no_writes_on_halves() {
+    check_past_the_lds(true, false, Waves::Halves);
+}
+
+#[test]
+fn lds_just_past_the_allocation_reads_0_and_takes_no_writes_on_halves() {
+    // Within the host's group-shared memory (the halves' own words, or its
+    // rounding): unchecked, this reads what was written instead of faulting.
+    check_past_the_lds(true, true, Waves::Halves);
+}
