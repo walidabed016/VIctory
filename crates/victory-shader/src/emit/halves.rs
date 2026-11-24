@@ -28,6 +28,12 @@
 //! * **One lane.** Where one lane of each console wave at most gets
 //!   ([`alone_blocks`]: `if (index == 0)`), `v_readfirstlane` reads that
 //!   lane's own value, with no exchange.
+//! * **Lockstep.** A group of one console wave that the halves cannot run
+//!   lane by lane follows that wave's own control flow instead: both halves
+//!   take each branch the wave takes (on values every thread has alike),
+//!   EXEC and the lane masks are values (the wave's ballots), and each
+//!   vector instruction runs under the thread's own EXEC bit, so every
+//!   block meets.
 //! * **LDS of a one-wave group.** The console compiler leaves out barriers
 //!   when the group is one wave, which its two halves no longer are: every
 //!   LDS access gets a barrier before it, so they happen in program order

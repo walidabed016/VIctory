@@ -370,7 +370,8 @@ fn cross_lane_reads_after_lanes_split_and_in_a_uniform_loop_match_64_lane_waves(
 
 #[test]
 fn a_cross_lane_read_some_lanes_skip_keeps_64_lane_waves() {
-    let threads = [64, 1, 1];
+    // Two console waves: no lockstep (one console wave per group).
+    let threads = [128, 1, 1];
     let mut w = prologue(threads);
     w.extend([SAVE_EXEC, V_CMPX_EQ_U32_0_V0, sopp(0x08, 3)]);
     w.extend(vop3(0x360, 14, v(3), inline(40)));
@@ -641,4 +642,235 @@ fn lds_just_past_the_allocation_reads_0_and_takes_no_writes_on_halves() {
     // Within the host's group-shared memory (the halves' own words, or its
     // rounding): unchecked, this reads what was written instead of faulting.
     check_past_the_lds(true, true, Waves::Halves);
+}
+
+/// `v_mov_b32 vdst, k` (a literal).
+const fn mov_k(vdst: u8, k: u32) -> [u32; 2] {
+    [vop1(0x001, vdst, 255), k]
+}
+
+/// A branch of SOPP opcode `op` past `region`, then the region.
+fn skip(op: u8, region: Vec<u32>) -> Vec<u32> {
+    let mut w = vec![sopp(op, region.len() as i16)];
+    w.extend(region);
+    w
+}
+
+/// SOPP opcodes: `s_cbranch_scc0`, `s_cbranch_execz`, `s_cbranch_execnz`.
+const SCC0: u8 = 0x04;
+const EXECZ: u8 = 0x08;
+const EXECNZ: u8 = 0x09;
+/// What a lane outside EXEC keeps.
+const DEAD: u32 = 0xDEAD;
+
+/// Each thread's first `n` stored dwords.
+fn slots(got: &[u32], f: u32, n: usize) -> &[u32] {
+    let at = (f * SLOTS) as usize;
+    &got[at..at + n]
+}
+
+#[test]
+fn masks_written_where_lanes_split_are_the_console_waves_in_lockstep() {
+    // Lanes with bit 0 or 3 of their index go in (`s_and_saveexec`, SCC);
+    // each there stores how many of them have bit 1, how many of those lie
+    // below it, and the first (`s_bcnt1`, `v_mbcnt`, `s_ff1` of a mask
+    // written there; bit 1 is taken before, in every lane).
+    let threads = [32, 2, 1];
+    let mut w = prologue(threads);
+    for r in [5, 6, 7] {
+        w.extend(mov_k(r, DEAD));
+    }
+    w.extend([
+        vop2(0x1B, 8, inline(9), 3),
+        vop2(0x1B, 9, inline(2), 3),
+        vopc(0xC5, ZERO, 8),
+        sop1(0x24, 16, VCC_LO),
+    ]);
+    let mut region = vec![
+        vopc(0xC5, ZERO, 9),
+        sop1(0x10, 12, VCC_LO),
+        vop1(0x001, 5, 12),
+    ];
+    region.extend(vop3(0x365, 6, VCC_LO as u16, ZERO));
+    region.extend(vop3(0x366, 6, VCC_HI as u16, v(6)));
+    region.extend([sop1(0x14, 13, VCC_LO), vop1(0x001, 7, 13)]);
+    w.extend(skip(SCC0, region));
+    w.push(RESTORE_EXEC);
+    for (k, r) in [5u8, 6, 7].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    let inside = |f: u32| f & 9 != 0;
+    let marked: Vec<u32> = (0..64).filter(|&f| inside(f) && f & 2 != 0).collect();
+    for (label, got) in run(&shader, 64 * SLOTS) {
+        for f in 0..64u32 {
+            let want = if inside(f) {
+                let below = marked.iter().filter(|&&g| g < f).count() as u32;
+                [marked.len() as u32, below, marked[0]]
+            } else {
+                [DEAD; 3]
+            };
+            assert_eq!(slots(&got, f, 3), want, "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn reads_of_other_lanes_where_only_the_upper_half_runs_are_the_console_waves() {
+    // Lanes 40-63 go in (`v_cmpx`, `s_cbranch_execz`), the lower half none
+    // of them; there each stores the first lane's v11, lane 5's (outside
+    // EXEC), lane ^ 8's through `ds_swizzle` and lane - 1's through DPP
+    // `row_shr:1`, where a lane outside EXEC gives 0 and no write.
+    let threads = [64, 1, 1];
+    let mut w = prologue(threads);
+    for r in [5, 6, 7, 10] {
+        w.extend(mov_k(r, DEAD));
+    }
+    w.extend([vop2(0x25, 11, 255, 3), 256]);
+    w.extend([SAVE_EXEC, vopc(0xD3, inline(40), 3)]);
+    let mut region = vec![vop1(0x002, 14, v(11))];
+    region.extend(vop3(0x360, 15, v(11), inline(5)));
+    region.extend([vop1(0x001, 5, 14), vop1(0x001, 6, 15)]);
+    region.extend(ds(0x35, 7, 11, 0, 0x201F));
+    region.extend(mov_dpp(10, 11, 0x111));
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    for (k, r) in [5u8, 6, 7, 10].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    let on = |f: u32| f >= 40;
+    for (label, got) in run(&shader, 64 * SLOTS) {
+        for f in 0..64u32 {
+            let want = if on(f) {
+                let swizzled = if on(f ^ 8) { 256 + (f ^ 8) } else { 0 };
+                let shifted = if f % 16 >= 1 && on(f - 1) {
+                    256 + f - 1
+                } else {
+                    DEAD
+                };
+                [256 + 40, 256 + 5, swizzled, shifted]
+            } else {
+                [DEAD; 4]
+            };
+            assert_eq!(slots(&got, f, 4), want, "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn a_loop_taking_lanes_by_key_in_turn_is_the_console_waves() {
+    // Each turn takes the lanes whose key is the first remaining lane's
+    // (`v_readfirstlane`, `v_cmp`, `s_and_saveexec`, `s_xor` EXEC,
+    // `s_cbranch_execnz`); each stores its turn, the key taken and how
+    // many lanes took it (`s_bcnt1`).
+    let threads = [64, 1, 1];
+    let key = |f: u32| (f * 13) & 7;
+    let mut w = prologue(threads);
+    w.push(vop2(0x0B, 11, inline(13), 3));
+    w.push(vop2(0x1B, 11, inline(7), 11));
+    w.extend(mov_k(12, DEAD));
+    w.extend([sop1(0x03, 20, 0x80), SAVE_EXEC]);
+    let body = vec![
+        vop1(0x002, 14, v(11)),
+        vopc(0xC2, 14, 11),
+        sop1(0x24, 18, VCC_LO),
+        vop1(0x001, 5, 20),
+        vop1(0x001, 12, 14),
+        sop1(0x10, 21, VCC_LO),
+        vop1(0x001, 13, 21),
+        sop2(0x13, EXEC_LO, EXEC_LO, 18),
+        sop2(0x00, 20, 20, inline(1) as u8),
+    ];
+    let back = -(body.len() as i16 + 1);
+    w.extend(body);
+    w.extend([sopp(EXECNZ, back), RESTORE_EXEC]);
+    for (k, r) in [5u8, 12, 13].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    let mut want = [[0; 3]; 64];
+    let mut left: Vec<u32> = (0..64).collect();
+    let mut turn = 0;
+    while let Some(&first) = left.first() {
+        let k = key(first);
+        let taken: Vec<u32> = left.iter().copied().filter(|&f| key(f) == k).collect();
+        for &f in &taken {
+            want[f as usize] = [turn, k, taken.len() as u32];
+        }
+        left.retain(|&f| key(f) != k);
+        turn += 1;
+    }
+    for (label, got) in run(&shader, 64 * SLOTS) {
+        for f in 0..64u32 {
+            assert_eq!(slots(&got, f, 3), want[f as usize], "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn one_wave_lds_written_where_lanes_split_is_in_program_order() {
+    // LDS[i] = 0; lanes 40-63 then write LDS[i] = i + 1000 (`v_cmpx`,
+    // `s_cbranch_execz`); each lane reads LDS[i ^ 33], mostly the other
+    // half's.
+    let threads = [64, 1, 1];
+    let mut w = prologue(threads);
+    w.push(vop2(0x1A, 5, inline(2), 3));
+    w.push(vop2(0x1D, 6, inline(33), 3));
+    w.push(vop2(0x1A, 6, inline(2), 6));
+    w.extend([vop2(0x25, 8, 255, 3), 1000]);
+    w.push(vop1(0x001, 9, ZERO));
+    w.extend(ds(0x0D, 0, 5, 9, 0));
+    w.extend([SAVE_EXEC, vopc(0xD3, inline(40), 3)]);
+    w.extend(skip(EXECZ, ds(0x0D, 0, 5, 8, 0).to_vec()));
+    w.push(RESTORE_EXEC);
+    w.extend(ds(0x36, 9, 6, 0, 0));
+    w.extend(store(9, 4, 0));
+    w.push(S_ENDPGM);
+    let (shader, waves, barriers) = build(&w, threads, 256);
+    assert_eq!(waves, Waves::Lockstep);
+    // The counter's, the `v_cmpx` ballot's and one before each LDS access
+    // (the host GPU need not show their lack).
+    assert_eq!(barriers, 5);
+    for (label, got) in run(&shader, 64 * SLOTS) {
+        for f in 0..64u32 {
+            let g = f ^ 33;
+            let want = if g >= 40 { g + 1000 } else { 0 };
+            assert_eq!(got[(f * SLOTS) as usize], want, "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn the_first_lane_of_no_lanes_is_lane_0() {
+    // `v_readfirstlane` with EXEC zero reads lane 0; each thread stores
+    // that and its lane (`v_mbcnt`, which needs the console's lanes).
+    let threads = [64, 1, 1];
+    let mut w = prologue(threads);
+    w.extend([vop2(0x25, 11, 255, 3), 256]);
+    w.extend([
+        SAVE_EXEC,
+        vopc(0xD4, ZERO, 3),
+        vop1(0x002, 14, v(11)),
+        RESTORE_EXEC,
+        vop1(0x001, 5, 14),
+    ]);
+    w.extend(vop3(0x365, 6, ONES, ZERO));
+    w.extend(vop3(0x366, 6, ONES, v(6)));
+    w.extend(store(5, 4, 0));
+    w.extend(store(6, 4, 4));
+    w.push(S_ENDPGM);
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Halves);
+    for (label, got) in run(&shader, 64 * SLOTS) {
+        for f in 0..64u32 {
+            assert_eq!(slots(&got, f, 2), [256, f], "{label}: thread {f}");
+        }
+    }
 }

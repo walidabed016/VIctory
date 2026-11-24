@@ -282,6 +282,9 @@ pub enum Waves {
     Any,
     /// Each as two 32-lane host waves ([`halves`]).
     Halves,
+    /// The group's one console wave as two 32-lane host waves that follow
+    /// its own branches ([`halves`]).
+    Lockstep,
     /// As 64-lane host waves (the program declares `WaveSize(64)`, which
     /// hosts with only 32-lane waves refuse), for this reason the halves
     /// cannot run it.

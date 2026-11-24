@@ -439,6 +439,9 @@ fn translate(
                                 let how = match waves {
                                     emit::Waves::Any => "any wave size".to_owned(),
                                     emit::Waves::Halves => "32-lane halves".to_owned(),
+                                    emit::Waves::Lockstep => {
+                                        "32-lane halves in lockstep".to_owned()
+                                    }
                                     emit::Waves::Wave64(why) => format!("64-lane waves: {why}"),
                                 };
                                 if t.list {
