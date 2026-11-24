@@ -602,6 +602,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    // Diagnostics: each view's section, first slice and pages, to tell
+    // whether a large mapping could be one host allocation.
+    #[cfg(feature = "diagnostics")]
+    let mut views = Vec::new();
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -618,10 +622,38 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
+        #[cfg(feature = "diagnostics")]
+        views.push(format!(
+            "{:#x}:{:#x}+{:#x}",
+            first.section.0 as usize, first.index, run
+        ));
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
+    }
+    #[cfg(feature = "diagnostics")]
+    if n * PAGE >= 16 << 20 {
+        let before = physical
+            .views
+            .range(..base)
+            .next_back()
+            .filter(|(at, (len, _))| *at + len == base)
+            .map(|(_, (len, s))| {
+                format!(
+                    "{:#x}:{:#x}+{:#x}",
+                    s.section.0 as usize,
+                    s.index,
+                    len / PAGE
+                )
+            });
+        tracing::info!(
+            address = format_args!("{base:#x}"),
+            len = n * PAGE,
+            ?views,
+            ?before,
+            "large physical mapping"
+        );
     }
     address
 }
