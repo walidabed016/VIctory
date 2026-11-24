@@ -596,10 +596,8 @@ impl Shadow {
             }
             at += n;
         }
-        // Armed blocks still mapped are read in place while this is held.
-        let (mapping, mapped) =
-            crate::watch::mapped((start + from) / PAGE, (start + to).div_ceil(PAGE));
         let changed: Vec<usize> = split(pieces.len(), to - from, |part| {
+            let mut seen = None;
             part.filter(|&i| {
                 let (at, host, n) = pieces[i];
                 // SAFETY: inside the copy's memory, which the GPU is done
@@ -607,15 +605,15 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
                 match was.at(at, n) {
                     Some(Before::Bytes(before)) => host != before,
+                    // Blocks no longer armed tell what they held below.
                     Some(Before::Armed(_)) => {
-                        let block = (start + at) / PAGE;
-                        !mapped.iter().any(|&(a, b)| a <= block && block < b) || {
-                            // SAFETY: an armed block, mapped while `mapping`
-                            // is held.
+                        crate::watch::in_place((start + at) / PAGE, &mut seen, || {
+                            // SAFETY: an armed block, mapped while it is read.
                             host != unsafe {
                                 std::slice::from_raw_parts((start + at) as *const u8, n)
                             }
-                        }
+                        })
+                        .unwrap_or(true)
                     }
                     None => false,
                 }
@@ -623,7 +621,6 @@ impl Shadow {
             .collect::<Vec<_>>()
         })
         .concat();
-        drop(mapping);
         let mut title = vec![0u8; PIECE];
         let (mut written, mut synced) = (0, Vec::new());
         for i in changed {
