@@ -8297,8 +8297,18 @@ impl<'a> Lower<'a> {
     /// Whether no lane that enters block `b` from its `n`th predecessor reads
     /// `v`, a value joined there, so that what the edge brings never matters:
     /// compares in `b` that every such lane answers alike (against a
-    /// constant the edge brings) rule out each block that reads it.
-    fn unread_from(&self, v: Value, b: usize, n: usize) -> bool {
+    /// constant the edge brings) rule out each block that reads it. A join it
+    /// feeds on a forward edge reads it only where no lane bringing it there
+    /// reads that join: `facts` hold for every lane that brings `v` to `b`,
+    /// `seen` holds the joins being decided.
+    fn unread_from(
+        &self,
+        v: Value,
+        b: usize,
+        n: usize,
+        facts: &[(Bool, bool)],
+        seen: &mut Vec<Value>,
+    ) -> bool {
         let (p, st) = (self.x.p, self.x.st);
         let along = |w: Value| match self.phi_at.get(&w) {
             Some(&(pb, i)) if pb == b => p.blocks[b].phis[i].args[n],
@@ -8333,7 +8343,7 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
-        let mut known = Vec::new();
+        let mut known = facts.to_vec();
         for (i, inst) in p.blocks[b].insts.iter().enumerate() {
             let Fields::Valu(f) = &inst.fields else {
                 continue;
@@ -8404,7 +8414,17 @@ impl<'a> Lower<'a> {
                         } if taken != not_taken => Some((when, taken == r)),
                         _ => None,
                     };
-                    if !unreached(s, edge) {
+                    if unreached(s, edge) || !self.read_phis.contains(&phi.value) {
+                        continue;
+                    }
+                    if self.rpo[r] <= self.rpo[s] || seen.contains(&phi.value) {
+                        return false;
+                    }
+                    seen.push(phi.value);
+                    let mut carried = known.clone();
+                    carried.push((st.reach[s], true));
+                    carried.extend(edge);
+                    if !self.unread_from(phi.value, r, m, &carried, seen) {
                         return false;
                     }
                 }
@@ -8437,8 +8457,10 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let read =
-                    |l: &Self| l.read_phis.contains(&phi.value) && !l.unread_from(phi.value, b, n);
+                let read = |l: &Self| {
+                    l.read_phis.contains(&phi.value)
+                        && !l.unread_from(phi.value, b, n, &[], &mut vec![phi.value])
+                };
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if read(self) => {

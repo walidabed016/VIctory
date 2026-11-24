@@ -68,8 +68,11 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
 /// turn writes the lane mask `v0 < 16` to s[2:3] and counts it in v5; the
 /// first turn then overwrites s3 with 0x100 and sets v1 to -1, the second
 /// skips that with v1 at `skipped`, and both join. A lane reads s3 there
-/// (adding it to v5) only when v1 is -1. Each thread stores v5.
-fn two_turns(skipped: u8) -> Vec<u32> {
+/// (adding it to v5) only when v1 is -1. With `rejoined`, s3 first passes
+/// through a second join (the first turn writes 0x100 to it again, the
+/// second skips that), as the ped pixel programs' unrolled decal loop does,
+/// and the read tests the first join's compare. Each thread stores v5.
+fn two_turns(skipped: u8, rejoined: bool) -> Vec<u32> {
     // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0; v4 = v0 * 4; s4 = 0; v5 = 0.
     let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
     w.extend([vop2(0x1A, 4, u16::from(TWO), 0), sop1(0x03, 4, ZERO)]);
@@ -96,6 +99,15 @@ fn two_turns(skipped: u8) -> Vec<u32> {
         vopc(0xC2, u16::from(ONES), 1),
         sop2(0x15, VCC_LO, EXEC_LO, VCC_LO),
     ]);
+    if rejoined {
+        // s[6:7] = vcc; s_cmp_eq_u32 s4, 0; s_cbranch_scc0 second; s3 = 0x100;
+        // second: vcc = s[6:7].
+        w.extend([sop1(0x04, 6, VCC_LO), sopc(0x06, 4, ZERO)]);
+        let skip = w.len();
+        w.extend([0, sop1(0x03, 3, LITERAL), 0x100]);
+        w[skip] = sopp(0x04, skip, w.len());
+        w.push(sop1(0x04, VCC_LO, 6));
+    }
     let unread = w.len();
     w.push(0);
     // s5 = s3 & 0x100; v5 += s5.
@@ -272,7 +284,18 @@ fn run(shader: &HostShader) -> Vec<(&'static str, Vec<u32>)> {
 
 #[test]
 fn a_mask_joined_with_data_runs_where_only_the_data_is_read() {
-    let shader = lower_cs(&two_turns(ZERO)).expect("lower");
+    let shader = lower_cs(&two_turns(ZERO, false)).expect("lower");
+    let want: Vec<u32> = (0..THREADS)
+        .map(|x| 0x100 + if x < 16 { 2 } else { 0 })
+        .collect();
+    for (label, got) in run(&shader) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_mask_a_second_join_passes_on_runs_where_only_the_data_is_read() {
+    let shader = lower_cs(&two_turns(ZERO, true)).expect("lower");
     let want: Vec<u32> = (0..THREADS)
         .map(|x| 0x100 + if x < 16 { 2 } else { 0 })
         .collect();
@@ -294,8 +317,12 @@ fn a_table_address_joined_from_two_paths_reads_each_paths_dword() {
 
 #[test]
 fn a_mask_joined_with_data_is_refused_where_a_lane_bringing_it_reads_it() {
-    match lower_cs(&two_turns(ONES)) {
-        Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, "a lane mask read as data"),
-        other => panic!("{:?}", other.map(|_| ())),
+    for rejoined in [false, true] {
+        match lower_cs(&two_turns(ONES, rejoined)) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a lane mask read as data", "rejoined {rejoined}");
+            }
+            other => panic!("rejoined {rejoined}: {:?}", other.map(|_| ())),
+        }
     }
 }
