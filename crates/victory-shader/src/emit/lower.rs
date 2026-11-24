@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, BVH, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -902,6 +902,13 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
+        if a.param == BVH {
+            let zero = self.s.m.i32(0);
+            for k in 0..n {
+                self.write(inst, Reg::V(reg + k as u8), zero, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
         let x = self.x;
@@ -3822,6 +3829,18 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if self.scalar.get(&site).is_some_and(|a| a.param == BVH) {
+            let (Some(Operand::Scalar { code, dwords }), true) =
+                (*data, name.starts_with("s_load_"))
+            else {
+                return Err("a write to an acceleration structure");
+            };
+            let zero = self.s.m.i32(0);
+            for k in 0..dwords {
+                self.write(inst, Reg::S(code + k), zero, None);
+            }
+            return Ok(());
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -4019,7 +4038,21 @@ impl<'a> Lower<'a> {
             )
         };
         let Some(&(at, first)) = uses.iter().find(|u| !scalar(u.0)).or(uses.first()) else {
-            return Err("a descriptor read only as data");
+            const DATA: Why = "a descriptor read only as data";
+            let bases = &self.x.res.bvh_bases;
+            if !inst.writes.iter().any(|w| bases.contains(&w.1)) {
+                return Err(DATA);
+            }
+            // An acceleration structure's descriptor: its base is 0.
+            let zero = self.s.m.i32(0);
+            for &(r, v) in &inst.writes {
+                if bases.contains(&v) {
+                    self.write(inst, r, zero, None);
+                } else {
+                    self.vals.insert(v, Val::Missing(DATA));
+                }
+            }
+            return Ok(());
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -6849,10 +6882,37 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        let name = inst.name();
+        if name.starts_with("image_bvh") {
+            // shortcut: the host builds no acceleration structure, so each
+            // is taken to be empty (see `BVH`) and the ray misses the node,
+            // as the hardware reports it by the node's type (the pointer's
+            // low 3 bits): a triangle's (0-3) distance +inf over 1 and no
+            // barycentrics, past any ray's end, which every compare of the
+            // distance with the ray's range takes as a miss (a NaN would
+            // not be); no child of a box node (0xFFFFFFFF in each slot).
+            let (Operand::Vector { reg, .. }, Some(&Operand::Vector { reg: node, .. })) =
+                (*data, addr.first())
+            else {
+                return Err("an intersection");
+            };
+            let node = inst.read(Reg::V(node)).ok_or("a node pointer")?;
+            let node = self.i32_of(node)?;
+            let guard = self.guard(b, i)?;
+            let c = self.cur;
+            let (seven, four, none) = (self.s.m.i32(7), self.s.m.i32(4), self.s.m.i32(u32::MAX));
+            let kind = self.s.m.bin(c, Bin::And, node, seven);
+            let triangle = self.s.m.cmp(c, pred::IULT, kind, four);
+            for (k, miss) in (0..).zip([0x7F80_0000, 0x3F80_0000, 0, 0]) {
+                let miss = self.s.m.i32(miss);
+                let x = self.s.m.select(c, triangle, miss, none);
+                self.write(inst, Reg::V(reg + k), x, guard);
+            }
+            return Ok(());
+        }
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
-        let name = inst.name();
         if *a16 && name.starts_with("image_sample_b") {
             return Err("a biased image sample with 16-bit coordinates");
         }

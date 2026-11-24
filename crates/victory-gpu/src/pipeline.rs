@@ -98,6 +98,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether the program intersects rays (`image_bvh*_intersect_ray`),
+    /// which the translation answers as misses of an empty acceleration
+    /// structure.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) rays: bool,
 }
 
 #[cfg(windows)]
@@ -109,13 +114,25 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        if t.rays {
+                            tracing::warn!(
+                                stage = self.stage,
+                                hash = %self.hash,
+                                "ray intersections miss: acceleration structures are taken to be \
+                                 empty (no ray-traced shadows or reflections; logged once per \
+                                 program)"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -159,6 +176,7 @@ impl Shader {
                     heap_unknown: 0,
                 },
                 used: Vec::new(),
+                rays: false,
             })),
         })
     }
@@ -169,7 +187,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let native = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -178,12 +196,23 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used })
+    #[cfg(feature = "diagnostics")]
+    let rays = native.as_ref().is_some_and(|p| {
+        victory_shader::gfx10::decode(&p.code).is_ok_and(|insts| {
+            insts
+                .iter()
+                .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+        })
+    });
+    Ok(Translated {
+        host,
+        used: native.map(|p| p.used).unwrap_or_default(),
+        #[cfg(feature = "diagnostics")]
+        rays,
+    })
 }
 
 #[repr(C)]

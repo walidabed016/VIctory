@@ -113,6 +113,8 @@
 #[cfg(all(test, windows))]
 mod atomic64_tests;
 mod bitcode;
+#[cfg(all(test, windows))]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;

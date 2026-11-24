@@ -12,6 +12,8 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
+use std::collections::HashSet;
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
@@ -51,6 +53,13 @@ pub struct Linear {
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
+
+/// [`Address::param`] of memory in an acceleration structure: at the base an
+/// `image_bvh*_intersect_ray` descriptor holds, or computed from what is
+/// read at such an address (node and instance records). The host builds no
+/// structure, so each is taken to be empty, as the intersections are (no
+/// ray hits a node): its memory reads 0.
+pub const BVH: usize = usize::MAX - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -142,6 +151,10 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Dwords scalar loads from root parameters read that hold an
+    /// acceleration structure's base (see [`BVH`]): taken to be 0, as the
+    /// structure is empty and none of its memory is read.
+    pub bvh_bases: Vec<Value>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -194,6 +207,7 @@ pub fn track(
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+    let bvh = t.bvh_roots();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -217,6 +231,8 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // Intersections read no descriptor (see [`BVH`]).
+                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -226,6 +242,14 @@ pub fn track(
                 Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
+                }
+                _ if !bvh.is_empty() && t.in_bvh(inst, &bvh) => {
+                    let address = Address {
+                        param: BVH,
+                        offset: 0,
+                        dynamic: None,
+                    };
+                    out.scalar.push((site, address));
                 }
                 Fields::Smem {
                     base,
@@ -271,6 +295,13 @@ pub fn track(
                     loads.push(load);
                 }
             }
+        }
+    }
+    for &((b, i), a) in &out.scalar {
+        let inst = &p.blocks[b].insts[i];
+        if a.param < layout.len() && inst.name().starts_with("s_load_") {
+            let bases = inst.writes.iter().map(|w| w.1).filter(|v| bvh.contains(v));
+            out.bvh_bases.extend(bases);
         }
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
@@ -984,6 +1015,153 @@ impl<'a> Tracer<'a> {
             })),
             None => Box::new(std::iter::once(v)),
         }
+    }
+
+    /// The values the program's `image_bvh*_intersect_ray` reach their
+    /// acceleration structures through: what each one's descriptor base
+    /// (dwords 0 and 1) and node pointer (its first address, two dwords
+    /// for `image_bvh64_intersect_ray`) are computed from, back to the
+    /// loads holding them (program inputs aside: a root parameter's address
+    /// is traced as such), and the node pointers each one returns.
+    fn bvh_roots(&self) -> HashSet<Value> {
+        let mut roots = HashSet::new();
+        let mut todo = Vec::new();
+        for inst in self.p.blocks.iter().flat_map(|b| &b.insts) {
+            let Fields::Image {
+                rsrc: Operand::Scalar { code, .. },
+                addr,
+                ..
+            } = &inst.fields
+            else {
+                continue;
+            };
+            let node = match inst.name() {
+                "image_bvh_intersect_ray" => 1,
+                "image_bvh64_intersect_ray" => 2,
+                _ => continue,
+            };
+            let base = Operand::Scalar {
+                code: *code,
+                dwords: 2,
+            };
+            todo.extend(self.reads(inst, &[base]));
+            todo.extend(self.reads(inst, addr).into_iter().take(node));
+            roots.extend(inst.writes.iter().map(|w| w.1));
+        }
+        while let Some(v) = todo.pop() {
+            if self.inputs[v.0 as usize].is_some() || !roots.insert(v) {
+                continue;
+            }
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                todo.extend(&self.p.blocks[b].phis[i].args);
+            } else if let Some(inst) = self.def(v) {
+                todo.extend(self.data(inst));
+            }
+        }
+        roots
+    }
+
+    /// Whether the scalar or global memory access `inst` is in an
+    /// acceleration structure ([`BVH`]): its address, not traced to a root
+    /// parameter, computed from `roots` (see [`Tracer::bvh_roots`]) or
+    /// from what is read in one.
+    fn in_bvh(&self, inst: &Inst, roots: &HashSet<Value>) -> bool {
+        let traced = match &inst.fields {
+            Fields::Smem {
+                base,
+                offset,
+                soffset,
+                ..
+            } => self.smem_address(inst, base, *offset, soffset).is_ok(),
+            Fields::Flat {
+                addr,
+                saddr,
+                offset,
+                ..
+            } => self
+                .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                .is_ok(),
+            _ => true,
+        };
+        let mut seen = HashSet::new();
+        !traced
+            && self.address_words(inst).is_some_and(|words| {
+                self.reads(inst, &words)
+                    .into_iter()
+                    .any(|v| self.bvh_derived(v, roots, &mut seen))
+            })
+    }
+
+    fn bvh_derived(&self, v: Value, roots: &HashSet<Value>, seen: &mut HashSet<Value>) -> bool {
+        if roots.contains(&v) {
+            return true;
+        }
+        if !seen.insert(v) {
+            return false;
+        }
+        let from = match (self.phis[v.0 as usize], self.def(v)) {
+            (Some((b, i)), _) => self.p.blocks[b].phis[i].args.clone(),
+            (None, Some(inst)) => match self.address_words(inst) {
+                Some(words) => self.reads(inst, &words),
+                None => self.data(inst),
+            },
+            (None, None) => Vec::new(),
+        };
+        from.into_iter().any(|x| self.bvh_derived(x, roots, seen))
+    }
+
+    /// The address operands of a scalar (not buffer) or global memory
+    /// access.
+    fn address_words(&self, inst: &Inst) -> Option<Vec<Operand>> {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Smem { base, .. } if name.contains("_load_") || name.contains("_store_") => {
+                (!name.starts_with("s_buffer_")).then(|| vec![*base])
+            }
+            Fields::Flat { addr, saddr, .. } if name.starts_with("global_") => {
+                Some(addr.iter().chain(saddr).copied().collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// The values the ALU instruction `inst` computes its results from: its
+    /// operands but lane masks, lane selects and carries; none for others.
+    fn data(&self, inst: &Inst) -> Vec<Value> {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Sop { src, .. } => self.reads(inst, src),
+            Fields::Valu(f) => {
+                let n = if name.starts_with("v_readlane")
+                    || name.starts_with("v_readfirstlane")
+                    || name.starts_with("v_writelane")
+                {
+                    1
+                } else if name.starts_with("v_cndmask") || name.contains("_co_ci_") {
+                    2
+                } else {
+                    f.src.len()
+                };
+                self.reads(inst, &f.src[..n.min(f.src.len())])
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The values `inst` reads in the registers of `ops` (EXEC aside).
+    fn reads(&self, inst: &Inst, ops: &[Operand]) -> Vec<Value> {
+        let mut out = Vec::new();
+        for op in ops {
+            let regs: Vec<Reg> = match *op {
+                Operand::Scalar { code, dwords } if !(EXEC..=EXEC + 1).contains(&code) => {
+                    (0..dwords).map(|k| Reg::S(code + k)).collect()
+                }
+                Operand::Vector { reg, dwords } => (0..dwords).map(|k| Reg::V(reg + k)).collect(),
+                _ => Vec::new(),
+            };
+            out.extend(regs.into_iter().filter_map(|r| inst.read(r)));
+        }
+        out
     }
 
     fn smem_address(
