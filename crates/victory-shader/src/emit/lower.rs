@@ -4158,20 +4158,33 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind: a
-        // vector memory or image access best, else a scalar buffer load.
-        let uses: Vec<(Site, u8)> = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .filter_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+        // vector memory or image access best, else a scalar buffer load;
+        // without one, a use of the descriptor loaded from the same address
+        // elsewhere (a waterfall loop that only reads a per-lane image's
+        // size, beside the one that samples it).
+        let uses_of = |load_of: &dyn Fn(Site) -> bool| -> Vec<(Site, u8)> {
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .filter_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if load_of(load) => Some((d.site, first)),
+                        _ => None,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
+        let mut uses = uses_of(&|load| load == site);
+        if uses.is_empty() {
+            uses = uses_of(&|load| self.same_address(load, site));
+            if !uses.is_empty() && self.scalar_leaves_loop(site.0) {
+                return Err(
+                    "a scalar a waterfall loop reads from a descriptor, used after the loop",
+                );
+            }
+        }
         let scalar = |at: Site| {
             matches!(
                 self.x.p.blocks[at.0].insts[at.1].fields,
@@ -4335,6 +4348,87 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the scalar loads at `a` and `b` read the same address: the
+    /// same root parameter and offset, and the same computed term, or terms
+    /// that `v_readfirstlane_b32` reads from the same vector value (the
+    /// first lane's entry of a per-lane table index, as each waterfall loop
+    /// over the index reads it).
+    fn same_address(&self, a: Site, b: Site) -> bool {
+        let (Some(x), Some(y)) = (self.scalar.get(&a), self.scalar.get(&b)) else {
+            return false;
+        };
+        let first_lane = |v: Value| {
+            let def = self
+                .x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+            let Fields::Valu(f) = &def.fields else {
+                return None;
+            };
+            match f.src.first() {
+                Some(&Operand::Vector { reg, .. }) if def.name() == "v_readfirstlane_b32" => {
+                    def.read(Reg::V(reg))
+                }
+                _ => None,
+            }
+        };
+        x.param == y.param
+            && x.offset == y.offset
+            && match (x.dynamic, y.dynamic) {
+                (None, None) => true,
+                (Some(d), Some(e)) => {
+                    d == e || first_lane(d).is_some_and(|v| first_lane(e) == Some(v))
+                }
+                _ => false,
+            }
+    }
+
+    /// Whether block `b` loops on itself and a scalar it computes (not a
+    /// lane mask) is read after the loop. Lanes run such a loop each until
+    /// its own pass (see `structure`), so the scalar is the lane's own pass's;
+    /// on the console it is the last pass's, the same in every lane.
+    fn scalar_leaves_loop(&self, b: usize) -> bool {
+        let p = self.x.p;
+        if !matches!(p.blocks[b].exit, Exit::Branch { taken, not_taken } if taken == b || not_taken == b)
+        {
+            return false;
+        }
+        let st = self.x.st;
+        let scalar = |(r, v): &(Reg, Value)| {
+            matches!(*r, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                && !st.masks.contains_key(v)
+                && !st.highs.contains_key(v)
+        };
+        let block = &p.blocks[b];
+        let written: HashSet<Value> = block
+            .phis
+            .iter()
+            .map(|ph| (ph.reg, ph.value))
+            .chain(block.insts.iter().flat_map(|i| i.writes.iter().copied()))
+            .filter(scalar)
+            .map(|w| w.1)
+            .collect();
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|&(c, _)| c != b)
+            .any(|(_, other)| {
+                other
+                    .insts
+                    .iter()
+                    .flat_map(|i| &i.reads)
+                    .any(|r| written.contains(&r.1))
+                    || other
+                        .phis
+                        .iter()
+                        .flat_map(|ph| &ph.args)
+                        .any(|a| written.contains(a))
+            })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -9286,6 +9380,88 @@ mod tests {
             // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    /// Each lane's texture (table entry lane & 1) read in a waterfall loop
+    /// that only takes its height from the descriptor, then sampled through
+    /// the same entry in a second one; the height is copied to v17 `inside`
+    /// the first loop, else after it from the SGPR the loop leaves.
+    fn height_then_sample(inside: bool) -> Vec<u32> {
+        let copy = 0x7E22_0220; // v_mov_b32 v17, s32
+        let mut w = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE96_037E, // s_mov_b32 s22, exec_lo
+            0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0xF40C_0602,
+            0x2800_0000, // s_load_dwordx8 s[24:31], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x93A0_FF1A,
+            0x0010_000E, // s_bfe_u32 s32, s26, 0x10000e (height - 1)
+        ];
+        if inside {
+            w.push(copy);
+        }
+        w.extend([
+            0xBE96_4716,                                    // s_andn2_wrexec_b32 s22, s22
+            if inside { 0xBF89_FFF6 } else { 0xBF89_FFF7 }, // s_cbranch_execnz -> 0x40
+            0xBEFE_0317,                                    // s_mov_b32 exec_lo, s23
+        ]);
+        if !inside {
+            w.push(copy);
+        }
+        w.extend([
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF6, // s_cbranch_execnz -> v_readfirstlane_b32
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xE070_1080,
+            0x800A_1110, // buffer_store_dword v17, v16, s[40:43], 0 offen offset:128
+            0xBF81_0000, // s_endpgm
+        ]);
+        w
+    }
+
+    #[test]
+    fn descriptor_dwords_a_waterfall_loop_leaves_in_scalars_are_refused() {
+        // The descriptor's kind comes from the sampling loop's load of the
+        // same entry; a height kept in a VGPR is each lane's own.
+        let (layout, used) = texture_and_uav_tables();
+        assert!(lower_wave(&height_then_sample(true), layout, used, false).is_ok());
+        // On the console the SGPR holds the last pass's height.
+        let (layout, used) = texture_and_uav_tables();
+        match lower_wave(&height_then_sample(false), layout, used, false) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(
+                what,
+                "a scalar a waterfall loop reads from a descriptor, used after the loop"
+            ),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("lowered"),
         }
     }
 

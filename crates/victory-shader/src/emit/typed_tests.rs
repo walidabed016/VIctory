@@ -1,7 +1,8 @@
 //! End-to-end tests of typed buffer stores and loads (`buffer_store_format_*`,
-//! `buffer_load_format_*`) through typed views in 32-bit formats.
-//! Synthetic GFX10 programs lowered to DXIL, validated by `dxil.dll` when
-//! present, and run on the host GPU and WARP.
+//! `buffer_load_format_*`) through typed views in 32-bit formats, and of an
+//! image's size read from its descriptor. Synthetic GFX10 programs lowered
+//! to DXIL, validated by `dxil.dll` when present, and run on the host GPU
+//! and WARP.
 
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -15,8 +16,8 @@ use crate::{io, ir, resource, structure};
 const LANES: u32 = 32;
 
 /// Lowers a wave32 program of 32 lanes with the resource heap at s0 and a
-/// table at s1 whose entry 0 is a UAV.
-fn build(words: &[u32]) -> HostShader {
+/// table at s1 whose entry 0 is a UAV, with `more` used-resource entries.
+fn build(words: &[u32], more: &[UsedResource]) -> HostShader {
     let param = |root, user_data: u8| RootParam {
         root,
         table_offset_dwords: 0,
@@ -39,7 +40,10 @@ fn build(words: &[u32]) -> HostShader {
             dwords: 4,
             user_data: 1,
             slot: 1,
-        }],
+        }]
+        .into_iter()
+        .chain(more.iter().copied())
+        .collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
             threads: [LANES, 1, 1],
@@ -166,7 +170,7 @@ const CLEAR_PATTERN: &[u32] = &[
 /// every bit, NaNs and denormals included.
 #[test]
 fn typed_stores_write_32_bit_formats() {
-    let shader = build(CLEAR_PATTERN);
+    let shader = build(CLEAR_PATTERN, &[]);
     let mut failed = Vec::new();
     for (name, format) in [
         ("R32_UINT", DXGI_FORMAT_R32_UINT),
@@ -184,4 +188,61 @@ fn typed_stores_write_32_bit_formats() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Each lane reads the width - 1 and height - 1 of the 2D texture at table
+/// entry 1 from its descriptor (a load whose dwords nothing accesses the
+/// texture through), loads texel (0, 0) through another load of the same
+/// entry, and stores the three and a zero at dword 4 * lane of the UAV.
+const SIZE_FROM_DESCRIPTOR: &[u32] = &[
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0xF40C_0403,
+    0xFA00_0020, // s_load_dwordx8 s[16:23], s[6:7], 0x20
+    0xF40C_0803,
+    0xFA00_0020, // s_load_dwordx8 s[32:39], s[6:7], 0x20
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0x7E0A_0280, // v_mov_b32 v5, 0
+    0x340C_0084, // v_lshlrev_b32 v6, 4, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x9398_FF12,
+    0x0010_000E, // s_bfe_u32 s24, s18, 0x10000e (height - 1)
+    0xD54E_0001,
+    0x0278_2212, // v_alignbit_b32 v1, s18, s17, 30
+    0x3602_02FF,
+    0x0000_3FFF, // v_and_b32 v1, 0x3fff, v1 (width - 1)
+    0x7E04_0218, // v_mov_b32 v2, s24
+    0xF000_1108,
+    0x0008_0304, // image_load v3, v[4:5], s[32:39] dim:SQ_RSRC_IMG_2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE07C_1000,
+    0x8003_0106, // buffer_store_dwordx4 v[1:4], v6, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// A descriptor load read only as data takes its view's kind from a load of
+/// the same address that the program accesses the view through.
+#[test]
+fn an_image_size_read_from_a_descriptor_loaded_twice_is_the_views() {
+    let texture = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 1,
+        slot: 1,
+    };
+    let shader = build(SIZE_FROM_DESCRIPTOR, &[texture]);
+    let texels: Vec<[f32; 4]> = (0..15).map(|i| [0.25 + i as f32, 0.0, 0.0, 1.0]).collect();
+    let views = [View::RawUav(4 * LANES), View::Texture(5, 3, &texels)];
+    let want: Vec<u32> = (0..LANES)
+        .flat_map(|_| [4, 2, 0.25f32.to_bits(), 0])
+        .collect();
+    for (label, uavs) in run(&shader, &views) {
+        assert_eq!(uavs[0], want, "{label}");
+    }
 }
