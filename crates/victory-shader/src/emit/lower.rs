@@ -7132,9 +7132,11 @@ impl<'a> Lower<'a> {
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
+            // gradients (x then y) come before the coordinates, a cube's
+            // two per direction, along its face's s and t.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            let per = if kind == 5 { 2 } else { spatial };
+            let grads = if op == 63 { 2 * per } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -7149,11 +7151,12 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+            let face = (kind == 5).then_some(cs[2]);
+            if let Some(face) = face {
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -7245,11 +7248,24 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..per {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + per + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if let Some(face) = face {
+                        // A face coordinate is sc / (2 |ma|) + 1.5 and the
+                        // direction's |ma| is 1: the direction moves twice the
+                        // face coordinates' gradient along the face's axes and
+                        // not along its major axis.
+                        let (two, zero) = (self.s.m.f32(2.0f32.to_bits()), self.s.m.f32(0));
+                        for d in [0, 3] {
+                            let u = self.s.m.bin(c, Bin::Mul, g[d], two);
+                            let v = self.s.m.bin(c, Bin::Mul, g[d + 1], two);
+                            let r = self.on_cube_face(face, [u, v], [zero, zero]);
+                            g[d..d + 3].copy_from_slice(&r);
+                        }
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -7516,18 +7532,26 @@ impl<'a> Lower<'a> {
         let u = self.s.m.bin(c, Bin::Sub, u, three);
         let v = self.s.m.bin(c, Bin::Mul, t, two);
         let v = self.s.m.bin(c, Bin::Sub, v, three);
+        let (one, mone) = (k(self, 1.0), k(self, -1.0));
+        self.on_cube_face(face, [u, v], [one, mone])
+    }
+
+    /// The vector with `u` and `v` along the s and t axes of cube face
+    /// `face` (a float id, as `v_cubeid` gives) and `plus` along the major
+    /// axis of a positive face, `minus` along that of a negative one.
+    fn on_cube_face(&mut self, face: V, [u, v]: [V; 2], [plus, minus]: [V; 2]) -> [V; 3] {
+        let c = self.cur;
         let z = self.s.m.f32(0x8000_0000);
         let (nu, nv) = (
             self.s.m.bin(c, Bin::Sub, z, u),
             self.s.m.bin(c, Bin::Sub, z, v),
         );
-        let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
-            [one, mone, u, u, u, nu],
-            [nv, nv, one, mone, nv, nv],
-            [nu, u, v, nv, one, mone],
+            [plus, minus, u, u, u, nu],
+            [nv, nv, plus, minus, nv, nv],
+            [nu, u, v, nv, plus, minus],
         ];
         table.map(|row| {
             let mut r = row[0];

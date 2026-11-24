@@ -310,6 +310,94 @@ fn a_sample_with_gradients_keeps_to_its_least_level() {
     }
 }
 
+/// A cube sample with gradients (`image_sample_d`, or with `cl` its `_cl`
+/// form with least level 2): lane l samples face min(l / 4, 5) of a cube of
+/// 64-texel faces with a gradient of 2^(k + 1) texels in the k-th of ds/dx,
+/// dt/dx, ds/dy and dt/dy, k = l & 3.
+fn cube_gradients(cl: bool) -> Vec<u32> {
+    let sample = if cl {
+        // image_sample_d_cl v12, v[1:8], s[12:19], s[8:11] dmask:0x1 dim:CUBE
+        0xF08C_0118
+    } else {
+        // image_sample_d v12, v[1:7], s[12:19], s[8:11] dmask:0x1 dim:CUBE
+        0xF088_0118
+    };
+    vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x3612_0083, // v_and_b32 v9, 3, v0 (k)
+        0x7E14_0282, // v_mov_b32 v10, 2
+        0x3414_1509, // v_lshlrev_b32 v10, v9, v10
+        0x7E14_0D0A, // v_cvt_f32_u32 v10, v10
+        0x1014_14FF,
+        0x3C80_0000, // v_mul_f32 v10, 1/64, v10 (the gradient)
+        0x7D84_1280, // v_cmp_eq_u32 vcc_lo, 0, v9
+        0x0202_1480, // v_cndmask_b32 v1, 0, v10, vcc_lo (ds/dx)
+        0x7D84_1281, // v_cmp_eq_u32 vcc_lo, 1, v9
+        0x0204_1480, // v_cndmask_b32 v2, 0, v10, vcc_lo (dt/dx)
+        0x7D84_1282, // v_cmp_eq_u32 vcc_lo, 2, v9
+        0x0206_1480, // v_cndmask_b32 v3, 0, v10, vcc_lo (ds/dy)
+        0x7D84_1283, // v_cmp_eq_u32 vcc_lo, 3, v9
+        0x0208_1480, // v_cndmask_b32 v4, 0, v10, vcc_lo (dt/dy)
+        0x7E0A_02FF,
+        0x3FA0_0000, // v_mov_b32 v5, 1.25 (s)
+        0x7E0C_02FF,
+        0x3FE0_0000, // v_mov_b32 v6, 1.75 (t)
+        0x2C16_0082, // v_lshrrev_b32 v11, 2, v0
+        0x2616_1685, // v_min_u32 v11, 5, v11
+        0x7E0E_0D0B, // v_cvt_f32_u32 v7, v11 (the face)
+        0x7E10_02F4, // v_mov_b32 v8, 2.0 (the least level)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        sample,
+        0x0043_0C01,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+#[test]
+fn a_cube_sample_with_gradients_takes_the_level_its_face_gradients_give() {
+    // Faces of 64 texels, 7 levels; level l of face f reads 10 f + l. (Past a
+    // face's width per pixel, the 4090 picks a level below WARP's off the
+    // face's centre.)
+    let texels: Vec<[f32; 4]> = (0..6u32)
+        .flat_map(|f| {
+            (0..7u32).flat_map(move |l| {
+                let n = (64usize >> l).pow(2);
+                std::iter::repeat_n([(10 * f + l) as f32, 0.0, 0.0, 1.0], n)
+            })
+        })
+        .collect();
+    let views = [View::Cube(64, 7, &texels), View::Null, View::RawUav(32)];
+    for cl in [false, true] {
+        let shader = lower_cs(&cube_gradients(cl), false).0;
+        let want: Vec<f32> = (0..32u32)
+            .map(|l| {
+                let level = (l & 3) + 1;
+                let level = if cl { level.max(2) } else { level };
+                (10 * (l >> 2).min(5) + level) as f32
+            })
+            .collect();
+        let ran = run(&shader, &views);
+        assert!(!ran.is_empty(), "no SM 6.6 device");
+        for (label, words) in ran {
+            let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            assert_eq!(got, want, "{label}, cl {cl}");
+        }
+    }
+}
+
 #[test]
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;

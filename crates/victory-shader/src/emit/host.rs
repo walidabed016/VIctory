@@ -986,8 +986,9 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
-    Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, levels, texels of faces +x -x +y -y
+    /// +z -z, each level 0 then 1...).
+    Cube(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F texture SRV with levels (width, height, levels, texels of
     /// level 0, then 1...).
     Mips(u32, u32, u32, &'a [[f32; 4]]),
@@ -1173,7 +1174,7 @@ impl Host {
                     View::Texture(..) | View::Cube(..) | View::Mips(..) => {
                         let (w, h, texels, faces, levels) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Cube(n, t) => (n, n, t, 6, 1),
+                            View::Cube(n, levels, t) => (n, n, t, 6, levels),
                             View::Mips(w, h, levels, t) => (w, h, t, 1, levels),
                             _ => unreachable!(),
                         };
@@ -1231,7 +1232,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: levels,
                                     ..Default::default()
                                 },
                             },
