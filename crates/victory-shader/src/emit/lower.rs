@@ -7771,29 +7771,41 @@ impl<'a> Lower<'a> {
     }
 
     /// Stores `vals` through `h`: a typed UAV's element `index` (four
-    /// float channels), or byte `off` of a raw UAV.
+    /// float channels), or byte `off` of a raw UAV. Raw stores go out one
+    /// dword at a time, in order: on the 4090, stores of several dwords to
+    /// the system-memory buffers that hold title UAVs run more than a hundred
+    /// times slower than single-dword stores.
     fn buffer_store(&mut self, h: V, typed: bool, index: V, off: V, vals: &[V]) {
         let iu = self.s.m.undef(self.s.t.i32);
-        let mut args = vec![h];
-        let (op, name) = if typed {
-            args.extend([index, iu]);
+        let void = self.s.t.void;
+        if typed {
+            let mut args = vec![h, index, iu];
             for &x in vals {
                 args.push(self.as_float(x));
             }
-            (69, "bufferStore.f32")
-        } else {
-            args.extend([off, iu]);
-            args.extend(vals);
-            args.resize(3 + 4, iu);
-            (140, "rawBufferStore.i32")
-        };
-        let mask = if typed { 0xF } else { (1u8 << vals.len()) - 1 };
-        args.push(self.s.m.i8(mask));
-        if !typed {
-            args.push(self.s.m.i32(4));
+            args.push(self.s.m.i8(0xF));
+            self.s
+                .op(self.cur, "bufferStore.f32", Attr::NoUnwind, void, 69, &args);
+            return;
         }
-        let void = self.s.t.void;
-        self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+        let (one, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        for (k, &x) in vals.iter().enumerate() {
+            let at = match k {
+                0 => off,
+                _ => {
+                    let step = self.s.m.i32(4 * k as u32);
+                    self.s.m.bin(self.cur, Bin::Add, off, step)
+                }
+            };
+            self.s.op(
+                self.cur,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[h, at, iu, x, iu, iu, iu, one, align],
+            );
+        }
     }
 
     /// `count` channels of element `index` of the typed buffer `h`.

@@ -95,7 +95,8 @@ fn build_with(words: &[u32], more: &[UsedResource]) -> HostShader {
 }
 
 /// Runs `shader` with `views` at heap indices 0.. and their `records`
-/// (stride, lead and kind, one per view) on the hardware GPU and on WARP (each
+/// (stride, lead and kind, one per view; bound only when the shader reads
+/// them) on the hardware GPU and on WARP (each
 /// skipped without a device): per one that ran, each UAV's dwords in heap
 /// order.
 fn run(
@@ -118,21 +119,22 @@ fn run(
         // The table starts at heap index 0; the view records follow the
         // user data (no root views).
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.view_strides {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: records.iter().flat_map(|&[s, l, k]| [s, l, k, 0]).collect(),
+                },
+            ));
+        }
         let uavs = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (
-                            1,
-                            Root::View {
-                                srv: true,
-                                data: records.iter().flat_map(|&[s, l, k]| [s, l, k, 0]).collect(),
-                            },
-                        ),
-                    ],
+                    roots,
                     views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -390,6 +392,46 @@ fn a_structured_views_record_count_read_from_its_descriptor_counts_its_records()
                     uavs[0]
                 ));
             }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Each lane stores 2, 3 and 4 dwords (`buffer_store_dwordx4/x3/x2`) into
+/// its 36-byte record of the raw UAV at table entry 0: values lane * 16 +
+/// 1..=4, 2..=4 and 3..=4 at dwords 0, 4 and 7 of the record.
+const WIDE_STORES: &[u32] = &[
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0x340C_0084, // v_lshlrev_b32 v6, 4, v0
+    0x4A02_0C81, // v_add_nc_u32 v1, 1, v6
+    0x4A04_0C82, // v_add_nc_u32 v2, 2, v6
+    0x4A06_0C83, // v_add_nc_u32 v3, 3, v6
+    0x4A08_0C84, // v_add_nc_u32 v4, 4, v6
+    0x160A_00A4, // v_mul_u32_u24 v5, 36, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE078_1000,
+    0x8003_0105, // buffer_store_dwordx4 v[1:4], v5, s[12:15], 0 offen
+    0xE07C_1010,
+    0x8003_0205, // buffer_store_dwordx3 v[2:4], v5, s[12:15], 0 offen offset:16
+    0xE074_101C,
+    0x8003_0305, // buffer_store_dwordx2 v[3:4], v5, s[12:15], 0 offen offset:28
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn raw_stores_of_several_dwords_write_each_dword_in_place() {
+    let shader = build_with(WIDE_STORES, &[]);
+    let want: Vec<u32> = (0..LANES)
+        .flat_map(|l| [1, 2, 3, 4, 2, 3, 4, 3, 4].map(|k| l * 16 + k))
+        .collect();
+    let views = [View::RawUav(9 * LANES)];
+    let mut failed = Vec::new();
+    for (label, uavs) in run(&shader, &views, &[[4, 0, view_kind::RAW_UAV]]) {
+        if uavs[0] != want {
+            failed.push(format!("{label}: got {:?}, want {want:?}", uavs[0]));
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
