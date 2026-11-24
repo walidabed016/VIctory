@@ -211,6 +211,11 @@ fn audit_on() -> bool {
 #[cfg(test)]
 static BEFORE_ASKING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
+/// Tests: a title write while [`Shadow::write_back`] writes a piece back,
+/// after it read the piece.
+#[cfg(test)]
+static BEFORE_WRITING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 /// Whether copies of view memory that shaders write arm its blocks instead
 /// of taking snapshots ([`Shadow::arm`]); `VICTORY_EAGER_SNAPSHOTS` turns
 /// it off.
@@ -809,20 +814,56 @@ impl Shadow {
                 continue;
             }
             // Title memory with the GPU's bytes put in; the copy takes the
-            // title's bytes in turn.
-            let mut changed = false;
-            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                if *h != *o && *t != *h {
-                    *t = *h;
-                    changed = true;
+            // title's bytes in turn. Only the words the GPU changed go back:
+            // the title writes the piece while we compare it, and writing it
+            // whole put the bytes we read back over those writes.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let words = title
+                .chunks_mut(4)
+                .zip(host.chunks_mut(4))
+                .zip(old.chunks(4));
+            for (k, ((t, h), o)) in words.enumerate() {
+                let mut gpu = false;
+                for ((t, h), o) in t.iter_mut().zip(h.iter()).zip(o) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        gpu = true;
+                    }
                 }
-                *h = *t;
+                h.copy_from_slice(t);
+                let (a, b) = (4 * k, 4 * k + t.len());
+                match runs.last_mut() {
+                    Some(run) if gpu && run.1 == a => run.1 = b,
+                    _ if gpu => runs.push((a, b)),
+                    _ => {}
+                }
             }
-            if changed {
+            #[cfg(test)]
+            if let Some(race) = BEFORE_WRITING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                race();
+            }
+            if !runs.is_empty() {
                 #[cfg(feature = "diagnostics")]
                 let started = std::time::Instant::now();
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                let to = start + at;
+                // A kernel copy per run costs ~0.7 us: blocks guarded until
+                // now are written in place when the GPU's words are scattered.
+                crate::watch::writing_in_place(to, n, |ours| {
+                    for &(a, b) in &runs {
+                        let (dst, src) = ((to + a) as *mut u8, title[a..b].as_ptr());
+                        if ours && runs.len() > 16 {
+                            // SAFETY: guarded blocks just opened: mapped
+                            // read-write, and no unmapping runs meanwhile.
+                            unsafe { std::ptr::copy_nonoverlapping(src, dst, b - a) };
+                        } else {
+                            crate::host::write_mapped(dst, src, b - a);
+                        }
+                    }
+                });
                 written += n;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::cost(
@@ -2383,6 +2424,80 @@ pub(crate) mod tests {
         }
         // The split threads and this one, and other tests' that took a part.
         assert!(ran.len() <= 10, "{} threads", ran.len());
+    }
+
+    /// The title writes a piece of a buffer while copy-back writes the
+    /// GPU's words in it back: only those words go back, so the title's
+    /// write next to them stays (run 68).
+    #[test]
+    fn a_title_write_while_copy_back_writes_a_piece_stays() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = title_memory(502, 256 * MIB, MIB, MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        // Small enough not to be used in place.
+        register(usize::MAX - 16, at as u64, 512 << 10);
+        let s = find(at as u64, 512 << 10).unwrap();
+        assert!(!s.in_place);
+        let declared = [(at, 512 << 10)];
+        let x = at + (128 << 10) + 32;
+        crate::watch::forget_asked();
+        s.update(at, 512 << 10);
+        s.writing(at, 512 << 10);
+        // SAFETY: inside the copy's memory.
+        unsafe { s.host_at(x - at, 4).cast::<u32>().write(0xfeed) };
+        // SAFETY: our test memory.
+        *BEFORE_WRITING.lock().unwrap() =
+            Some(Box::new(move || unsafe { ((x + 64) as *mut u32).write(7) }));
+        crate::watch::forget_asked();
+        assert_eq!(s.copy_back(&declared), 64 << 10);
+        // SAFETY: as above.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        assert_eq!(read(x + 64), 7, "the title's write was undone");
+        assert_eq!((read(x), read(x + 4)), (0xfeed, word(x + 4)));
+        drop(s);
+        unregister(usize::MAX - 16, at as u64);
+        release(at);
+    }
+
+    /// The GPU's words scattered over a guarded piece go back in place,
+    /// and only they.
+    #[test]
+    fn scattered_gpu_words_go_back_in_place() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = (966 * SLAB) as usize - 256 * MIB;
+        // Copies across views: not used in place.
+        let made = views(at, &[MIB; 4]);
+        assert_eq!(made.len(), 4, "no free address for test views");
+        register(usize::MAX - 17, at as u64, (4 * MIB) as u64);
+        let s = find(at as u64, (4 * MIB) as u64).unwrap();
+        assert!(!s.in_place);
+        let declared = [(at, 4 * MIB)];
+        let piece = at + MIB + (64 << 10);
+        crate::watch::forget_asked();
+        s.update(at, 4 * MIB);
+        s.writing(at, 4 * MIB);
+        let gpu: Vec<usize> = (0..32).map(|k| piece + k * 1024 + 8).collect();
+        for &w in &gpu {
+            // SAFETY: inside the copy's memory.
+            unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
+        }
+        crate::watch::forget_asked();
+        assert_eq!(s.copy_back(&declared), 64 << 10);
+        crate::watch::disarm();
+        // SAFETY: our views.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        for &w in &gpu {
+            assert_eq!((read(w), read(w + 4)), (0xfeed, word(w + 4)));
+        }
+        drop(s);
+        unregister(usize::MAX - 17, at as u64);
+        unmap(&made);
     }
 
     /// The word a copy holds for title address `at` (0 where it has no

@@ -892,6 +892,25 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
 }
 
+/// Before our own write into title memory `[at, at + len)` from the CPU,
+/// word by word: opens its guarded blocks as [`writing`] does, then runs
+/// `write` while no unmapping can run, telling it whether every block was
+/// guarded until now (so mapped read-write once opened, and stores need no
+/// kernel copy to leave unmapped pages alone).
+pub(crate) fn writing_in_place<T>(at: usize, len: usize, write: impl FnOnce(bool) -> T) -> T {
+    let _mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    let ours = {
+        let mut g = guards();
+        let ours = g
+            .protected
+            .gaps(at / BLOCK, (at + len).div_ceil(BLOCK))
+            .is_empty();
+        open(&mut g, at, at + len);
+        ours
+    };
+    write(ours)
+}
+
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new
 /// and read-write, so it is no longer guarded. It unmaps through
 /// [`title_memory_unmapping`].
