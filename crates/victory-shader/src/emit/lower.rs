@@ -80,9 +80,8 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
         return lower_as(parts, Split::No);
     }
     // On 32-lane halves where the translation shows it exact: lane by lane,
-    // else, for a group of one console wave or of waves that never meet,
-    // in each wave's own control flow; else on the console's 64-lane waves
-    // with the reason.
+    // else, for a group of whole console waves, in each wave's own control
+    // flow; else on the console's 64-lane waves with the reason.
     let why = |e| match e {
         ShaderError::Unsupported { what, .. } => what,
         _ => "an error on 32-lane halves",
@@ -94,7 +93,8 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let StageIo::Cs(cs) = parts.native.io else {
         unreachable!("wave64 lanes are compute")
     };
-    if cs.threads.iter().product::<u32>() <= 64 || apart_waves(parts) {
+    let threads = cs.threads.iter().product::<u32>();
+    if threads <= 64 || threads.is_multiple_of(64) {
         match lower_as(parts, Split::Lockstep) {
             Ok(l) => return Ok(l),
             Err(e) => reason = why(e),
@@ -114,8 +114,9 @@ enum Split {
     /// As two 32-lane halves, each lane on its own way through the program.
     Halves,
     /// As two 32-lane halves following the console wave's own branches,
-    /// EXEC a value; groups of one console wave, or of several that never
-    /// meet, played in turn ([`Serial`]).
+    /// EXEC a value; groups of one console wave, or of several: played in
+    /// turn where they never meet ([`Serial`]), else each wave's halves
+    /// waiting for each other alone ([`Halves::pairs`]).
     Lockstep,
 }
 
@@ -485,6 +486,12 @@ struct Halves {
     lockstep: bool,
     /// Lockstep in a group of several console waves that never meet.
     serial: Option<Serial>,
+    /// Lockstep in a group of several console waves that may meet: the two
+    /// halves of a console wave wait for each other through a pair barrier
+    /// of their own ([`Lower::pair_barrier`]) where a one-wave group's
+    /// halves take a group barrier; the console's `s_barrier` stays a
+    /// group barrier.
+    pairs: bool,
 }
 
 /// Lockstep for a group of several console waves that never meet
@@ -510,6 +517,8 @@ struct HalfIds {
     wave: V,
     /// Whether its console wave has lanes 32-63; none when all do.
     upper: Option<V>,
+    /// Pairs: the group-shared counter of its console wave's pair barrier.
+    pair: Option<V>,
 }
 
 /// Why a value from the other half has no form: the halves do not meet.
@@ -613,7 +622,7 @@ impl<'a> Lower<'a> {
                     s.wave_size = Some(32);
                     // Several console waves in lockstep: the host group is
                     // one, which plays them in turn.
-                    let serial = (lockstep && !one_wave).then(|| {
+                    let serial = (lockstep && !one_wave && apart_waves(x)).then(|| {
                         s.threads = Some([64, 1, 1]);
                         Serial {
                             threads: cs.threads,
@@ -621,6 +630,7 @@ impl<'a> Lower<'a> {
                             next: None,
                         }
                     });
+                    let pairs = lockstep && !one_wave && serial.is_none();
                     // A wave's lanes have their own x index. (In lockstep
                     // every lane goes where its wave does: none is alone.)
                     let distinct = (!lockstep
@@ -657,11 +667,12 @@ impl<'a> Lower<'a> {
                         } else {
                             data_masks(p, x.st)
                         },
-                        lds_barriers: one_wave && s.lds_dwords > 0 && threads > 32,
+                        lds_barriers: s.lds_dwords > 0 && (one_wave && threads > 32 || pairs),
                         ids: None,
                         dwords: 0,
                         lockstep,
                         serial,
+                        pairs,
                     });
                 }
             }
@@ -1104,7 +1115,7 @@ impl<'a> Lower<'a> {
             let high = match ids.upper {
                 Some(u) => {
                     let id = self.s.m.i32(ident);
-                    self.s.m.select(c, u, high, id)
+                    self.s.m.select(self.cur, u, high, id)
                 }
                 None => high,
             };
@@ -1116,6 +1127,7 @@ impl<'a> Lower<'a> {
         // -0.0 leaves every float sum as it is.
         let none = self.s.m.i32(if float { 0x8000_0000 } else { 0 });
         let z = self.s.m.i32(0);
+        let c = self.cur;
         let upper = self.s.m.cmp(c, pred::NE, ids.half, z);
         let below = self.s.m.select(c, upper, low, none);
         Ok(self.combine(op, r, below))
@@ -2473,21 +2485,37 @@ impl<'a> Lower<'a> {
             return Err(NO_ROOM);
         }
         let i32t = self.s.t.i32;
-        let arr = self.s.m.array(1, i32t);
+        // Pairs: a counter per console wave after the group's.
+        let pairs = self
+            .halves
+            .as_ref()
+            .is_some_and(|h| h.pairs)
+            .then_some(total / 64);
+        let dwords = 1 + pairs.unwrap_or(0);
+        let arr = self.s.m.array(dwords, i32t);
         let area = self.s.m.global("halves", arr, 3);
         if let Some(h) = &mut self.halves {
-            h.dwords = 1;
+            h.dwords = dwords;
         }
         let c = self.cur;
         let zero = self.s.m.i32(0);
         let counter = self.s.m.element(c, area, zero);
-        // Every thread clears the counter, then each wave's first lane adds
-        // 32 (the others 0): it gets where the wave's threads start.
-        self.s.m.store(c, counter, zero);
-        self.group_barrier();
         let lane = self
             .s
             .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        // Every thread clears the counter (and lane n of each host wave
+        // pair counter n), then each wave's first lane adds 32 (the others
+        // 0): it gets where the wave's threads start.
+        self.s.m.store(c, counter, zero);
+        let one = self.s.m.i32(1);
+        if let Some(waves) = pairs {
+            let waves = self.s.m.i32(waves);
+            let n = self.s.m.bin(c, Bin::URem, lane, waves);
+            let n = self.s.m.bin(c, Bin::Add, n, one);
+            let p = self.s.m.element(c, area, n);
+            self.s.m.store(c, p, zero);
+        }
+        self.group_barrier();
         let k32 = self.s.m.i32(32);
         let lead = self.s.m.cmp(c, pred::EQ, lane, zero);
         let add = self.s.m.select(c, lead, k32, zero);
@@ -2516,6 +2544,10 @@ impl<'a> Lower<'a> {
             let total = self.s.m.i32(total);
             self.s.m.cmp(c, pred::IULT, up, total)
         });
+        let pair = pairs.map(|_| {
+            let n = self.s.m.bin(c, Bin::Add, wave, one);
+            self.s.m.element(c, area, n)
+        });
         self.s.flags |= flags::WAVE_OPS;
         if let Some(h) = &mut self.halves {
             h.ids = Some(HalfIds {
@@ -2524,9 +2556,89 @@ impl<'a> Lower<'a> {
                 half,
                 wave,
                 upper,
+                pair,
             });
         }
         Ok(())
+    }
+
+    /// Halves: where the two halves of a console wave wait for each other
+    /// (around an exchange, before an LDS access): a group barrier, or in
+    /// a group of several console waves in lockstep their pair barrier.
+    fn halves_barrier(&mut self) {
+        match self
+            .halves
+            .as_ref()
+            .and_then(|h| h.ids)
+            .and_then(|i| i.pair)
+        {
+            Some(p) => self.pair_barrier(p),
+            None => self.group_barrier(),
+        }
+    }
+
+    /// Pairs ([`Halves::pairs`]): the two halves of this thread's console
+    /// wave wait for each other through its counter `p` in group-shared
+    /// memory. Each half's first lane adds 1 where it gets there, so after
+    /// both halves' nth barrier the count is 2n; a half goes on once it
+    /// reaches the end of the pair its own arrival belongs to. Both halves
+    /// follow their wave's branches, so they get to the same barriers in
+    /// the same order. Group-shared fences before and after make what one
+    /// half wrote before visible to the other after.
+    // shortcut: a half stops waiting after `PAIR_SPINS` reads, which only
+    // bounds a fault: both host waves of a group are resident and run.
+    fn pair_barrier(&mut self, p: V) {
+        use super::bitcode::Rmw;
+        const PAIR_SPINS: u32 = 1 << 16;
+        let void = self.s.t.void;
+        let i32t = self.s.t.i32;
+        let fence = self.s.m.i32(8);
+        let c = self.cur;
+        self.s
+            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let lane = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let lead = self.s.m.cmp(c, pred::EQ, lane, zero);
+        let add = self.s.m.select(c, lead, one, zero);
+        let old = self.s.m.atomic(c, Rmw::Add, p, add);
+        let old = self.s.op(
+            c,
+            "waveReadLaneAt.i32",
+            Attr::NoUnwind,
+            i32t,
+            117,
+            &[old, zero],
+        );
+        let even = self.s.m.i32(!1);
+        let start = self.s.m.bin(c, Bin::And, old, even);
+        let two = self.s.m.i32(2);
+        let end = self.s.m.bin(c, Bin::Add, start, two);
+        let (spin, after) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::Br(spin));
+        let n = self.s.m.phi(spin, i32t);
+        let now = self.s.m.atomic(spin, Rmw::Or, p, zero);
+        let now = self.s.op(
+            spin,
+            "waveReadLaneAt.i32",
+            Attr::NoUnwind,
+            i32t,
+            117,
+            &[now, zero],
+        );
+        let ahead = self.s.m.bin(spin, Bin::Sub, now, end);
+        let met = self.s.m.cmp(spin, pred::SGE, ahead, zero);
+        let next = self.s.m.bin(spin, Bin::Add, n, one);
+        let limit = self.s.m.i32(PAIR_SPINS);
+        let tired = self.s.m.cmp(spin, pred::IUGE, next, limit);
+        let leave = self.s.m.bin(spin, Bin::Or, met, tired);
+        self.s.m.terminate(spin, Term::CondBr(leave, after, spin));
+        self.s.m.set_phi(n, vec![(zero, c), (next, spin)]);
+        self.cur = after;
+        self.s
+            .op(after, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.s.flags |= flags::WAVE_OPS;
     }
 
     /// Lockstep in turn ([`Serial`]): a loop over the console group's
@@ -2618,16 +2730,22 @@ impl<'a> Lower<'a> {
             let p = slot(self, k, mine);
             self.s.m.store(c, p, w);
         }
-        self.group_barrier();
+        self.halves_barrier();
+        let c = self.cur;
         let one = self.s.m.i32(1);
         let upper = self.s.m.bin(c, Bin::Add, pair, one);
         let out = std::array::from_fn(|k| {
-            let (p0, p1) = (slot(self, k, pair), slot(self, k, upper));
+            let base = self.s.m.i32(k as u32 * waves * 2);
+            let (i0, i1) = (
+                self.s.m.bin(c, Bin::Add, pair, base),
+                self.s.m.bin(c, Bin::Add, upper, base),
+            );
+            let (p0, p1) = (self.s.m.element(c, area, i0), self.s.m.element(c, area, i1));
             (self.s.m.load(c, p0), self.s.m.load(c, p1))
         });
         if looped {
             // Every thread has read before any writes again.
-            self.group_barrier();
+            self.halves_barrier();
         }
         Ok(out)
     }
@@ -2681,7 +2799,7 @@ impl<'a> Lower<'a> {
         let high = match upper {
             Some(u) => {
                 let z = self.s.m.i32(0);
-                self.s.m.select(c, u, high, z)
+                self.s.m.select(self.cur, u, high, z)
             }
             None => high,
         };
@@ -2714,6 +2832,7 @@ impl<'a> Lower<'a> {
         let w0 = self.read_lane(x, zero);
         let [(low_bits, high_bits), (low, high), (lane0, _)] =
             self.exchange([bits, w, w0], APART)?;
+        let c = self.cur;
         let any_high = self.s.m.cmp(c, pred::NE, high_bits, zero);
         let r = self.s.m.select(c, any_high, high, lane0);
         let any_low = self.s.m.cmp(c, pred::NE, low_bits, zero);
@@ -2888,6 +3007,18 @@ impl<'a> Lower<'a> {
         }
         let name = inst.name();
         let guard = self.guard(b, i)?;
+        let shares = !(name == "ds_swizzle_b32" || name.contains("permute"));
+        if let Some(h) = &self.halves
+            && h.lds_barriers
+            && shares
+            && self.s.lds_dwords > 0
+        {
+            // Halves of one console wave: LDS accesses in program order.
+            if !h.meet[self.cur_ir] {
+                return Err(APART_LDS);
+            }
+            self.halves_barrier();
+        }
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
         let dst_reg = match dst {
@@ -2978,15 +3109,6 @@ impl<'a> Lower<'a> {
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
-        }
-        if let Some(h) = &self.halves
-            && h.lds_barriers
-        {
-            // Halves of a one-wave group: LDS accesses in program order.
-            if !h.meet[self.cur_ir] {
-                return Err(APART_LDS);
-            }
-            self.group_barrier();
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned.
@@ -5442,6 +5564,7 @@ impl<'a> Lower<'a> {
                 self.cross_lane(false)?;
                 let w = self.read_lane(a, lane);
                 let [(low, high)] = self.exchange([w], APART)?;
+                let c = self.cur;
                 let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::And, lane, k32);
                 let up = self.s.m.cmp(c, pred::NE, bit, z);

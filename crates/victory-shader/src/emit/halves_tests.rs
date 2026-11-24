@@ -506,31 +506,43 @@ fn one_lane_of_each_wave_reads_its_own_first_lane_on_halves() {
     }
 }
 
-#[test]
-fn an_x_index_repeated_in_a_wave_keeps_64_lane_waves() {
-    // x == 0 holds in lanes 0 and 32 of a 32x4 group's first wave.
-    let threads = [32, 4, 1];
-    let (_, waves, _) = build(
-        &serial_prefix(threads, &[vopc(0xC2, ZERO, 7)]),
-        threads,
-        512,
-    );
-    assert_eq!(
-        waves,
-        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
-    );
+/// A [`serial_prefix`] of 128 threads whose loop two lanes of each console
+/// wave run, which the halves cannot run lane by lane: in lockstep, each
+/// console wave as it runs it. The two waves race for LDS[2] and LDS[3]
+/// after the barrier on the console too, so only what every order of them
+/// gives is checked.
+fn check_lanes_sharing_a_first_lane(threads: [u32; 3], compare: &[u32]) {
+    let (shader, waves, _) = build(&serial_prefix(threads, compare), threads, 512);
+    assert_eq!(waves, Waves::Lockstep, "{threads:?}");
+    for (label, got) in run(&shader, 128 * SLOTS) {
+        for f in 0..128u32 {
+            let at = (f * SLOTS) as usize;
+            match f % 4 {
+                0 => assert_eq!(got[at], 0, "{label}: thread {f}"),
+                1 => assert_eq!(got[at], 3, "{label}: thread {f}"),
+                2 => assert!(
+                    matches!(got[at], 9 | 12),
+                    "{label}: thread {f}: {}",
+                    got[at]
+                ),
+                _ => {}
+            }
+            assert_eq!(got[at + 1], (f % 64).min(32), "{label}: thread {f}");
+        }
+    }
 }
 
 #[test]
-fn lanes_that_share_a_first_lane_keep_64_lane_waves() {
+fn an_x_index_repeated_in_a_wave_is_the_console_waves_in_lockstep() {
+    // x == 0 holds in lanes 0 and 32 of each wave of a 32x4 group.
+    check_lanes_sharing_a_first_lane([32, 4, 1], &[vopc(0xC2, ZERO, 7)]);
+}
+
+#[test]
+fn lanes_that_share_a_first_lane_are_the_console_waves_in_lockstep() {
     // x % 32 == 0 holds in two lanes of each console wave.
-    let threads = [128, 1, 1];
     let compare = [vop2(0x1B, 8, inline(31), 7), vopc(0xC2, ZERO, 8)];
-    let (_, waves, _) = build(&serial_prefix(threads, &compare), threads, 512);
-    assert_eq!(
-        waves,
-        Waves::Wave64("a cross-lane value where the two 32-lane halves do not meet")
-    );
+    check_lanes_sharing_a_first_lane([128, 1, 1], &compare);
 }
 
 /// Each thread adds 2 to v5 x % 4 times in a loop of its own (as Sort's
@@ -944,13 +956,9 @@ fn lanes_outside_exec_take_slot_0_in_a_waterfall_in_lockstep() {
 /// which skips the region. Each there stores how many of them have bit 1
 /// (`s_bcnt1` of a mask written there), how many of those lie below it
 /// (`v_mbcnt`), the first (`s_ff1`), the first lane's v11
-/// (`v_readfirstlane`) and lane 50's (`v_readlane`). With `barrier`, an
-/// `s_barrier` first.
-fn waves_apart(threads: [u32; 3], barrier: bool) -> Vec<u32> {
+/// (`v_readfirstlane`) and lane 50's (`v_readlane`).
+fn waves_apart(threads: [u32; 3]) -> Vec<u32> {
     let mut w = prologue(threads);
-    if barrier {
-        w.push(sopp(0x0A, 0));
-    }
     for r in [5, 6, 7, 10, 12] {
         w.extend(mov_k(r, DEAD));
     }
@@ -984,7 +992,7 @@ fn waves_apart(threads: [u32; 3], barrier: bool) -> Vec<u32> {
 }
 
 fn check_waves_apart(threads: [u32; 3]) {
-    let (shader, waves, _) = build(&waves_apart(threads, false), threads, 0);
+    let (shader, waves, _) = build(&waves_apart(threads), threads, 0);
     assert_eq!(waves, Waves::Lockstep, "{threads:?}");
     let total: u32 = threads.iter().product();
     let inside = |f: u32| f % 64 >= 24 * (f / 64);
@@ -1017,14 +1025,63 @@ fn waves_of_a_group_that_branch_apart_are_the_console_waves_in_turn() {
     check_waves_apart([8, 16, 1]);
 }
 
+/// [`waves_apart`] with LDS, which makes its console waves meet: then
+/// each thread writes LDS[index] = index + 1000 and reads LDS[index ^ 33]
+/// (the other half of its console wave, in program order with no barrier
+/// on the console), and after an `s_barrier` LDS[index + 64] (the next
+/// console wave's, around the group).
+fn waves_apart_meeting(threads: [u32; 3]) -> Vec<u32> {
+    let total: u32 = threads.iter().product();
+    let mut w = waves_apart(threads);
+    assert_eq!(w.pop(), Some(S_ENDPGM));
+    w.push(vop2(0x1A, 20, inline(2), 3));
+    w.extend([vop2(0x25, 21, 255, 3), 1000]);
+    w.extend(ds(0x0D, 0, 20, 21, 0));
+    w.push(vop2(0x1D, 22, inline(33), 3));
+    w.push(vop2(0x1A, 22, inline(2), 22));
+    w.extend(ds(0x36, 23, 22, 0, 0));
+    w.push(sopp(0x0A, 0));
+    w.extend([vop2(0x25, 24, 255, 3), 64]);
+    w.extend([vop2(0x1B, 24, 255, 24), total - 1]);
+    w.push(vop2(0x1A, 24, inline(2), 24));
+    w.extend(ds(0x36, 25, 24, 0, 0));
+    w.extend(store(23, 4, 20));
+    w.extend(store(25, 4, 24));
+    w.push(S_ENDPGM);
+    w
+}
+
 #[test]
-fn waves_of_a_group_with_a_barrier_keep_64_lane_waves() {
-    let threads = [16, 16, 1];
-    let (_, waves, _) = build(&waves_apart(threads, true), threads, 0);
-    assert_eq!(
-        waves,
-        Waves::Wave64("a lane mask read as data where the two 32-lane halves do not meet")
-    );
+fn waves_of_a_group_that_branch_apart_and_share_lds_are_the_console_waves() {
+    for threads in [[16, 16, 1], [8, 16, 1], [1024, 1, 1]] {
+        let total: u32 = threads.iter().product();
+        let (shader, waves, _) = build(&waves_apart_meeting(threads), threads, total * 4);
+        assert_eq!(waves, Waves::Lockstep, "{threads:?}");
+        let inside = |f: u32| f % 64 >= 24 * (f / 64);
+        for (label, got) in run(&shader, total * SLOTS) {
+            for f in 0..total {
+                let wave = f / 64 * 64;
+                let apart = if inside(f) {
+                    let lanes = || (wave..wave + 64).filter(|&g| inside(g));
+                    let marked: Vec<u32> = lanes().filter(|&g| g & 2 != 0).collect();
+                    let below = marked.iter().filter(|&&g| g < f).count() as u32;
+                    let first = lanes().next().unwrap();
+                    [
+                        marked.len() as u32,
+                        below,
+                        marked[0] % 64,
+                        256 + first,
+                        256 + wave + 50,
+                    ]
+                } else {
+                    [DEAD; 5]
+                };
+                let lds = [(f ^ 33) + 1000, (f + 64) % total + 1000];
+                let want = [&apart[..], &lds[..]].concat();
+                assert_eq!(slots(&got, f, 7), want, "{label} {threads:?}: thread {f}");
+            }
+        }
+    }
 }
 
 /// `op_dpp vdst, vsrc0, vsrc1` (VOP2) with DPP8 lane selects `sel`.

@@ -42,6 +42,14 @@
 //!   thread = turn * 64 + its own); the console's `s_endpgm` ends a turn.
 //!   Waves that never wait for each other may run in any order on the
 //!   console, this one included.
+//! * **Pairs.** A group of several console waves that may meet (LDS, the
+//!   console's barriers) runs in lockstep wave by wave: each console wave's
+//!   halves follow its own branches, which another wave may not take, so
+//!   where a one-wave group's halves take a group barrier (around an
+//!   exchange, before an LDS access), the two halves of one console wave
+//!   wait for each other alone, through a counter of their own in
+//!   group-shared memory; the console's `s_barrier` stays a group barrier.
+//!   Both host waves of a pair belong to one host group, so both run.
 //! * **LDS of a one-wave group.** The console compiler leaves out barriers
 //!   when the group is one wave, which its two halves no longer are: every
 //!   LDS access gets a barrier before it, so they happen in program order
