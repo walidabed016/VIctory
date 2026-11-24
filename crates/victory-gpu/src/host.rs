@@ -1942,6 +1942,8 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::dump_drops(&drops, frames);
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -1978,6 +1980,14 @@ impl Meter {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames
+                    );
+                }
+                if drops.len() > 40 {
+                    let rest: u64 = drops[40..].iter().map(|(_, n)| n).sum();
+                    tracing::info!(
+                        "dropped {:.1}/frame for {} more reasons (VICTORY_DROPS=<file> lists them)",
+                        rest as f64 / frames,
+                        drops.len() - 40
                     );
                 }
             }

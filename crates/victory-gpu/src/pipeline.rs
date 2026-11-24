@@ -327,6 +327,36 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
     drops
 }
 
+/// With `VICTORY_DROPS=<file>` (diagnostics): every reason of the drops
+/// taken over `frames` frames, per frame, appended to the file (emptied at
+/// the first call) under the frame presented last. Every meter window is
+/// written; the log shows the first 40 reasons of one window in five.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dump_drops(drops: &[(String, u64)], frames: f64) {
+    use std::io::Write as _;
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(file) = FILE.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_DROPS")?;
+        match std::fs::File::create(&path) {
+            Ok(file) => Some(Mutex::new(file)),
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "VICTORY_DROPS: cannot create the file");
+                None
+            }
+        }
+    }) else {
+        return;
+    };
+    let mut text = format!("frame {} ({frames} frames)\n", crate::queue::presented());
+    for (why, n) in drops {
+        text += &format!("{:.1}\t{why}\n", *n as f64 / frames);
+    }
+    let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = file.write_all(text.as_bytes()) {
+        tracing::warn!(error = %e, "VICTORY_DROPS: cannot write the file");
+    }
+}
+
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {
