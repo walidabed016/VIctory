@@ -1112,10 +1112,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                once!(
+                    dimension = resource[0],
+                    unordered,
+                    "placed texture view without a host texture"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -1131,19 +1132,40 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use): what a dispatch writes through one, later draws read through the
+/// other.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
+    const UNORDERED: u32 = 0x4;
+    // The description's flags, after its alignment, size and format words.
+    let writable = resource[12] & UNORDERED != 0;
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource);
+    #[cfg(feature = "diagnostics")]
+    if *unordered || texture.is_none() || resource[12] & 0x7 != 0 {
+        let program = crate::pipeline::host_pipeline(BINDING.get() as crate::object::This)
+            .map_or("none", |p| p.name.as_str());
+        let what = if *unordered {
+            "placed unordered view"
+        } else {
+            "placed view"
+        };
+        crate::resource::census(what, address, resource, texture.is_some(), program);
+    }
+    let words = desc[..10].try_into().ok();
+    match (*unordered, texture) {
+        (false, Some(texture)) => Some(View::Shader(texture as usize, words)),
+        (true, Some(texture)) if writable => Some(View::Unordered(texture as usize, 0, words)),
+        _ => None,
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -1396,6 +1418,45 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// An unordered access view of a texture the title placed in its memory
+    /// is a view of the host texture made for that memory, as its shader
+    /// views are, when the texture's description allows unordered access.
+    #[test]
+    fn placed_texture_uavs_view_the_host_texture() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = Box::leak(vec![0u8; 0x3_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        // A 64x64 R8G8B8A8_UNORM 2D texture, one mip, flags at word 12.
+        let mut texture = [0u32; 14];
+        texture[..13].copy_from_slice(&[3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0, 0x4]);
+        // A 2D view of it at `address`.
+        let mut words = [0u32; 16];
+        words[..2].copy_from_slice(&[28, 4]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        let uav = View::Placed(true, texture, words);
+        let Some(View::Unordered(made, 0, Some(desc))) = placed_texture(&uav) else {
+            panic!("no unordered view of the placed texture");
+        };
+        assert_eq!(desc[..2], [28, 4]);
+        let srv = placed_texture(&View::Placed(false, texture, words));
+        assert!(
+            matches!(srv, Some(View::Shader(r, _)) if r == made),
+            "one host texture"
+        );
+        assert!(make(&uav, heap.cpu(0)).is_some());
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        texture[12] = 0;
+        assert!(placed_texture(&View::Placed(true, texture, words)).is_none());
+        assert!(placed_texture(&View::Placed(false, texture, words)).is_some());
     }
 
     /// The record stride of a buffer view is its element size as the

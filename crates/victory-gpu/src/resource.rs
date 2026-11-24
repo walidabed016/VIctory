@@ -972,7 +972,56 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if desc.dimension != BUFFER && (desc.flags & 7 != 0 || resource.host.is_none()) {
+        // SAFETY: a description is 56 bytes, as 14 words.
+        let words = unsafe {
+            std::ptr::from_ref(&desc)
+                .cast::<[u32; 14]>()
+                .read_unaligned()
+        };
+        let made = resource.host.is_some();
+        census("texture", resource.data() as u64, &words, made, "");
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+/// Logs, once per kind, address and description, a texture the title
+/// renders to or writes (`what` "texture") or one the host could not make,
+/// and a view of a texture the title placed in memory itself (diagnostics):
+/// where it is, what it is, whether the host made it, and the program the
+/// view was made for. Offline these lines show which placed views alias
+/// which render targets.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn census(
+    what: &'static str,
+    address: u64,
+    desc: &[u32; 14],
+    made: bool,
+    program: &str,
+) {
+    type Seen = std::collections::HashSet<(&'static str, u64, [u32; 14])>;
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen
+        .get_or_insert_with(Seen::default)
+        .insert((what, address, *desc))
+    {
+        return;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let bytes = footprint(&d).map_or(0, |f| f.size);
+    tracing::info!(
+        "census: {what} at {address:#x}+{bytes:#x} {}x{}x{} mips {} f{} layout {:#x} flags {:#x}, host {made}, program {program}",
+        d.width,
+        d.height,
+        d.depth_or_array_size,
+        d.mip_levels,
+        d.format,
+        d.layout,
+        d.flags
+    );
 }
 
 #[cfg(windows)]
