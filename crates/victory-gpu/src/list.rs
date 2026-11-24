@@ -658,7 +658,7 @@ fn copy_to_buffer(
         return Err("footprint off the host's placement alignment");
     }
     if crate::texture::title_written(texture) {
-        crate::texture::upload(list, src.resource, texture);
+        crate::texture::upload(list, src.resource);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     shadow.refresh(list, address, bytes);
