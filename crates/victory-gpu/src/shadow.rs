@@ -966,6 +966,8 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
             tracing::debug!(start = format_args!("{start:#x}"), len, "buffer used in place");
         }
         let memory = Memory::Linear(start as *mut u8);
+        #[cfg(feature = "diagnostics")]
+        made(gpu, len as u64, start as u64, len as u64);
         let shadow = Shadow::new(buffer, memory, gpu, start as u64, len as u64, true);
         entry.shadow = Some(Arc::new(shadow));
     }
@@ -994,10 +996,27 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
                 "buffer copied to the host"
             );
         }
+        #[cfg(feature = "diagnostics")]
+        made(gpu, len.next_multiple_of(1 << 16), key.0, len);
         let shadow = Shadow::new(buffer, Memory::Linear(data), gpu, key.0, len, false);
         entry.shadow = Some(Arc::new(shadow));
     }
     Some(entry.shadow.clone())
+}
+
+/// Diagnostics: the host range (start, bytes) and title range (start,
+/// bytes) of every title buffer's host copy made, newest last, for
+/// device-removed reports to name a copy of a buffer the title has
+/// released ([`near`]).
+#[cfg(feature = "diagnostics")]
+static MADE: Mutex<Vec<[u64; 4]>> = Mutex::new(Vec::new());
+
+/// Diagnostics: a title buffer's host copy was made (see [`MADE`]).
+#[cfg(feature = "diagnostics")]
+fn made(gpu: u64, bytes: u64, start: u64, len: u64) {
+    MADE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push([gpu, bytes, start, len]);
 }
 
 /// The host copy a root view at `address` reads, and how many of the
@@ -1523,6 +1542,22 @@ pub(crate) fn near(va: u64) -> String {
         ),
         None => "; no title memory copy below it".into(),
     };
+    // Diagnostics: outside every copy held now, the newest copy made there
+    // is one of a buffer the title has released.
+    #[cfg(feature = "diagnostics")]
+    if !below.is_some_and(|&(gpu, _, len)| va < gpu + len)
+        && let Some(&[gpu, bytes, start, len]) = MADE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|c| (c[0]..c[0] + c[1]).contains(&va))
+    {
+        text.push_str(&format!(
+            "; inside the host copy made for title {start:#x}+{len:#x} at host {gpu:#x}+{bytes:#x}, offset {:#x}, a buffer the title has released",
+            va - gpu
+        ));
+    }
     if let Some(slab) = m
         .slabs
         .values()
@@ -1731,6 +1766,28 @@ pub(crate) mod tests {
             return p;
         }
         0
+    }
+
+    /// A device-removed report names the copy of a released title buffer
+    /// that holds the faulting address (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn faults_in_copies_of_released_buffers_are_named() {
+        if host().is_none() {
+            return;
+        }
+        let memory = vec![0u8; 3 << 16];
+        let start = (memory.as_ptr() as u64).next_multiple_of(1 << 16);
+        register(start as usize, start, 0x1_0000);
+        let gpu = find(start, 16).expect("a copy").gpu;
+        unregister(start as usize, start);
+        let text = near(gpu + 0x40);
+        assert!(
+            text.contains(&format!(
+                "inside the host copy made for title {start:#x}+0x10000"
+            )),
+            "{text}"
+        );
     }
 
     pub(crate) fn release(p: usize) {
