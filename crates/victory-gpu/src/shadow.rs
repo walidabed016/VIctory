@@ -83,6 +83,12 @@ pub(crate) struct Shadow {
     /// for a buffer's copy; for a mirror slab, which spans a GiB of title
     /// memory, one per region written.
     before: Mutex<Vec<(usize, Vec<u8>)>>,
+    /// In place of snapshots over view memory ([`Shadow::arm`]): the regions
+    /// whose title blocks are armed for the submission's copy-back, as
+    /// (from, to, asking) offsets, and the blocks of them not armed, kept as
+    /// the copy held them (by title block).
+    armed: Mutex<Vec<(usize, usize, u64)>>,
+    kept: Mutex<BTreeMap<usize, Vec<u8>>>,
     /// The buffer is title memory itself ([`in_place`]): nothing to copy.
     in_place: bool,
 }
@@ -139,6 +145,59 @@ fn split<T: Send>(n: usize, len: usize, f: impl Fn(std::ops::Range<usize>) -> T 
             .into_iter()
             .map(|p| p.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
             .collect()
+    })
+}
+
+/// What a copy held before a submission, for its copy-back: snapshots
+/// (offset, bytes), blocks kept (title block, bytes) and armed regions
+/// (from, to, asking; [`Shadow::arm`]).
+struct Was<'a> {
+    snapshots: &'a [(usize, Vec<u8>)],
+    kept: &'a BTreeMap<usize, Vec<u8>>,
+    armed: &'a [(usize, usize, u64)],
+    start: usize,
+}
+
+enum Before<'a> {
+    Bytes(&'a [u8]),
+    /// As the armed title block holds it, armed at this asking.
+    Armed(u64),
+}
+
+impl Was<'_> {
+    /// What the copy held at offsets `[at, at + n)` (in one title block),
+    /// if anything tells.
+    fn at(&self, at: usize, n: usize) -> Option<Before<'_>> {
+        if let Some((taken, bytes)) = self
+            .snapshots
+            .iter()
+            .find(|(t, b)| *t <= at && at + n <= t + b.len())
+        {
+            return Some(Before::Bytes(&bytes[at - taken..at - taken + n]));
+        }
+        let block = (self.start + at) / PAGE;
+        if let Some(bytes) = self.kept.get(&block) {
+            let first = (block * PAGE).max(self.start) - self.start;
+            return Some(Before::Bytes(&bytes[at - first..at - first + n]));
+        }
+        self.armed
+            .iter()
+            .find(|&&(a, b, _)| a <= at && at + n <= b)
+            .map(|&(.., asked)| Before::Armed(asked))
+    }
+}
+
+/// Whether copies of view memory that shaders write arm its blocks instead
+/// of taking snapshots ([`Shadow::arm`]); `VICTORY_EAGER_SNAPSHOTS` turns
+/// it off.
+fn armed_snapshots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_EAGER_SNAPSHOTS").is_none();
+        if !on {
+            tracing::info!("copies shaders write are snapshotted whole (VICTORY_EAGER_SNAPSHOTS)");
+        }
+        on
     })
 }
 
@@ -228,6 +287,8 @@ impl Shadow {
             shaders_write: AtomicBool::new(false),
             pending: Mutex::default(),
             before: Mutex::default(),
+            armed: Mutex::default(),
+            kept: Mutex::default(),
             in_place,
         }
     }
@@ -360,6 +421,10 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        if from < to && armed_snapshots() && crate::watch::view(self.start as usize + from) {
+            self.arm(from, to);
+            return;
+        }
         let w = WINDOW as usize;
         let joins = |at: usize, n: usize| at <= to + w && from <= at + n + w;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -405,6 +470,49 @@ impl Shadow {
         before.push((start, grown));
     }
 
+    /// [`Shadow::writing`] over view memory: no snapshot. The title blocks
+    /// of offsets `[from, to)` are armed instead ([`crate::watch::arm`]):
+    /// title memory holds what the copy does until the title writes a
+    /// block, whose bytes are saved first. Blocks that cannot be armed
+    /// (written since the copy took them, at the range's ends, not mapped)
+    /// are kept as the copy holds them.
+    fn arm(&self, from: usize, to: usize) {
+        let start = self.start as usize;
+        let (asked, loose) = {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let base = start / PAGE;
+            crate::watch::arm(start + from, start + to, |page| {
+                copied.get(page.wrapping_sub(base)).copied().unwrap_or(0)
+            })
+        };
+        self.armed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((from, to, asked));
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let (started, had) = (std::time::Instant::now(), kept.len());
+        for block in loose.into_iter().flat_map(|(a, b)| a..b) {
+            kept.entry(block).or_insert_with(|| self.block_bytes(block));
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::cost(
+            crate::copystat::Op::Snapshot,
+            started,
+            start + from,
+            ((kept.len() - had) * PAGE) as u64,
+        );
+    }
+
+    /// The copy's bytes of title block `block` (64 KiB), cut to the buffer.
+    fn block_bytes(&self, block: usize) -> Vec<u8> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (a, b) = ((block * PAGE).max(start), ((block + 1) * PAGE).min(end));
+        let mut bytes = Vec::with_capacity(b - a);
+        self.gather(a - start, b - start, &mut bytes);
+        bytes
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote in the
     /// ranges it declared (address, bytes; [`Shadow::writing`]) back into
     /// title memory (unmapped pages left alone), and only those: the title's
@@ -438,15 +546,22 @@ impl Shadow {
             return 0;
         }
         let mut snapshots = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut armed = self.armed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let was = Was {
+            snapshots: &snapshots,
+            kept: &kept,
+            armed: &armed,
+            start,
+        };
         let mut written = 0;
         for (from, to) in merged {
-            if let Some((taken, before)) = snapshots
-                .iter()
-                .find(|(taken, before)| *taken <= from && to <= taken + before.len())
-            {
-                written += self.write_back(from, to, &before[from - taken..to - taken]);
-            }
+            written += self.write_back(from, to, &was);
         }
+        // The submission is done with its armed blocks (its copy-back
+        // disarms them all).
+        kept.clear();
+        armed.clear();
         // Every submitted step that declared the ranges is done with them
         // (one submission runs at a time), and the snapshots with the last.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -460,10 +575,10 @@ impl Shadow {
     }
 
     /// [`Shadow::copy_back`] of offsets `[from, to)`, whose bytes before
-    /// the submission were `before`: by 64 KiB piece, the copy compared
-    /// with them (on several threads for big ranges), title memory read
-    /// only where the GPU wrote.
-    fn write_back(&self, from: usize, to: usize, before: &[u8]) -> usize {
+    /// the submission `was` tells: by 64 KiB piece, the copy compared with
+    /// them (on several threads for big ranges; armed blocks as title memory
+    /// holds them), title memory read only where the GPU wrote.
+    fn write_back(&self, from: usize, to: usize, was: &Was) -> usize {
         const PIECE: usize = 64 << 10;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -481,24 +596,61 @@ impl Shadow {
             }
             at += n;
         }
+        // Armed blocks still mapped are read in place while this is held.
+        let (mapping, mapped) =
+            crate::watch::mapped((start + from) / PAGE, (start + to).div_ceil(PAGE));
         let changed: Vec<usize> = split(pieces.len(), to - from, |part| {
             part.filter(|&i| {
                 let (at, host, n) = pieces[i];
                 // SAFETY: inside the copy's memory, which the GPU is done
                 // with; only this thread writes it.
                 let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
-                host != &before[at - from..at - from + n]
+                match was.at(at, n) {
+                    Some(Before::Bytes(before)) => host != before,
+                    Some(Before::Armed(_)) => {
+                        let block = (start + at) / PAGE;
+                        !mapped.iter().any(|&(a, b)| a <= block && block < b) || {
+                            // SAFETY: an armed block, mapped while `mapping`
+                            // is held.
+                            host != unsafe {
+                                std::slice::from_raw_parts((start + at) as *const u8, n)
+                            }
+                        }
+                    }
+                    None => false,
+                }
             })
             .collect::<Vec<_>>()
         })
         .concat();
+        drop(mapping);
         let mut title = vec![0u8; PIECE];
         let (mut written, mut synced) = (0, Vec::new());
         for i in changed {
             let (at, host, n) = pieces[i];
+            let saved;
+            let old: &[u8] = match was.at(at, n) {
+                Some(Before::Bytes(before)) => before,
+                Some(Before::Armed(asked)) => {
+                    let block = (start + at) / PAGE;
+                    let Some(bytes) = crate::watch::before(block, asked) else {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::cost(
+                            crate::copystat::Op::Missed,
+                            std::time::Instant::now(),
+                            start + at,
+                            n as u64,
+                        );
+                        continue;
+                    };
+                    saved = bytes;
+                    let first = start + at - block * PAGE;
+                    &saved[first..first + n]
+                }
+                None => continue,
+            };
             // SAFETY: as above.
             let host = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, n) };
-            let old = &before[at - from..at - from + n];
             let title = &mut title[..n];
             if !crate::host::read_into((start + at) as *const u8, title) {
                 continue;
@@ -716,6 +868,21 @@ impl Shadow {
             let (a, b) = ((from - start).max(*taken), (to - start).min(*taken + bytes.len()));
             if a < b {
                 self.fill(a, &mut bytes[a - *taken..b - *taken]);
+            }
+        }
+        // Armed blocks refreshed since: the copy no longer holds what title
+        // memory does when the title writes them next, so they are kept.
+        let armed = self.armed.lock().unwrap_or_else(|e| e.into_inner());
+        if !armed.is_empty() {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for block in from / PAGE..to.div_ceil(PAGE) {
+                let (a, b) = (
+                    (block * PAGE).saturating_sub(start),
+                    (block + 1) * PAGE - start,
+                );
+                if armed.iter().any(|&(x, y, _)| x < b && a < y) {
+                    kept.insert(block, self.block_bytes(block));
+                }
             }
         }
         to - from
@@ -1636,12 +1803,13 @@ pub(crate) mod tests {
         if !gpu() {
             return;
         }
-        // Two views: the buffer is copied (a heap wraps one allocation).
-        let at = (961 * SLAB) as usize - 256 * MIB;
-        let made = views(at, &[24 * MIB, 24 * MIB]);
-        assert_eq!(made.len(), 2, "no free address for test views");
-        register(usize::MAX - 7, at as u64, 48 << 20);
-        let s = find(at as u64, 48 << 20).unwrap();
+        // Write-watched memory (view memory is armed instead), its last page
+        // not committed: the buffer is copied.
+        let len = (48 << 20) + (64 << 10);
+        let at = title_memory(500, 256 * MIB, len, 48 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 7, at as u64, len as u64);
+        let s = find(at as u64, len as u64).unwrap();
         assert!(!s.in_place);
         let declared = [
             (at + MIB, 64 << 10),
@@ -1674,7 +1842,7 @@ pub(crate) mod tests {
         }
         assert_eq!(s.copy_back(&declared), 2 * (64 << 10));
         for w in written_at {
-            // SAFETY: our views.
+            // SAFETY: our test memory.
             assert_eq!(unsafe { (w as *const u32).read() }, 0xfeed);
             // SAFETY: as above.
             assert_eq!(unsafe { ((w + 4) as *const u32).read() }, word(w + 4));
@@ -1682,6 +1850,66 @@ pub(crate) mod tests {
         assert!(s.before.lock().unwrap().is_empty());
         drop(s);
         unregister(usize::MAX - 7, at as u64);
+        release(at);
+    }
+
+    /// A copy of view memory that shaders write takes no snapshot: its
+    /// title blocks are armed, and the title's first write to one during
+    /// the submission saves the block first. Copy-back writes what the GPU
+    /// wrote and leaves the title's own writes: in blocks written during
+    /// the submission, and in one written after the refresh but before
+    /// arming (kept as the copy held it).
+    #[test]
+    fn a_copy_of_view_memory_arms_its_blocks_instead_of_a_snapshot() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = (962 * SLAB) as usize - 256 * MIB;
+        let made = views(at, &[24 * MIB, 24 * MIB]);
+        assert_eq!(made.len(), 2, "no free address for test views");
+        register(usize::MAX - 8, at as u64, 48 << 20);
+        let s = find(at as u64, 48 << 20).unwrap();
+        assert!(!s.in_place);
+        let declared = [(at + MIB, 32 * MIB)];
+        crate::watch::forget_asked();
+        s.update(at + MIB, 32 * MIB);
+        let early = at + 2 * MIB + 100;
+        // SAFETY: our views (guarded: our handler opens the block).
+        unsafe { (early as *mut u32).write(0xe) };
+        s.writing(at + MIB, 32 * MIB);
+        assert!(s.before.lock().unwrap().is_empty(), "no snapshot");
+        let kept: Vec<usize> = s.kept.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [early / PAGE]);
+        // The GPU writes a word in a block the title leaves alone, one in a
+        // block the title writes elsewhere, one where the title writes the
+        // same word (the GPU's wins), and one in the block written early.
+        let gpu = [at + 4 * MIB, at + 8 * MIB + 64, at + 12 * MIB, early + 8];
+        for w in gpu {
+            // SAFETY: inside the copy's memory.
+            unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
+        }
+        let title = [at + 8 * MIB + 128, at + 12 * MIB, at + 20 * MIB];
+        for w in title {
+            // SAFETY: as above.
+            unsafe { (w as *mut u32).write(7) };
+        }
+        assert_eq!(s.copy_back(&declared), 4 * (64 << 10));
+        crate::watch::disarm();
+        // SAFETY: our views.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        for w in gpu {
+            assert_eq!(read(w), 0xfeed);
+        }
+        assert_eq!(read(at + 8 * MIB + 128), 7);
+        assert_eq!(read(at + 20 * MIB), 7);
+        assert_eq!(read(early), 0xe);
+        assert_eq!(read(at + 4 * MIB + 4), word(at + 4 * MIB + 4));
+        // Where compared, the copy holds what title memory does.
+        assert_eq!(held(&s, at + 8 * MIB + 128), Some(7));
+        assert!(s.kept.lock().unwrap().is_empty() && s.armed.lock().unwrap().is_empty());
+        drop(s);
+        unregister(usize::MAX - 8, at as u64);
         unmap(&made);
     }
 

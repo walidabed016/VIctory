@@ -19,7 +19,7 @@
 //! (none is known to).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -330,12 +330,23 @@ struct Guards {
     /// not mapped at all (placeholders in the title's tiled heaps), which
     /// read as zeros until the runtime maps them ([`title_memory_remapped`]).
     clean: Blocks,
+    /// Blocks armed for the submission's copy-back ([`arm`]): the first
+    /// write to one saves its bytes before it is opened.
+    armed: Blocks,
+    /// Those saved, by block.
+    saved: BTreeMap<usize, Vec<u8>>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: Blocks(BTreeMap::new()),
     clean: Blocks(BTreeMap::new()),
+    armed: Blocks(BTreeMap::new()),
+    saved: BTreeMap::new(),
 });
+
+/// Held to read armed blocks without the guards' lock ([`mapped`]); the
+/// runtime's remappings wait for it.
+static MAPPING: RwLock<()> = RwLock::new(());
 
 /// A set of blocks as runs (first, end), apart and in order, so that a
 /// check of a range costs what it holds of runs, not its blocks (the
@@ -343,6 +354,13 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 struct Blocks(BTreeMap<usize, usize>);
 
 impl Blocks {
+    fn contains(&self, block: usize) -> bool {
+        self.0
+            .range(..=block)
+            .next_back()
+            .is_some_and(|(_, &end)| block < end)
+    }
+
     /// The runs that hold blocks of `[from, to)`, whole.
     fn touching(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let first = self
@@ -498,6 +516,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let runs = g.protected.within(start / BLOCK, end.div_ceil(BLOCK));
     for &(from, to) in &runs {
+        save(g, from, to);
         g.protected.remove(from, to);
         g.clean.remove(from, to);
         for block in from..to {
@@ -507,6 +526,123 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         }
     }
     !runs.is_empty()
+}
+
+/// Saves the bytes of the armed blocks of guarded blocks `[from, to)` not
+/// saved yet (guarded: mapped, and as they were armed).
+fn save(g: &mut Guards, from: usize, to: usize) {
+    for (a, b) in g.armed.within(from, to) {
+        for block in a..b {
+            if g.saved.contains_key(&block) {
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            // SAFETY: a guarded block: mapped and readable.
+            let bytes = unsafe { std::slice::from_raw_parts((block * BLOCK) as *const u8, BLOCK) };
+            g.saved.insert(block, bytes.to_vec());
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::cost(
+                crate::copystat::Op::Saved,
+                started,
+                block * BLOCK,
+                BLOCK as u64,
+            );
+        }
+    }
+}
+
+/// Arms title memory `[start, end)` for a submission whose shaders write a
+/// copy of it, in place of a snapshot of the copy: until [`disarm`], the
+/// first write to an armed block saves its bytes first, so what the copy
+/// held before the submission is the block's saved bytes or the block
+/// itself ([`before`]). Armed are the whole blocks guarded and not written
+/// since, nor since the copy took them (`copied`: the asking after which
+/// the copy took a page, 0 if never). Returns the asking now and the runs
+/// of blocks of the range not armed.
+pub(crate) fn arm(
+    start: usize,
+    end: usize,
+    copied: impl Fn(usize) -> u64,
+) -> (u64, Vec<(usize, usize)>) {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = guards();
+    let (first, last) = (start.div_ceil(BLOCK), end / BLOCK);
+    let mut armed = Vec::new();
+    for (a, b) in g.clean.within(first, last.max(first)) {
+        for (a, b) in g.protected.within(a, b) {
+            let mut run: Option<usize> = None;
+            for block in a..=b {
+                let current = block < b && {
+                    let taken = copied(block * BLOCK / PAGE);
+                    let written = j.written.get(&(block * BLOCK / PAGE)).copied().unwrap_or(0);
+                    taken != 0 && written <= taken
+                };
+                match (current, run) {
+                    (true, None) => run = Some(block),
+                    (false, Some(from)) => {
+                        armed.push((from, block));
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for &(a, b) in &armed {
+        g.armed.insert(a, b);
+    }
+    let (mut loose, mut at) = (Vec::new(), start / BLOCK);
+    for (a, b) in armed {
+        if at < a {
+            loose.push((at, a));
+        }
+        at = b;
+    }
+    if at < end.div_ceil(BLOCK) {
+        loose.push((at, end.div_ceil(BLOCK)));
+    }
+    (j.asked, loose)
+}
+
+/// The runs of armed blocks of `[from, to)` (block numbers), and a lock
+/// that keeps them mapped while held: the runtime's remappings wait.
+pub(crate) fn mapped(
+    from: usize,
+    to: usize,
+) -> (std::sync::RwLockReadGuard<'static, ()>, Vec<(usize, usize)>) {
+    let mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    let runs = guards().armed.within(from, to);
+    (mapping, runs)
+}
+
+/// What armed block `block` held when armed at asking `asked`: its saved
+/// bytes, or the block's own if still guarded and not written since; `None`
+/// if neither (written where no guard saw it: shaders in place, or a copy
+/// of ours).
+pub(crate) fn before(block: usize, asked: u64) -> Option<Vec<u8>> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let g = guards();
+    if let Some(bytes) = g.saved.get(&block) {
+        return Some(bytes.clone());
+    }
+    let page = block * BLOCK / PAGE;
+    let kept = g.armed.contains(block)
+        && g.protected.contains(block)
+        && g.clean.contains(block)
+        && j.written.get(&page).is_none_or(|&w| w <= asked);
+    kept.then(|| {
+        // SAFETY: an armed guarded block: mapped, and held still by the
+        // lock (a write to it waits for it in our handler, a remapping too).
+        unsafe { std::slice::from_raw_parts((block * BLOCK) as *const u8, BLOCK) }.to_vec()
+    })
+}
+
+/// After a submission's copy-back: nothing is armed.
+pub(crate) fn disarm() {
+    let mut g = guards();
+    g.armed = Blocks(BTreeMap::new());
+    g.saved.clear();
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -521,8 +657,16 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let _mapping = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    // Armed blocks keep what they held (the runtime calls this before it
+    // unmaps a view, and guarded blocks are mapped), and are armed no more:
+    // their bytes come from the saved copy alone.
+    for (a, b) in g.protected.within(from, to) {
+        save(&mut g, a, b);
+    }
+    g.armed.remove(from, to);
     g.protected.remove(from, to);
     // Unmapped blocks are clean without being guarded.
     g.clean.remove(from, to);
@@ -824,6 +968,52 @@ mod tests {
             VirtualFree(p as *mut _, 0, MEM_RELEASE);
             VirtualFree(h as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// An armed block tells what it held when armed: itself while guarded,
+    /// its saved bytes once the title writes it or the runtime remaps it,
+    /// nothing once something no guard sees wrote it, or after disarming.
+    #[test]
+    fn armed_blocks_tell_what_they_held() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        let _serial = serial();
+        // SAFETY: a pagefile section of four blocks, mapped read-write.
+        let v = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK).Value as usize
+        };
+        assert_ne!(v, 0);
+        // SAFETY: our view, not guarded yet.
+        unsafe { std::slice::from_raw_parts_mut(v as *mut u8, 4 * BLOCK).fill(1) };
+        forget_asked();
+        let (now, _) = writes(v, v + 4 * BLOCK, true).expect("view memory");
+        let (asked, loose) = arm(v, v + 4 * BLOCK, |_| now);
+        assert!(loose.is_empty());
+        let b = v / BLOCK;
+        let ones = vec![1u8; BLOCK];
+        assert_eq!(before(b, asked), Some(ones.clone()));
+        // SAFETY: our view (guarded: our handler saves, then opens).
+        unsafe { ((v + BLOCK + 8) as *mut u8).write(2) };
+        assert_eq!(before(b + 1, asked), Some(ones.clone()));
+        title_memory_remapped(v + 2 * BLOCK, BLOCK);
+        assert_eq!(before(b + 2, asked), Some(ones.clone()));
+        wrote(v + 3 * BLOCK, v + 4 * BLOCK);
+        assert_eq!(before(b + 3, asked), None);
+        disarm();
+        assert_eq!(before(b, asked), None);
+        title_memory_remapped(v, 4 * BLOCK);
+        // The view stays: the journal keeps its pages, which another test
+        // given the same addresses would read as its own.
     }
 
     /// Committed memory is told by the working set where it answers (view

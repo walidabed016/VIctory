@@ -219,8 +219,14 @@ pub(crate) enum Op {
     Compare,
     /// Bytes written back into title memory.
     WriteBack,
+    /// Armed blocks of title memory saved on their first write (by the
+    /// thread that wrote).
+    Saved,
+    /// Bytes of copies shaders wrote left to the title: nothing told what
+    /// they held before.
+    Missed,
 }
-const OPS: usize = 12;
+const OPS: usize = 14;
 const OP_NAMES: [&str; OPS] = [
     "asks",
     "asks finding writes",
@@ -234,6 +240,8 @@ const OP_NAMES: [&str; OPS] = [
     "snapshots",
     "compares",
     "writes back",
+    "saves on write",
+    "left to the title",
 ];
 
 /// Calls, microseconds and bytes per caller and operation, since the last

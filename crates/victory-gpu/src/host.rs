@@ -678,6 +678,7 @@ impl Host {
             let written = shadow.copy_back(declared);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
+        crate::watch::disarm();
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
