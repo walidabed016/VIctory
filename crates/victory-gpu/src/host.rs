@@ -43,9 +43,9 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     /// Resources heap slots stopped viewing (see [`Host::retire`]).
     retired: Mutex<Vec<ID3D12Resource>>,
-    /// The list copying host copies into their VRAM twins and back
-    /// ([`Host::twin_copies`]), made when first needed.
-    twin_list: Mutex<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
+    /// The lists copying host copies into their VRAM twins and back
+    /// ([`Host::twin_list`]), made when first needed.
+    twin_lists: Mutex<Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -78,9 +78,10 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
-/// With VRAM twins ([`crate::shadow::twins_on`]): copies into them before
-/// submissions and out of them before copy-back (microseconds and bytes
-/// each), since the last frame-rate line.
+/// With VRAM twins ([`crate::shadow::twins_on`]): microseconds recording
+/// the copies around submissions, bytes copied into the twins, bytes
+/// compared on the GPU and bytes copied out of them whole, since the last
+/// frame-rate line.
 pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -236,7 +237,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             retired: Mutex::default(),
-            twin_list: Mutex::new(None),
+            twin_lists: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -807,17 +808,18 @@ impl Host {
             .push(resource);
     }
 
-    /// Records copies between host copies and their VRAM twins with
-    /// `record` into the host's own list, runs it and waits for it (one
-    /// submission runs at a time, so the list is free again). Returns the
-    /// bytes `record` copied.
-    fn twin_copies(
+    /// The host's own list `k` of those that copy host copies into their
+    /// VRAM twins and back around a submission, made when first needed,
+    /// recorded with `record` and closed: to run with the submission, unless
+    /// `record` recorded nothing (returned 0). The submission before has
+    /// run, so the list is free again.
+    fn twin_list(
         &self,
-        submitted: &mut u64,
+        k: usize,
         record: impl FnOnce(&ID3D12GraphicsCommandList) -> u64,
-    ) -> u64 {
-        let mut made = self.twin_list.lock().unwrap_or_else(|e| e.into_inner());
-        if made.is_none() {
+    ) -> Option<ID3D12CommandList> {
+        let mut made = self.twin_lists.lock().unwrap_or_else(|e| e.into_inner());
+        while made.len() <= k {
             // SAFETY: plain object creation.
             let list = unsafe {
                 self.device
@@ -836,47 +838,26 @@ impl Host {
                     })
             };
             match list {
-                Ok(list) => *made = Some(list),
+                Ok(list) => made.push(list),
                 Err(e) => {
                     tracing::warn!(error = %e, "no list for VRAM twin copies");
-                    return 0;
+                    return None;
                 }
             }
         }
-        let Some((allocator, list)) = made.as_ref() else {
-            return 0;
-        };
-        // SAFETY: the list's last run was waited for; it is recorded,
-        // closed and run once, and waited for.
+        let (allocator, list) = &made[k];
+        // SAFETY: the list's last run was waited for.
         unsafe {
             if let Err(e) = allocator.Reset().and_then(|()| list.Reset(allocator, None)) {
                 tracing::warn!(error = %e, "VRAM twin copies not recorded");
-                return 0;
+                return None;
             }
-            let bytes = record(list);
+            let recorded = record(list);
             if let Err(e) = list.Close() {
                 tracing::warn!(error = %e, "VRAM twin copies not run");
-                return 0;
+                return None;
             }
-            let Ok(run) = list.cast::<ID3D12CommandList>() else {
-                return 0;
-            };
-            if bytes == 0 {
-                return 0;
-            }
-            self.queue.ExecuteCommandLists(&[Some(run)]);
-            *submitted += 1;
-            let waited = self
-                .queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
-                Err(e) => tracing::warn!(error = %e, "VRAM twin copies not waited for"),
-            }
-            bytes
+            (recorded > 0).then(|| list.cast().ok()).flatten()
         }
     }
 
@@ -905,8 +886,36 @@ impl Host {
         // Loose-memory windows copied for the first time get their tiles.
         crate::shadow::map_windows(&self.queue);
         let prepared = std::time::Instant::now();
-        // What the CPU wrote into host copies goes to their twins first.
-        if crate::shadow::twins_on() {
+        // The ranges shaders write, each once per submission, however many
+        // dispatches declared it (the world's passes declare the same big
+        // ranges dozens of times). One list's lock at a time: a submission
+        // may name a list twice.
+        let mut back: Vec<crate::shadow::Declared> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                let Step::GpuWrite(shadow, address, len) = step else {
+                    continue;
+                };
+                let i = match back
+                    .iter()
+                    .position(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                {
+                    Some(i) => i,
+                    None => {
+                        back.push((shadow.clone(), Vec::new()));
+                        back.len() - 1
+                    }
+                };
+                if !back[i].1.contains(&(*address, *len)) {
+                    back[i].1.push((*address, *len));
+                }
+            }
+        }
+        // In the submission's run: what the CPU wrote into host copies goes
+        // to their twins first, and what shaders wrote comes down after.
+        let (mut twins_before, mut twins_after) = (Vec::new(), None);
+        if crate::shadow::twins_on() && !runs.is_empty() {
+            let recording = std::time::Instant::now();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, ..) = step {
@@ -914,9 +923,33 @@ impl Host {
                     }
                 }
             }
-            let bytes = self.twin_copies(&mut submitted, crate::shadow::upload_twins);
-            TWINS[0].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
-            TWINS[1].fetch_add(bytes, Ordering::Relaxed);
+            let (mut up, mut compares, mut compared, mut down) = (0, None, 0, 0);
+            twins_before.extend(self.twin_list(0, |l| {
+                up = crate::shadow::upload_twins(l);
+                up
+            }));
+            let kept = self.twin_list(1, |l| {
+                compares = crate::shadow::snapshot_twins(l, &back);
+                compares.as_ref().map_or(0, |c| c.len() as u64)
+            });
+            if kept.is_none() {
+                compares = compares.filter(|c| c.is_empty());
+            }
+            twins_before.extend(kept);
+            twins_after = self.twin_list(2, |l| match &compares {
+                Some(c) => {
+                    compared = crate::shadow::compare_twins(l, c);
+                    compared
+                }
+                None => {
+                    down = crate::shadow::download_twins(l, &back);
+                    down
+                }
+            });
+            let spent = recording.elapsed().as_micros() as u64;
+            for (n, counter) in [spent, up, compared, down].into_iter().zip(&TWINS) {
+                counter.fetch_add(n, Ordering::Relaxed);
+            }
         }
         // Diagnostics: the tile mappings just queued, waited for on their own.
         #[cfg(feature = "diagnostics")]
@@ -948,6 +981,10 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        for list in &twins_before {
+            // SAFETY: a closed list, run before the submission's.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list.clone())]) };
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -957,6 +994,12 @@ impl Host {
             unsafe { self.queue.ExecuteCommandLists(group) };
             #[cfg(feature = "diagnostics")]
             let after = qpc();
+            if i + 1 == groups.len()
+                && let Some(list) = twins_after.take()
+            {
+                // SAFETY: a closed list, run after the submission's.
+                unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            }
             // SAFETY: the fence and event are ours.
             unsafe {
                 let waited = self
@@ -1032,40 +1075,8 @@ impl Host {
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<crate::shadow::Declared> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                let Step::GpuWrite(shadow, address, len) = step else {
-                    continue;
-                };
-                let i = match back
-                    .iter()
-                    .position(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-                {
-                    Some(i) => i,
-                    None => {
-                        back.push((shadow.clone(), Vec::new()));
-                        back.len() - 1
-                    }
-                };
-                if !back[i].1.contains(&(*address, *len)) {
-                    back[i].1.push((*address, *len));
-                }
-            }
-        }
-        // What shaders wrote into twins comes down for the compares.
-        if crate::shadow::twins_on() && !back.is_empty() {
-            let down = std::time::Instant::now();
-            let bytes =
-                self.twin_copies(&mut submitted, |l| crate::shadow::download_twins(l, &back));
-            TWINS[2].fetch_add(down.elapsed().as_micros() as u64, Ordering::Relaxed);
-            TWINS[3].fetch_add(bytes, Ordering::Relaxed);
-        }
         #[cfg(feature = "diagnostics")]
         let _charged = crate::copystat::charge(crate::copystat::Caller::CopyBack);
         for (shadow, declared) in &back {
@@ -2316,12 +2327,13 @@ impl Meter {
                  {waited:.1} ms/frame waiting for them) and {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
-            let [up_ms, up_mb, down_ms, down_mb] = [0, 1, 2, 3]
-                .map(|i| TWINS[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i % 2] / frames);
+            let [ms, up, compared, down] = [0, 1, 2, 3].map(|i| {
+                TWINS[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i.min(1)] / frames
+            });
             if crate::shadow::twins_on() {
                 tracing::info!(
-                    "VRAM twins per frame: {up_ms:.1} ms copying {up_mb:.1} MB up (of the GPU time), \
-                     {down_ms:.1} ms copying {down_mb:.1} MB down (of copying back)"
+                    "VRAM twins per frame: {ms:.1} ms recording; {up:.1} MB copied up, \
+                     {compared:.1} MB compared on the GPU, {down:.1} MB copied down whole"
                 );
             }
             #[cfg(feature = "diagnostics")]

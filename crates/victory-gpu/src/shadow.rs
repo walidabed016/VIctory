@@ -2028,6 +2028,283 @@ pub(crate) fn download_twins(list: &ID3D12GraphicsCommandList, back: &[Declared]
     bytes
 }
 
+/// Whether what shaders wrote into twins is found on the GPU: before a
+/// submission the twins' ranges its shaders write are kept in VRAM
+/// ([`snapshot_twins`]), and after it a compute shader compares them and
+/// stores only the words shaders changed into the host copies
+/// ([`compare_twins`]), instead of copying the ranges down whole
+/// ([`download_twins`]). `VICTORY_NO_TWIN_COMPARE` turns it off.
+pub(crate) fn twin_compare_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_TWIN_COMPARE").is_none();
+        if !on {
+            tracing::info!("what shaders wrote comes down whole (VICTORY_NO_TWIN_COMPARE)");
+        }
+        on
+    })
+}
+
+/// A twin's range a submission's shaders write, kept before it runs
+/// ([`snapshot_twins`]): the GPU addresses of the twin's bytes, of the
+/// kept bytes and of the host copy's, and the length, a multiple of 4.
+pub(crate) struct Compare {
+    twin: u64,
+    kept: u64,
+    host: u64,
+    bytes: u64,
+}
+
+/// VRAM the twins' ranges are kept in before a submission: the buffer,
+/// its GPU address and size.
+struct Keep(Option<(ID3D12Resource, u64, u64)>);
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Keep {}
+
+static KEEP: Mutex<Keep> = Mutex::new(Keep(None));
+
+/// The host gave no VRAM to keep twins' ranges in: they come down whole.
+static NO_KEEP: AtomicBool = AtomicBool::new(false);
+
+/// The most VRAM kept for one submission: past it its ranges come down
+/// whole.
+const KEEP_MAX: u64 = 1 << 30;
+
+/// Before a submission, after [`upload_twins`]: records into `list` copies
+/// within VRAM of the twins' ranges its shaders write (`back`), for
+/// [`compare_twins`] after it. None, recording nothing, where the ranges
+/// must come down whole ([`download_twins`]): the compare is off or has no
+/// pipeline, a range's last word passes its buffer's end, or the ranges
+/// pass [`KEEP_MAX`] or the VRAM the host gives.
+pub(crate) fn snapshot_twins(
+    list: &ID3D12GraphicsCommandList,
+    back: &[Declared],
+) -> Option<Vec<Compare>> {
+    if !twin_compare_on() || NO_KEEP.load(Ordering::Relaxed) || compare_pipeline().is_none() {
+        return None;
+    }
+    // The buffer and offset of each range's twin bytes, its twin's and host
+    // copy's GPU addresses, and its length.
+    let mut ranges: Vec<(ID3D12Resource, u64, u64, u64, u64)> = Vec::new();
+    let m = mirror_state();
+    let w = WINDOW as usize;
+    for (s, declared) in back {
+        let Some(twin) = &s.twin else {
+            continue;
+        };
+        let start = s.start as usize;
+        for (from, to) in s.merged(declared) {
+            let (from, to) = (from & !3, (to + 3) & !3);
+            if !s.mirror() {
+                // SAFETY: live buffers.
+                let (width, gpu, host) = unsafe {
+                    (
+                        twin.GetDesc().Width,
+                        twin.GetGPUVirtualAddress(),
+                        s.buffer.GetGPUVirtualAddress(),
+                    )
+                };
+                if to as u64 > width {
+                    return None;
+                }
+                let (from, len) = (from as u64, (to - from) as u64);
+                ranges.push((twin.clone(), from, gpu + from, host + from, len));
+                continue;
+            }
+            let (mut at, end) = (start + from, start + to);
+            while at < end {
+                let next = ((at / w + 1) * w).min(end);
+                let k = (at / w) as u64;
+                if let (Some(&(vh, vs, _)), Some(&(h, slot))) =
+                    (m.twinned.get(&k), m.windows.get(&k))
+                {
+                    let (vram, o) = (&m.vram[vh].1, (vs as usize * w + at % w) as u64);
+                    let to = (slot as usize * w + at % w) as u64;
+                    // SAFETY: live buffers.
+                    let (gpu, host) = unsafe {
+                        (
+                            vram.GetGPUVirtualAddress(),
+                            m.heaps[h].1.GetGPUVirtualAddress(),
+                        )
+                    };
+                    ranges.push((vram.clone(), o, gpu + o, host + to, (next - at) as u64));
+                }
+                at = next;
+            }
+        }
+    }
+    drop(m);
+    let need: u64 = ranges.iter().map(|r| r.4.next_multiple_of(256)).sum();
+    if ranges.iter().any(|r| r.4 >= 1 << 31) || need > KEEP_MAX {
+        return None;
+    }
+    let mut keep = KEEP.lock().unwrap_or_else(|e| e.into_inner());
+    if keep.0.as_ref().is_none_or(|k| k.2 < need) {
+        // The last submission has run: the smaller buffer can go.
+        keep.0 = None;
+        let size = need.next_multiple_of(64 << 20);
+        let Some(buffer) = vram_buffer(size) else {
+            NO_KEEP.store(true, Ordering::Relaxed);
+            return None;
+        };
+        crate::host::name(&buffer, || "twins' ranges kept for the compare".into());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        keep.0 = Some((buffer, gpu, size));
+    }
+    let (kept, gpu, _) = keep.0.as_ref()?;
+    let mut at = 0;
+    let mut compares = Vec::with_capacity(ranges.len());
+    for (source, offset, twin, host, bytes) in ranges {
+        // SAFETY: an open list; both buffers hold the range.
+        unsafe { list.CopyBufferRegion(kept, at, &source, offset, bytes) };
+        compares.push(Compare {
+            twin,
+            kept: gpu + at,
+            host,
+            bytes,
+        });
+        at += bytes.next_multiple_of(256);
+    }
+    Some(compares)
+}
+
+/// After a submission ran: records into `list` the compares of the twins'
+/// ranges [`snapshot_twins`] kept with what the twins hold now, which store
+/// the words shaders changed into the host copies, where copy-back compares
+/// them. Returns the bytes compared.
+pub(crate) fn compare_twins(list: &ID3D12GraphicsCommandList, compares: &[Compare]) -> u64 {
+    let Some((root, pipeline)) = compare_pipeline() else {
+        return 0;
+    };
+    if compares.is_empty() {
+        return 0;
+    }
+    // SAFETY: an open list; our root signature and pipeline.
+    unsafe {
+        list.SetComputeRootSignature(root);
+        list.SetPipelineState(pipeline);
+    }
+    let mut bytes = 0;
+    for c in compares {
+        let groups = c.bytes.div_ceil(16 * 64).min(65535) as u32;
+        let constants = [c.bytes as u32, 64 * groups];
+        // SAFETY: an open list; the addresses hold the range, the twin's and
+        // the kept bytes in VRAM.
+        unsafe {
+            list.SetComputeRootShaderResourceView(0, c.twin);
+            list.SetComputeRootShaderResourceView(1, c.kept);
+            list.SetComputeRootUnorderedAccessView(2, c.host);
+            list.SetComputeRoot32BitConstants(3, 2, constants.as_ptr().cast(), 0);
+            list.Dispatch(groups, 1, 1);
+        }
+        bytes += c.bytes;
+    }
+    bytes
+}
+
+/// The compare of [`compare_twins`]: each thread takes 16 bytes at a time,
+/// and stores only the words that changed, one at a time (16-byte stores
+/// to system memory run at ~0.08 GB/s, 4-byte ones at ~13).
+const COMPARE: &str = r#"
+#define RS "SRV(t0), SRV(t1), UAV(u0), RootConstants(num32BitConstants=2, b0)"
+cbuffer Range : register(b0) { uint bytes; uint threads; };
+ByteAddressBuffer twin : register(t0);
+ByteAddressBuffer kept : register(t1);
+RWByteAddressBuffer host : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    for (uint at = id.x * 16; at < bytes; at += threads * 16) {
+        if (at + 16 <= bytes) {
+            uint4 now = twin.Load4(at);
+            uint4 was = kept.Load4(at);
+            if (now.x != was.x) host.Store(at, now.x);
+            if (now.y != was.y) host.Store(at + 4, now.y);
+            if (now.z != was.z) host.Store(at + 8, now.z);
+            if (now.w != was.w) host.Store(at + 12, now.w);
+        } else {
+            for (uint w = at; w < bytes; w += 4) {
+                uint now = twin.Load(w);
+                if (now != kept.Load(w)) host.Store(w, now);
+            }
+        }
+    }
+}
+"#;
+
+/// The root signature and pipeline of [`COMPARE`], made on first use.
+fn compare_pipeline() -> Option<(&'static ID3D12RootSignature, &'static ID3D12PipelineState)> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    struct Made(ID3D12RootSignature, ID3D12PipelineState);
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Made {}
+    // SAFETY: as above.
+    unsafe impl Sync for Made {}
+    static MADE: std::sync::OnceLock<Option<Made>> = std::sync::OnceLock::new();
+    let made = MADE.get_or_init(|| {
+        let host = host()?;
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names live through the call.
+        let compiled = unsafe {
+            D3DCompile(
+                COMPARE.as_ptr().cast(),
+                COMPARE.len(),
+                windows::core::s!("twin compare"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let text = errors.map(|b| {
+                // SAFETY: the blob's own bytes.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+                };
+                String::from_utf8_lossy(bytes).into_owned()
+            });
+            tracing::warn!(error = %e, ?text, "no twin compare shader: what shaders wrote comes down whole");
+            return None;
+        }
+        let code = code?;
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: a shader with its root signature inside.
+        let made = unsafe {
+            host.device
+                .CreateRootSignature::<ID3D12RootSignature>(0, bytes)
+                .and_then(|root| {
+                    let pipeline: ID3D12PipelineState = host.device.CreateComputePipelineState(
+                        &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: bytes.as_ptr().cast(),
+                                BytecodeLength: bytes.len(),
+                            },
+                            ..Default::default()
+                        },
+                    )?;
+                    Ok(Made(root, pipeline))
+                })
+        };
+        made.inspect_err(|e| {
+            tracing::warn!(error = %e, "no twin compare pipeline: what shaders wrote comes down whole");
+        })
+        .ok()
+    });
+    made.as_ref().map(|m| (&m.0, &m.1))
+}
+
 /// Ranges sorted and joined where they overlap or meet.
 fn merge(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -3007,15 +3284,17 @@ pub(crate) mod tests {
         assert!(slab.twin.is_some() && slab.mirror());
         let scratch = vram_buffer(64 << 10).unwrap();
         let list = host.new_list().unwrap();
-        // In each, the GPU copies 4 KiB of the copy over the next 4 KiB.
+        // In each, the GPU copies 4 KiB and a word of the copy over the next
+        // (the compare's last 16 bytes hold a word).
+        const N: usize = 4100;
         let places = [(&buffer, at + (64 << 10)), (&slab, at + 20 * MIB)];
         for (s, a) in places {
-            s.refresh(&list, a as u64, 8192);
-            s.gpu_writes(&list, (a + 4096) as u64, 4096);
+            s.refresh(&list, a as u64, 4096 + N as u64);
+            s.gpu_writes(&list, (a + 4096) as u64, N as u64);
             let (twin, o) = (s.resource(), s.offset(a as u64));
             // SAFETY: an open list; our buffers, the ranges inside them.
             unsafe {
-                list.list.CopyBufferRegion(&scratch, 0, twin, o, 4096);
+                list.list.CopyBufferRegion(&scratch, 0, twin, o, N as u64);
                 list.list.ResourceBarrier(&[
                     crate::host::transition(
                         twin,
@@ -3029,7 +3308,7 @@ pub(crate) mod tests {
                     ),
                 ]);
                 list.list
-                    .CopyBufferRegion(twin, o + 4096, &scratch, 0, 4096);
+                    .CopyBufferRegion(twin, o + 4096, &scratch, 0, N as u64);
                 list.list.ResourceBarrier(&[crate::host::transition(
                     &scratch,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -3038,10 +3317,23 @@ pub(crate) mod tests {
             }
         }
         list.close();
+        let counted = || {
+            crate::host::TWINS
+                .each_ref()
+                .map(|n| n.load(Ordering::Relaxed))
+        };
+        let before = counted();
         host.execute(&[&list]);
         list.reset();
+        let after = counted();
+        // Both ranges came down, through the compare where it is on.
+        let k = if twin_compare_on() { 2 } else { 3 };
+        assert!(
+            after[k] - before[k] >= 2 * N as u64,
+            "{before:?} to {after:?}"
+        );
         for (_, a) in places {
-            for w in (a..a + 4096).step_by(4) {
+            for w in (a..a + N).step_by(4) {
                 // SAFETY: our test memory.
                 let got = unsafe { ((w + 4096) as *const u32).read() };
                 assert_eq!(got, word(w), "at {:#x}", w + 4096);

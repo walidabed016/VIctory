@@ -247,12 +247,13 @@ fn world_frame() {
         "world frame, host side: {:.1} ms",
         took.as_secs_f64() * 1e3 / FRAMES as f64
     );
-    let [up_us, up, down_us, down] = twins().map(|n| n / FRAMES as f64);
+    let [us, up, compared, down] = twins().map(|n| n / FRAMES as f64);
     println!(
-        "VRAM twins per frame: {:.1} ms copying {:.1} MB up, {:.1} ms copying {:.1} MB down",
-        up_us / 1e3,
+        "VRAM twins per frame: {:.1} ms recording; {:.1} MB copied up, {:.1} MB compared on \
+         the GPU, {:.1} MB copied down whole",
+        us / 1e3,
         up / 1e6,
-        down_us / 1e3,
+        compared / 1e6,
         down / 1e6
     );
     for line in copystat::lines(FRAMES as f64) {
