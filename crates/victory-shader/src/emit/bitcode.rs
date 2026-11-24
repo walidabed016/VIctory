@@ -385,6 +385,44 @@ impl Module {
         V::Inst(i)
     }
 
+    /// Tests: `v` as 32 bits where every select takes its second arm, as
+    /// in a lane outside every EXEC the program set in lockstep; leaves
+    /// other than integer constants (inputs, loads, calls) count as 0.
+    #[cfg(test)]
+    pub fn second_arms(&self, v: V) -> u32 {
+        let op = match v {
+            V::Const(i) => {
+                return match &self.consts[i as usize].1 {
+                    Const::Int(x) => *x as u32,
+                    _ => 0,
+                };
+            }
+            V::Inst(i) => &self.insts[i as usize].op,
+            _ => return 0,
+        };
+        match op {
+            Op::Select(_, _, f) => self.second_arms(*f),
+            Op::Cast(Cast::ZExt | Cast::SExt | Cast::Trunc | Cast::Bitcast, x) => {
+                self.second_arms(*x)
+            }
+            Op::Bin(op, a, b) => {
+                let (a, b) = (self.second_arms(*a), self.second_arms(*b));
+                match op {
+                    Bin::Add => a.wrapping_add(b),
+                    Bin::Sub => a.wrapping_sub(b),
+                    Bin::Mul => a.wrapping_mul(b),
+                    Bin::Shl => a.wrapping_shl(b),
+                    Bin::LShr => a.wrapping_shr(b),
+                    Bin::And => a & b,
+                    Bin::Or => a | b,
+                    Bin::Xor => a ^ b,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
         let ty = self.type_of(a);
         self.push(block, ty, Op::Bin(op, a, b))

@@ -50,6 +50,10 @@ pub(crate) struct Lowered {
     /// Group barriers the 32-lane halves add.
     #[cfg(test)]
     pub halves_barriers: u32,
+    /// The index of each non-uniform heap handle in a lane outside every
+    /// EXEC the program set ([`super::bitcode::Module::second_arms`]).
+    #[cfg(test)]
+    pub nonuniform_outside_exec: Vec<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1181,6 +1185,13 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             halves_barriers: self.halves_barriers,
+            #[cfg(test)]
+            nonuniform_outside_exec: self
+                .s
+                .nonuniform_indices
+                .iter()
+                .map(|&i| self.s.m.second_arms(i))
+                .collect(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5238,7 +5249,16 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                // Lanes outside EXEC take 0, slot 0's: in lockstep they run
+                // the loop's accesses too, and their register holds anything.
                 let a = s(self, 0)?;
+                let a = match guard {
+                    Some(g) => {
+                        let zero = self.s.m.i32(0);
+                        self.s.m.select(c, g, a, zero)
+                    }
+                    None => a,
+                };
                 int(self, a)
             }
             "v_readfirstlane_b32"

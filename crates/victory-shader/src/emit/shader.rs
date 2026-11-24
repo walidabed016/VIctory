@@ -100,6 +100,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Their heap indices.
+    #[cfg(test)]
+    pub nonuniform_indices: Vec<V>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -155,6 +158,8 @@ impl Shader {
             view_strides: None,
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            nonuniform_indices: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -350,6 +355,10 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        #[cfg(test)]
+        if nonuniform {
+            self.nonuniform_indices.push(index);
+        }
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

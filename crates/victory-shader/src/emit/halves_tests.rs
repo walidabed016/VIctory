@@ -109,6 +109,30 @@ fn prologue(threads: [u32; 3]) -> Vec<u32> {
 /// whose UAV table is at s0; returns the shader, how its waves run and the
 /// group barriers the halves add.
 fn build(words: &[u32], threads: [u32; 3], lds: u32) -> (HostShader, Waves, u32) {
+    let lowered = lower64(words, threads, lds);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        view_strides: lowered.view_strides,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    } else {
+        eprintln!("no dxil.dll; validation skipped");
+    }
+    (shader, lowered.waves, lowered.halves_barriers)
+}
+
+/// [`build`]'s lowering.
+fn lower64(words: &[u32], threads: [u32; 3], lds: u32) -> lower::Lowered {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -142,7 +166,7 @@ fn build(words: &[u32], threads: [u32; 3], lds: u32) -> (HostShader, Waves, u32)
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -153,26 +177,7 @@ fn build(words: &[u32], threads: [u32; 3], lds: u32) -> (HostShader, Waves, u32)
         prims: Vec::new(),
         mesh_stride: 0,
     })
-    .expect("lower");
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        view_strides: lowered.view_strides,
-        heap_indices: Vec::new(),
-        heap_unknown: 0,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
-    }
-    (shader, lowered.waves, lowered.halves_barriers)
+    .expect("lower")
 }
 
 /// Runs `shader` (one group) on the hardware GPU, which must take it, and
@@ -873,4 +878,56 @@ fn the_first_lane_of_no_lanes_is_lane_0() {
             assert_eq!(slots(&got, f, 2), [256, f], "{label}: thread {f}");
         }
     }
+}
+
+#[test]
+fn lanes_outside_exec_take_slot_0_in_a_waterfall_in_lockstep() {
+    // Lanes 40-63 run a console waterfall: v7 = (lane & 1) * 32, the first
+    // lane's table offset (`v_readfirstlane`), the lanes with the same one
+    // (`v_cmpx_eq`), its entry loaded (`s_load` at that offset) and read
+    // through (`buffer_load_dword`). A cross-lane read of lane 5 there keeps
+    // the wave in lockstep, where every thread runs the loop's accesses:
+    // lanes 0-39, whose v7 still holds 0x7FFF_FFE0, must take slot 0, not
+    // slot 0x3FF_FFFF (decal classification, runs 54 and 56).
+    let threads = [64, 1, 1];
+    let mut w = prologue(threads);
+    w.extend(mov_k(7, 0x7FFF_FFE0));
+    w.extend(mov_k(9, DEAD));
+    w.extend([SAVE_EXEC, vopc(0xD3, inline(40), 3)]);
+    let mut region = vec![vop2(0x1B, 7, inline(1), 3), vop2(0x1A, 7, inline(5), 7)];
+    region.extend(vop3(0x360, 15, v(3), inline(5)));
+    region.extend([
+        vop1(0x001, 6, 15),
+        0xBE9A_047E, // s_mov_b64 s[26:27], exec
+        0xBE96_047E, // s_mov_b64 s[22:23], exec
+    ]);
+    let looped = [
+        vop1(0x002, 20, v(7)),
+        vopc(0xD2, 20, 7), // v_cmpx_eq_u32 exec, s20, v7
+        0xF408_0300,
+        0x2800_0000, // s_load_dwordx4 s[12:15], s[0:1], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_0000,
+        0x8003_0900, // buffer_load_dword v9, off, s[12:15], 0
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE96_3A16, // s_andn2_wrexec_b64 s[22:23], s[22:23]
+    ];
+    region.extend(looped);
+    region.extend([
+        sopp(EXECNZ, -(looped.len() as i16 + 1)),
+        0xBEFE_041A, // s_mov_b64 exec, s[26:27]
+    ]);
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    w.extend(store(6, 4, 0));
+    w.extend(store(9, 4, 4));
+    w.push(S_ENDPGM);
+    let lowered = lower64(&w, threads, 0);
+    assert_eq!(lowered.waves, Waves::Lockstep);
+    let outside = lowered.nonuniform_outside_exec;
+    assert!(!outside.is_empty(), "no per-lane heap index");
+    assert!(
+        outside.iter().all(|&i| i == 0),
+        "slots outside EXEC: {outside:x?}"
+    );
 }
