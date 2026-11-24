@@ -24,6 +24,8 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod frame_costs;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;

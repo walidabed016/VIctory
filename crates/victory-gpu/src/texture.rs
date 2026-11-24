@@ -195,7 +195,11 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::cost(crate::copystat::Op::Copy, started, start, size as u64);
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -213,7 +217,11 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let hash = blake3::hash(tiled);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::cost(crate::copystat::Op::Hash, started, start, size as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -228,6 +236,8 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let _detiling = Detiling(std::time::Instant::now(), self.memory as usize, tiled.len());
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -256,17 +266,27 @@ impl Staging {
     }
 }
 
+/// Charges a detiling's time when it ends (diagnostics).
+#[cfg(feature = "diagnostics")]
+struct Detiling(std::time::Instant, usize, usize);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Detiling {
+    fn drop(&mut self) {
+        crate::copystat::cost(crate::copystat::Op::Detile, self.0, self.1, self.2 as u64);
+    }
+}
+
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     let mut p = at as usize;
     let end = p + len;
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::watch::query(p, &mut info);
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }

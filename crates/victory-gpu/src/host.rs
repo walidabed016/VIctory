@@ -661,6 +661,8 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let _charged = crate::copystat::charge(crate::copystat::Caller::CopyBack);
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
             crate::watch::forget_asked();
@@ -1313,6 +1315,8 @@ impl HostList {
                     batch.flush();
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
+                    #[cfg(feature = "diagnostics")]
+                    let _charged = crate::copystat::charge(crate::copystat::Caller::Snapshot);
                     shadow.writing(*address, *len);
                     #[cfg(feature = "diagnostics")]
                     add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
@@ -1320,6 +1324,8 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        #[cfg(feature = "diagnostics")]
+                        let _charged = crate::copystat::charge(crate::copystat::Caller::Texture);
                         staging.refresh();
                     }
                     continue;
@@ -1401,6 +1407,8 @@ impl Batch {
 
     fn flush(&mut self) {
         for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+            #[cfg(feature = "diagnostics")]
+            let _charged = crate::copystat::charge(shadow.caller());
             let started = std::time::Instant::now();
             let asking = crate::watch::asking();
             let mut copied = 0;

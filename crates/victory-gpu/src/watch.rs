@@ -139,12 +139,35 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut granularity,
             )
         } != 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{Op, cost};
+            cost(Op::Ask, started, from * PAGE, ((to - from) * PAGE) as u64);
+            if !failed && count > 0 {
+                cost(
+                    Op::Found,
+                    started,
+                    from * PAGE,
+                    (count * KERNEL_PAGE) as u64,
+                );
+            }
+        }
         let guarded = if failed {
             count = 0;
             if !guarded {
                 return None;
             }
-            guard(from * PAGE, to * PAGE)?
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            let written = guard(from * PAGE, to * PAGE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::cost(
+                crate::copystat::Op::Guard,
+                started,
+                from * PAGE,
+                ((to - from) * PAGE) as u64,
+            );
+            written?
         } else {
             Vec::new()
         };
@@ -172,6 +195,29 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+/// `VirtualQuery` of `at` into `info`: what the system reports of the
+/// region holding it. It walks the page tables from `at` to the region's
+/// end (~17 us per MiB of the title's big pools).
+pub(crate) fn query(
+    at: usize,
+    info: &mut windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+) -> usize {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe {
+        windows_sys::Win32::System::Memory::VirtualQuery(at as *const _, info, size_of_val(info))
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::cost(
+        crate::copystat::Op::Query,
+        started,
+        at,
+        (info.BaseAddress as usize + info.RegionSize).saturating_sub(at) as u64,
+    );
+    n
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -197,11 +243,10 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION};
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    let n = query(start, &mut info);
     if n == 0 || info.Type != MEM_MAPPED {
         return None;
     }
@@ -236,19 +281,29 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// heaps copied ~300 MB of unmapped pages a frame, 4 KiB at a time.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect,
     };
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let set = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::cost(
+            crate::copystat::Op::Protect,
+            started,
+            from * BLOCK,
+            ((to - from) * BLOCK) as u64,
+        );
+        set
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -265,8 +320,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        let n = query(block * BLOCK, &mut info);
         if n != 0 && info.State != MEM_COMMIT {
             g.clean.insert(block);
         }

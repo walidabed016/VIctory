@@ -143,6 +143,17 @@ impl Shadow {
         matches!(self.memory, Memory::Mirror)
     }
 
+    /// Whom refreshes of this copy charge their costs to (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn caller(&self) -> crate::copystat::Caller {
+        use crate::copystat::Caller;
+        match (self.mirror(), self.loose) {
+            (true, _) => Caller::Mirror,
+            (false, true) => Caller::Window,
+            (false, false) => Caller::Buffer,
+        }
+    }
+
     /// Whether shaders have been given this copy to write.
     pub(crate) fn shaders_write(&self) -> bool {
         self.shaders_write.load(Ordering::Relaxed)
@@ -325,6 +336,8 @@ impl Shadow {
         }
         // Parts newly covered from the copy, the rest as it was taken (the
         // snapshots joined lie apart, in order).
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         taken.sort_unstable_by_key(|t| t.0);
         let mut grown = pooled(end - start);
         let mut at = start;
@@ -335,6 +348,13 @@ impl Shadow {
             give_back(bytes);
         }
         self.gather(at, end, &mut grown);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::cost(
+            crate::copystat::Op::Snapshot,
+            started,
+            self.start as usize + start,
+            (end - start) as u64,
+        );
         before.push((start, grown));
     }
 
@@ -369,6 +389,8 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
             let mut at = from;
@@ -398,14 +420,30 @@ impl Shadow {
                         *h = *t;
                     }
                     if changed {
+                        #[cfg(feature = "diagnostics")]
+                        let started = std::time::Instant::now();
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::cost(
+                            crate::copystat::Op::WriteBack,
+                            started,
+                            start + at,
+                            n as u64,
+                        );
                     }
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::cost(
+                crate::copystat::Op::Compare,
+                started,
+                start + from,
+                (to - from) as u64,
+            );
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -469,8 +507,7 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        self.copy(from, to);
-        to - from
+        self.copy_whole(from, to)
     }
 
     /// Copies the pages of `[from, to)` the watch says changed since they
@@ -518,7 +555,7 @@ impl Shadow {
                 if committed {
                     copied += self
                         .update_watched(a, end)
-                        .unwrap_or_else(|| self.copy(a, end));
+                        .unwrap_or_else(|| self.copy_whole(a, end));
                 }
                 a = end;
             }
@@ -531,6 +568,8 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -561,7 +600,19 @@ impl Shadow {
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::cost(crate::copystat::Op::Copy, started, from, bytes as u64);
         bytes
+    }
+
+    /// [`Shadow::copy`] of memory nothing can tell the changes of.
+    fn copy_whole(&self, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let n = self.copy(from, to);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::cost(crate::copystat::Op::Whole, started, from, n as u64);
+        n
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy
@@ -592,11 +643,10 @@ impl Shadow {
 /// Where the region of memory holding `at` ends, and whether it is
 /// committed (as the system reports it).
 fn region(at: usize) -> (usize, bool) {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+    if crate::watch::query(at, &mut info) == 0 {
         return (usize::MAX, false);
     }
     (
@@ -753,7 +803,7 @@ fn in_place(start: u64, len: u64) -> Option<(ID3D12Resource, usize, usize)> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::core::Interface;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
     };
     static OFF: OnceLock<bool> = OnceLock::new();
     if *OFF.get_or_init(|| std::env::var_os("VICTORY_COPY_TITLE_MEMORY").is_some()) || len < IN_PLACE_MIN {
@@ -765,8 +815,7 @@ fn in_place(start: u64, len: u64) -> Option<(ID3D12Resource, usize, usize)> {
     while at < to {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+        if crate::watch::query(at, &mut info) == 0
             || info.State != MEM_COMMIT
             || info.Type != MEM_PRIVATE && info.Type != MEM_MAPPED
             || info.Protect & 0xff != PAGE_READWRITE
@@ -806,8 +855,7 @@ fn in_place(start: u64, len: u64) -> Option<(ID3D12Resource, usize, usize)> {
                 while at < to {
                     // SAFETY: plain data filled in by the query.
                     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-                    // SAFETY: a valid out pointer of the right size.
-                    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+                    if crate::watch::query(at, &mut info) == 0 {
                         break;
                     }
                     let base = info.AllocationBase as usize;
