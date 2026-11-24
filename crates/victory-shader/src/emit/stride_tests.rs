@@ -1,7 +1,8 @@
 //! End-to-end tests of indexed buffer accesses whose record stride is only
 //! in the descriptor (a heap descriptor no used-resource entry names): the
 //! stride, and the bytes the host's raw view starts before the first
-//! record, come from the view heap's records at run time. Synthetic
+//! record, come from the view heap's records at run time; so does that
+//! lead for scalar loads of a structured view. Synthetic
 //! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present, and
 //! run on the host GPU and WARP against views of each kind.
 
@@ -17,6 +18,13 @@ const LANES: u32 = 32;
 /// Lowers a wave32 program of 32 lanes with the resource heap at s0 and a
 /// table at s1 whose entry 0 is a raw UAV.
 fn build(words: &[u32]) -> HostShader {
+    let shader = build_with(words, &[]);
+    assert!(shader.view_strides, "the stride is read at run time");
+    shader
+}
+
+/// [`build`] with `more` used-resource entries in the table.
+fn build_with(words: &[u32], more: &[UsedResource]) -> HostShader {
     let param = |root, user_data: u8| RootParam {
         root,
         table_offset_dwords: 0,
@@ -30,7 +38,7 @@ fn build(words: &[u32]) -> HostShader {
         wave64: false,
         vgprs: 32,
         layout: vec![param(RootType::ResourceHeap, 0), param(RootType::Table, 1)],
-        used: vec![UsedResource {
+        used: [UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -39,7 +47,10 @@ fn build(words: &[u32]) -> HostShader {
             dwords: 4,
             user_data: 1,
             slot: 1,
-        }],
+        }]
+        .into_iter()
+        .chain(more.iter().copied())
+        .collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
             threads: [LANES, 1, 1],
@@ -62,7 +73,6 @@ fn build(words: &[u32]) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    assert!(lowered.view_strides, "the stride is read at run time");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -253,6 +263,71 @@ fn indexed_stores_and_atomics_write_records_of_the_views_own_stride() {
                 failed.push(format!(
                     "{label} {stride}+{lead}: got {:?}, want {want:?}",
                     uavs[1]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A structured shader resource view of `stride` bytes at entry 1 of the
+/// table (heap index 1).
+fn structured(stride: u32) -> UsedResource {
+    UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data: 1,
+        slot: 1,
+    }
+}
+
+/// Each lane stores dword 1 of record 0 of the structured buffer at table
+/// entry 1, read with `s_buffer_load_dword`, at dword `lane` of the UAV.
+const SCALAR_LOAD: &[u32] = &[
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0xF408_0203,
+    0xFA00_0020, // s_load_dwordx4 s[8:11], s[6:7], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0404,
+    0xFA00_0004, // s_buffer_load_dword s16, s[8:11], 0x4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0210, // v_mov_b32 v1, s16
+    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+    0xE070_1000,
+    0x8003_0103, // buffer_store_dword v1, v3, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn scalar_loads_of_structured_views_start_at_the_first_record() {
+    let mut failed = Vec::new();
+    for [stride, lead] in [[12, 0], [12, 8], [64, 0], [64, 12]] {
+        let shader = build_with(SCALAR_LOAD, &[structured(stride)]);
+        let data: Vec<u32> = (0..(lead + 4 * stride) / 4).map(|i| 1000 + i).collect();
+        let views = [
+            View::RawUav(LANES),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ];
+        let want = vec![data[(lead / 4 + 1) as usize]; LANES as usize];
+        let records = [
+            [4, 0, view_kind::RAW_UAV],
+            [stride, lead, view_kind::RAW_SRV],
+        ];
+        for (label, uavs) in run(&shader, &views, &records) {
+            if uavs[0] != want {
+                failed.push(format!(
+                    "{label} {stride}+{lead}: got {:?}, want {want:?}",
+                    uavs[0]
                 ));
             }
         }

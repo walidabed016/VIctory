@@ -3680,6 +3680,12 @@ impl<'a> Lower<'a> {
             })?
         } else if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            // A structured view's raw view starts its lead before the first
+            // record (a raw one's has none).
+            if kind.is_some_and(|u| u.stride != 0) && !matches!(src, Source::Built { .. }) {
+                let (_, lead) = self.view_record(src)?;
+                addr = self.s.m.bin(c, Bin::Add, addr, lead);
+            }
             self.raw_dwords(h, addr, count)
         } else {
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
