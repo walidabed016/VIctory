@@ -44,6 +44,9 @@ pub(crate) struct HostHeap {
     /// names go by. An upload buffer and its mapping; none in sampler
     /// heaps, or if the host would not make it.
     strides: Option<(ID3D12Resource, usize)>,
+    /// Slots of buffer views made from the title's writes whose data no
+    /// stage has asked for since ([`HostHeap::take_unread`]).
+    unread: Mutex<std::collections::BTreeSet<u32>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -165,6 +168,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
+            unread: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -274,6 +278,14 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// The slots of buffer views made from the title's writes since the
+    /// last call: shaders that load slot indices from memory may read any
+    /// of them, and their data has not been copied for a draw.
+    pub(crate) fn take_unread(&self) -> Vec<u32> {
+        let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *unread).into_iter().collect()
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -429,6 +441,10 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+            }
+            if kept.is_some() && !for_draw && view.is_buffer() {
+                let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
+                unread.insert(index);
             }
             let record = kept
                 .as_ref()

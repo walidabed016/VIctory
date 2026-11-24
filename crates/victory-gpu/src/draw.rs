@@ -679,21 +679,39 @@ impl State {
     /// The view-heap slots a stage reaches through its user data that no
     /// used-resource entry names (a descriptor index in a root constant,
     /// say; see `victory_shader::emit::HeapIndex`), made for the draw with
-    /// their data as table entries are: buffer views get host slots only
-    /// for draws that read them. `values` is the stage's user data.
+    /// their data as table entries are. A stage that also loads slot
+    /// indices from memory may read any slot: the buffer views the title
+    /// wrote since such a stage last ran get their data for it. `values`
+    /// is the stage's user data.
+    ///
+    /// shortcut: those slots' data is copied once, for the first such stage
+    /// after the title wrote them (see [`crate::shadow`]).
     fn heap_slots(&self, list: &HostList, values: &[u32], shader: &HostShader) {
         #[cfg(feature = "diagnostics")]
         if shader.heap_unknown > 0 {
             HEAP_SLOTS[1].fetch_add(1, Ordering::Relaxed);
             HEAP_SLOTS[2].fetch_add(u64::from(shader.heap_unknown), Ordering::Relaxed);
         }
-        if shader.heap_indices.is_empty() || self.heaps[0] == 0 {
+        if (shader.heap_indices.is_empty() && shader.heap_unknown == 0) || self.heaps[0] == 0 {
             return;
         }
         let heap = crate::descriptor::heap(self.heaps[0] as This);
         let Some(host) = heap.host() else {
             return;
         };
+        if shader.heap_unknown > 0 {
+            for slot in host.take_unread() {
+                let view = heap.handle(slot).and_then(crate::descriptor::view);
+                let Some(view) = view.filter(View::is_buffer) else {
+                    continue;
+                };
+                let kind = match view {
+                    View::Unordered(..) | View::Placed(true, ..) => ResourceType::Uav,
+                    _ => ResourceType::Srv,
+                };
+                readable(list, kind, &view);
+            }
+        }
         for h in &shader.heap_indices {
             // Dynamic slots (of tables made afresh) are made with the table.
             let slot = h.slot(values);
@@ -1226,9 +1244,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
-    // Buffer views read title memory: their range is copied at submission;
-    // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    // Buffer and constant views read title memory: their range is copied
+    // at submission; what shaders write through unordered access goes back
+    // to it after.
+    let range = match *view {
+        View::Constant(address, size) => Some((address, u64::from(size))),
+        _ => crate::descriptor::host::buffer_range(view),
+    };
+    if let Some((address, len)) = range
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
@@ -1359,20 +1382,18 @@ void main() {
 }
 "#;
 
-    /// The words at `offsets` past a root view at title `address`, as a
-    /// dispatch reads them through the host address [`root_view`] gives.
-    /// Fails without dispatching where the root view's host copy ends
-    /// within 36 MiB of it: reading past a copy's end faults the hardware
-    /// adapter (`VICTORY_TEST_ROOT_PAST_COPY=1` dispatches anyway).
-    fn read_root(address: u64, offsets: [u32; 8]) -> [u32; 8] {
+    /// The root signature and pipeline of a compute shader in HLSL (shader
+    /// model 5.1) with its root signature inside.
+    fn compute(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
         let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call.
-        unsafe {
+        let compiled = unsafe {
             D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("root"),
+                source.as_ptr().cast(),
+                source.len(),
+                s!("test"),
                 None,
                 None,
                 s!("main"),
@@ -1380,17 +1401,27 @@ void main() {
                 0,
                 0,
                 &mut code,
-                None,
+                Some(&mut errors),
             )
+        };
+        if let Some(errors) = errors {
+            // SAFETY: the blob's own bytes.
+            let text = unsafe {
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
+            };
+            assert!(compiled.is_ok(), "{}", String::from_utf8_lossy(text));
         }
-        .unwrap();
+        compiled.unwrap();
         let code = code.unwrap();
         // SAFETY: the blob's own bytes.
         let bytes = unsafe {
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
         };
         // SAFETY: a shader with its root signature inside.
-        let (root, pso) = unsafe {
+        unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
             let pso: ID3D12PipelineState = host
                 .device
@@ -1404,7 +1435,17 @@ void main() {
                 })
                 .unwrap();
             (root, pso)
-        };
+        }
+    }
+
+    /// The words at `offsets` past a root view at title `address`, as a
+    /// dispatch reads them through the host address [`root_view`] gives.
+    /// Fails without dispatching where the root view's host copy ends
+    /// within 36 MiB of it: reading past a copy's end faults the hardware
+    /// adapter (`VICTORY_TEST_ROOT_PAST_COPY=1` dispatches anyway).
+    fn read_root(address: u64, offsets: [u32; 8]) -> [u32; 8] {
+        let host = crate::host::host().unwrap();
+        let (root, pso) = compute(SOURCE);
         let list = host.new_list().unwrap();
         let at = root_view(&list, address, true).unwrap();
         let held = crate::shadow::host_end(at).map_or(0, |end| end - at);
@@ -1488,5 +1529,135 @@ void main() {
         });
         assert_eq!(read_root(root as u64, offsets), want);
         release(p);
+    }
+
+    /// What Grand Theft Auto VI's meshlet culling (CS_BatchCullMeshlets)
+    /// does first, as translated: load a heap slot's index from a batch
+    /// record (dword 0, low 24 bits), read the kind of view the host made
+    /// there from the view heap's records, and read the batch's words
+    /// through a view of that kind (none: zeros). Its instance culling
+    /// reads instance records the same way.
+    const CULL: &str = r#"
+#define RS "SRV(t0, space=2), SRV(t1), UAV(u0), DescriptorTable(SRV(t0, space=1, numDescriptors=64)), DescriptorTable(CBV(b0, space=1, numDescriptors=64))"
+struct Words { uint4 w; };
+ByteAddressBuffer records : register(t0, space2);
+ByteAddressBuffer batches : register(t1);
+RWByteAddressBuffer read : register(u0);
+ByteAddressBuffer views[64] : register(t0, space1);
+ConstantBuffer<Words> constants[64] : register(b0, space1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    for (uint b = 0; b < 2; b++) {
+        uint slot = batches.Load(b * 16) & 0xffffff;
+        uint3 record = records.Load3(slot * 16);
+        uint word = 0;
+        if (record.z == 2) {
+            word = views[slot].Load(record.y);
+        } else if (record.z == 1) {
+            word = constants[slot].w.x;
+        }
+        read.Store2(b * 8, uint2(word, record.z));
+    }
+}
+"#;
+
+    /// A dispatch that loads its heap slots' indices from memory reads the
+    /// title's words through the buffer views the title wrote there, as
+    /// on the console: no draw names those slots, so the title's writes
+    /// make them, and the first stage that may read slots it does not name
+    /// brings their data up to date.
+    #[test]
+    fn a_dispatch_reads_buffer_views_through_slots_it_loads() {
+        use crate::descriptor::tests::{release_heap, view_heap};
+        use crate::descriptor::{create_cbv, create_placed_srv};
+        use victory_shader::emit::view_kind;
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let host = crate::host::host().unwrap();
+        // A title buffer under the in-place size: the host copies it.
+        let p = title_memory(800, 512 * MIB, 4 * MIB, 4 * MIB);
+        assert_ne!(p, 0, "no free address for test memory");
+        let (start, len) = (p as u64, 256u64 << 10);
+        crate::shadow::register(p, start, len);
+        let h = view_heap(64);
+        let heap = crate::descriptor::heap(h);
+        let host_heap = heap.host().expect("a host view heap");
+        let at = |index: u32| heap.handle(index).expect("a slot of the heap");
+        // A raw view of the buffer from byte 256 at slot 37, a constant
+        // view of 256 bytes at 0x1000 at slot 9.
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, len as u32);
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[39, 1, 0x1688, 0, 64, 0, 1024, 0, 1, 0]);
+        (desc[10], desc[11]) = (start as u32, (start >> 32) as u32);
+        let null = std::ptr::null();
+        create_placed_srv(null, &resource, &desc, at(37));
+        let constant = start + 0x1000;
+        create_cbv(
+            null,
+            &[constant as u32, (constant >> 32) as u32, 256, 0],
+            at(9),
+        );
+        // Batch records naming them in dword 0's low 24 bits.
+        let (batches, records) = host.shared_buffer(256).unwrap();
+        // SAFETY: the mapped buffer's first dwords.
+        unsafe {
+            let words = records.cast::<u32>();
+            words.write_volatile(0x5a00_0000 | 37);
+            words.add(4).write_volatile(0x0300_0000 | 9);
+        }
+        let shader = HostShader {
+            stage: victory_shader::HwStage::Cs,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            view_strides: true,
+            heap_indices: Vec::new(),
+            heap_unknown: 2,
+        };
+        let (root, pso) = compute(CULL);
+        let (out, data) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[h]);
+        state.heap_slots(&list, &[], &shader);
+        let (_, strides) = host_heap.strides().expect("the view heap's records");
+        // SAFETY: an open list; live heap, buffers, pipeline and root
+        // signature.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootShaderResourceView(0, strides);
+            l.SetComputeRootShaderResourceView(1, batches.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            let slots = host_heap.heap.GetGPUDescriptorHandleForHeapStart();
+            l.SetComputeRootDescriptorTable(3, slots);
+            l.SetComputeRootDescriptorTable(4, slots);
+            l.Dispatch(1, 1, 1);
+            l.Close().unwrap();
+        }
+        host.execute(&[&list]);
+        // SAFETY: the mapped words the dispatch wrote, waited for.
+        let got: [u32; 4] =
+            std::array::from_fn(|i| unsafe { data.cast::<u32>().add(i).read_volatile() });
+        let want = [
+            word(p + 256),
+            view_kind::RAW_SRV,
+            word(p + 0x1000),
+            view_kind::CBV,
+        ];
+        drop(list);
+        release_heap(h);
+        crate::shadow::unregister(p, start);
+        release(p);
+        assert_eq!(got, want, "words and kinds read through slots 37 and 9");
     }
 }

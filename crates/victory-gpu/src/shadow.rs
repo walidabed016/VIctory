@@ -12,8 +12,11 @@
 //!
 //! shortcut: only the ranges draws are known to read are brought up to
 //! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! descriptors, buffer and constant views in tables and in heap slots
+//! user data names); views in heap slots only shaders know (an index they
+//! load from memory) keep what the first stage that may read them after
+//! the title wrote them copied, and what shaders write there goes back to
+//! title memory only after that stage's submission.
 //!
 //! A title buffer of at least [`IN_PLACE_MIN`] bytes in committed private
 //! memory needs no copy: a heap opened on its pages

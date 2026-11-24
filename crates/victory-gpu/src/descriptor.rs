@@ -304,8 +304,8 @@ pub(crate) enum View {
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
     /// of resources or of memory) or memory the title placed a texture in.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    fn is_buffer(&self) -> bool {
+    #[cfg(windows)]
+    pub(crate) fn is_buffer(&self) -> bool {
         match self {
             View::Constant(..) | View::Placed(..) => true,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
