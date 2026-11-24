@@ -1,7 +1,8 @@
-//! End-to-end tests of joins of data with a value that has no DXIL form (a
-//! lane mask, a descriptor dword): synthetic GFX10 programs lowered to DXIL,
-//! validated by `dxil.dll` when present, and run on the host GPU and WARP.
-//! Such a join stands only where no lane that brings the value reads it.
+//! End-to-end tests of joins of values that have no DXIL form: synthetic
+//! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present, and
+//! run on the host GPU and WARP. A lane mask or a descriptor dword joined with
+//! data stands only where no lane that brings it reads it; addresses into the
+//! program's constant table join as offsets each predecessor computes.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -110,6 +111,57 @@ fn two_turns(skipped: u8) -> Vec<u32> {
         0x80 << 24 | 2 << 16 | 5 << 8 | 4,
     ]);
     w.push(S_ENDPGM);
+    w
+}
+
+/// Lane `l` loads a dword of a table after the code, read through
+/// `s_getpc_b64` at a join, and stores it: dword `l & 7` on the path
+/// `s_cmp_<cmp>_u32 s0, 0` (s0 is 0) falls through to the load on, dword
+/// `8 + (l & 7)` on the path that branches back to it (as the hair strand
+/// programs do). The table's dwords are 1000 and on.
+fn table_at_a_join(cmp: u8) -> Vec<u32> {
+    // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0; v4 = v0 * 4; v1 = v0 & 7.
+    let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
+    w.extend([vop2(0x1A, 4, u16::from(TWO), 0), vop2(0x1B, 1, 128 + 7, 0)]);
+    // s_getpc_b64 s[16:17] (the next instruction's byte); s16 += the table's
+    // distance from it; s_addc_u32 s17, s17, 0.
+    let pc = 4 * (w.len() + 1);
+    w.extend([sop1(0x1F, 16, 0), sop2(0x00, 16, 16, LITERAL), 0]);
+    let distance = w.len() - 1;
+    w.push(sop2(0x04, 17, 17, ZERO));
+    // s_cmp_<cmp>_u32 s0, 0; s_cbranch_scc0 back.
+    w.push(sopc(cmp, 0, ZERO));
+    let skip = w.len();
+    w.push(0);
+    // v_add_co_u32 v5, vcc, v2, s16; v_add_co_ci_u32 v6, vcc, 0, s17, vcc.
+    let address = |w: &mut Vec<u32>| {
+        for [w0, w1] in [
+            vop3(0x30F, 5, v(2), 16, 0),
+            vop3(0x128, 6, u16::from(ZERO), 17, u16::from(VCC_LO)),
+        ] {
+            w.extend([w0 | u32::from(VCC_LO) << 8, w1]);
+        }
+    };
+    // v2 = v1 * 4.
+    w.push(vop2(0x1A, 2, u16::from(TWO), 1));
+    address(&mut w);
+    // global_load_dword v7, v[5:6], off; s_waitcnt vmcnt(0);
+    // buffer_store_dword v7, v4, s[8:11], 0 offen.
+    let load = w.len();
+    w.extend([0xDC30_8000, 7 << 24 | 0x7D << 16 | 5, 0xBF8C_3F70]);
+    w.extend([
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 7 << 8 | 4,
+    ]);
+    w.push(S_ENDPGM);
+    // v2 = v1 * 4 + 32; s_branch load.
+    let back = w.len();
+    w[skip] = sopp(0x04, skip, back);
+    w.extend([vop2(0x1A, 2, u16::from(TWO), 1), vop2(0x25, 2, 128 + 32, 2)]);
+    address(&mut w);
+    w.push(sopp(0x02, w.len(), load));
+    w[distance] = (4 * w.len() - pc) as u32;
+    w.extend(1000..1016);
     w
 }
 
@@ -226,6 +278,17 @@ fn a_mask_joined_with_data_runs_where_only_the_data_is_read() {
         .collect();
     for (label, got) in run(&shader) {
         assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_table_address_joined_from_two_paths_reads_each_paths_dword() {
+    for (cmp, first) in [(0x06, 1000), (0x07, 1008)] {
+        let shader = lower_cs(&table_at_a_join(cmp)).expect("lower");
+        let want: Vec<u32> = (0..THREADS).map(|l| first + (l & 7)).collect();
+        for (label, got) in run(&shader) {
+            assert_eq!(got, want, "{label}, s_cmp {cmp:#x}");
+        }
     }
 }
 

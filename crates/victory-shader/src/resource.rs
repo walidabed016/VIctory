@@ -130,6 +130,13 @@ pub struct Resources {
     /// one (`s_load_*`), as a [`Linear`] function of a root parameter, or
     /// why it is none (an index loaded from memory, say).
     pub terms: Vec<(Site, Result<Linear, &'static str>)>,
+    /// Global accesses whose address a phi joins: the phi's block and the
+    /// address each of its predecessors brings, in [`Block::preds`]
+    /// order. Their [`Resources::scalar`] entry has the least of those
+    /// offsets and the phi as its dynamic term.
+    ///
+    /// [`Block::preds`]: crate::ir::Block::preds
+    pub joined: Vec<(Site, usize, Vec<Address>)>,
     pub descriptors: Vec<Descriptor>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
@@ -241,6 +248,12 @@ pub fn track(
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
+                    if let Some((block, _, addresses)) = t
+                        .joined(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .map_err(fail)?
+                    {
+                        out.joined.push((site, block, addresses));
+                    }
                     out.scalar.push((site, address));
                 }
                 _ => {}
@@ -305,6 +318,10 @@ struct Sum {
     offset: u32,
     dynamic: Option<Value>,
 }
+
+/// A phi's block, the phi, and the address each predecessor of the block
+/// brings.
+type Joined = (usize, Value, Vec<Address>);
 
 struct Tracer<'a> {
     p: &'a Program,
@@ -636,6 +653,14 @@ impl<'a> Tracer<'a> {
                 self.address(lo, hi, extra)
             }
             _ => {
+                if let Some((_, phi, addresses)) = self.joined(inst, addr, saddr, offset)? {
+                    let least = addresses.iter().map(|a| a.offset).min();
+                    return Ok(Address {
+                        param: addresses[0].param,
+                        offset: least.ok_or("a global address from a phi")?,
+                        dynamic: Some(phi),
+                    });
+                }
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
@@ -651,6 +676,58 @@ impl<'a> Tracer<'a> {
                 )
             }
         }
+    }
+
+    /// The addresses a phi joins into a global access's VGPR pair (its low
+    /// dword a phi; its high one a phi of the same block, or the same on
+    /// every edge): the phi's block, the phi, and per predecessor the
+    /// address it brings, `offset` added. `None` for other addresses.
+    fn joined(
+        &self,
+        inst: &Inst,
+        addr: Option<&Operand>,
+        saddr: Option<&Operand>,
+        offset: i16,
+    ) -> Result<Option<Joined>, &'static str> {
+        let Some(&Operand::Vector { reg, .. }) = addr else {
+            return Ok(None);
+        };
+        if matches!(saddr, Some(&Operand::Scalar { code, .. }) if code != NULL) {
+            return Ok(None);
+        }
+        let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
+        let (Some(Term::Value(lo)), Some(hi)) = (word(0), word(1)) else {
+            return Ok(None);
+        };
+        let Some((block, i)) = self.phis[lo.0 as usize] else {
+            return Ok(None);
+        };
+        let hi_phi = match hi {
+            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Const(_) => None,
+        };
+        if hi_phi.is_some_and(|(b, _)| b != block) {
+            return Err("a global address joined in two blocks");
+        }
+        let phis = &self.p.blocks[block].phis;
+        let addresses = phis[i]
+            .args
+            .iter()
+            .enumerate()
+            .map(|(j, &arg)| {
+                let hi = hi_phi.map_or(hi, |(_, h)| self.vorigin(phis[h].args[j]));
+                let extra = Sum {
+                    base: None,
+                    offset: offset as i32 as u32,
+                    dynamic: None,
+                };
+                self.address(self.vorigin(arg), hi, extra)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if addresses.iter().any(|a| a.param != addresses[0].param) {
+            return Err("a global address joined from two root parameters");
+        }
+        Ok(Some((block, lo, addresses)))
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's

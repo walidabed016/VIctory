@@ -777,6 +777,35 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
+    /// The bytes past `least` of the address a phi of `block` joins (see
+    /// [`Resources::joined`]): each predecessor computes its address's at
+    /// its end, and the join picks one.
+    fn joined_offset(&mut self, block: usize, addresses: &[Address], least: u32) -> Result<V, Why> {
+        let mut incoming = Vec::new();
+        for (&q, a) in self.x.p.blocks[block].preds.iter().zip(addresses) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let Some(tail) = self.tail[q] else {
+                return Err("a global address joined by a loop");
+            };
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let here = std::mem::replace(&mut self.cur, at);
+            let mut off = self.s.m.i32(a.offset.wrapping_sub(least));
+            let d = a.dynamic.map(|d| self.i32_of(d)).transpose();
+            if let Ok(Some(d)) = d {
+                off = self.s.m.bin(at, Bin::Add, off, d);
+            }
+            self.cur = here;
+            d?;
+            incoming.push((off, at));
+        }
+        let join = self.block[block].ok_or("a global address joined in a block not lowered")?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
+    }
+
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -808,7 +837,11 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        let x = self.x;
+        if let Some((_, block, addresses)) = x.res.joined.iter().find(|j| j.0 == (b, i)) {
+            let d = self.joined_offset(*block, addresses, a.offset)?;
+            off = self.s.m.bin(c, Bin::Add, off, d);
+        } else if let Some(d) = a.dynamic {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
