@@ -779,6 +779,10 @@ struct Resource {
     /// yet.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
+    /// The resource unordered access views use, if made (0: could not be;
+    /// see [`unordered_twin`]).
+    #[cfg(windows)]
+    twin: std::sync::OnceLock<usize>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -911,6 +915,44 @@ fn host_texture(
     texture
 }
 
+/// The resource unordered access views of `this` use when its host copy
+/// cannot have them: a depth texture the title also writes as unordered
+/// (Grand Theft Auto VI's shadow maps), which the PC refuses as one
+/// resource. Its twin has the same description without depth use, over
+/// the same memory, made on first use; draws and dispatches that write
+/// through such a view copy the depth texture into the twin before and
+/// back after ([`crate::draw`]).
+#[cfg(windows)]
+pub(crate) fn unordered_twin(this: This) -> Option<This> {
+    const DEPTH_UNORDERED: u32 = 0x2 | 0x4;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.desc.flags & DEPTH_UNORDERED != DEPTH_UNORDERED {
+        return None;
+    }
+    r.host.as_ref()?;
+    let twin = *r.twin.get_or_init(|| {
+        let mut desc = r.desc;
+        desc.flags &= !0x2;
+        let mut out = std::ptr::null();
+        let backing = Backing::Address(r.data());
+        let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
+        let made = hand_out_resource(desc, r.heap, r.heap_flags, backing, 0, null, iid, &mut out);
+        if made != S_OK {
+            return 0;
+        }
+        if resource(out).host.is_none() {
+            object::release_boxed::<Resource>(out);
+            tracing::warn!(?desc, "no unordered twin of a depth texture");
+            return 0;
+        }
+        out as usize
+    });
+    (twin != 0).then_some(twin as This)
+}
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
@@ -1004,6 +1046,8 @@ fn hand_out_resource(
                 state: state.into(),
             })
         }),
+        #[cfg(windows)]
+        twin: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1085,6 +1129,12 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        #[cfg(windows)]
+        if let Some(&twin) = self.twin.get()
+            && twin != 0
+        {
+            object::release_boxed::<Resource>(twin as This);
+        }
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,

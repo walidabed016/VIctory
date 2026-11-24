@@ -128,6 +128,35 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Depth textures and their unordered twins.
+type Twins = std::cell::RefCell<Vec<(This, This)>>;
+
+thread_local! {
+    /// The depth textures the draw or dispatch being recorded on this
+    /// thread writes through their unordered twins, and the twins
+    /// ([`crate::resource::unordered_twin`]): copied back after it.
+    static TWINS: Twins = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Copies what the draw or dispatch just recorded wrote into unordered
+/// twins back into their depth textures.
+fn twins_back(list: &HostList) {
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    for (depth, twin) in TWINS.take() {
+        let (Some(to), Some(from)) = (
+            crate::resource::host_resource(depth),
+            crate::resource::host_resource(twin),
+        ) else {
+            continue;
+        };
+        crate::list::ensure_state(list, twin, COPY_SOURCE);
+        crate::list::ensure_state(list, depth, COPY_DEST);
+        // SAFETY: an open list; live textures of one description.
+        unsafe { list.list.CopyResource(to, from) };
+    }
+}
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -461,6 +490,7 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         crate::descriptor::host::BINDING.set(self.pipeline);
+        TWINS.take();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -617,6 +647,7 @@ impl State {
         crate::indirect::close(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        twins_back(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -679,6 +710,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    twins_back(list);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1000,6 +1032,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            twins_back(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1088,6 +1121,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            twins_back(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1228,6 +1262,7 @@ impl State {
                 count_at.unwrap_or(0),
             )
         };
+        twins_back(list);
         if kind == DISPATCH {
             // Its groups may write arguments later executions read.
             crate::indirect::close(list);
@@ -1324,12 +1359,29 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            let mut resource = *resource as This;
+            // A depth texture's twin starts as the texture is.
+            if let Some(twin) = crate::resource::unordered_twin(resource)
+                && let (Some(to), Some(from)) = (
+                    crate::resource::host_resource(twin),
+                    crate::resource::host_resource(resource),
+                )
+            {
+                const COPY_DEST: u32 = 0x400;
+                const COPY_SOURCE: u32 = 0x800;
+                crate::list::ensure_state(list, resource, COPY_SOURCE);
+                crate::list::ensure_state(list, twin, COPY_DEST);
+                // SAFETY: an open list; live textures of one description.
+                unsafe { list.list.CopyResource(to, from) };
+                TWINS.with_borrow_mut(|t| t.push((resource, twin)));
+                resource = twin;
+            }
             #[cfg(feature = "diagnostics")]
             {
-                crate::capture::note_target(*resource as This);
-                crate::capture::note_access(*resource as This, true);
+                crate::capture::note_target(resource);
+                crate::capture::note_access(resource, true);
             }
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            crate::list::ensure_state(list, resource, UNORDERED_ACCESS);
         }
         _ => {}
     }
@@ -1704,6 +1756,94 @@ void main() {
         crate::shadow::unregister(p, start);
         release(p);
         assert_eq!(got, want, "words and kinds read through slots 37 and 9");
+    }
+
+    /// A depth texture the title also writes as unordered gets those
+    /// writes through its twin: the twin starts as the texture is and what
+    /// the command writes into it goes back to the texture after.
+    #[test]
+    fn unordered_writes_to_depth_textures_reach_them() {
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let memory = Box::leak(vec![0u8; 0x2_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        // A 64x64 16-bit depth texture, also unordered.
+        let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 53, 1, 0, 0, 0x6, 0];
+        let depth = crate::resource::texture_at(address, &desc).expect("a host texture");
+        let twin = crate::resource::unordered_twin(depth).expect("a twin");
+        let flags = |r: This| {
+            let t = crate::resource::host_resource(r).unwrap();
+            // SAFETY: a live resource.
+            unsafe { t.GetDesc() }.Flags.0 & 0x7
+        };
+        assert_eq!((flags(depth), flags(twin)), (0x2, 0x4));
+        assert_eq!(
+            crate::resource::unordered_twin(depth),
+            Some(twin),
+            "made once"
+        );
+        // A footprint of the texture's rows, 256 bytes apart.
+        let footprint = |buffer: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer; the location never releases it.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT(53),
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let texture = |r: This| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe {
+                std::mem::transmute_copy(crate::resource::host_resource(r).unwrap())
+            },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let (written, data) = host.shared_buffer(0x4000).unwrap();
+        // SAFETY: the buffer's mapped bytes.
+        unsafe { data.write_bytes(0x5a, 0x4000) };
+        let (read, back) = host.shared_buffer(0x4000).unwrap();
+        let list = host.new_list().unwrap();
+        let view = View::Unordered(depth as usize, 0, Some([55, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        readable(&list, ResourceType::Uav, &view);
+        // The command's write into the twin.
+        crate::list::ensure_state(&list, twin, COPY_DEST);
+        // SAFETY: an open list; live resources; whole subresources.
+        unsafe {
+            list.list
+                .CopyTextureRegion(&texture(twin), 0, 0, 0, &footprint(&written), None)
+        };
+        twins_back(&list);
+        crate::list::ensure_state(&list, depth, COPY_SOURCE);
+        // SAFETY: as above.
+        unsafe {
+            list.list
+                .CopyTextureRegion(&footprint(&read), 0, 0, 0, &texture(depth), None);
+            list.list.Close().unwrap();
+        }
+        host.execute(&[&list]);
+        // SAFETY: the mapped bytes the list wrote, waited for.
+        let row = unsafe { std::slice::from_raw_parts(back, 0x4000) };
+        assert!(
+            row.iter().step_by(256).all(|&b| b == 0x5a),
+            "the twin's write"
+        );
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Render targets the host has no texture or no view for keep their

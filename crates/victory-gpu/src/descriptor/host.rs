@@ -977,10 +977,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
+    // Unordered views name color formats: sRGB ones as linear, depth ones
+    // (of a depth texture's twin) as the color format of their bits.
+    const DEPTH_AS_COLOR: [(u32, u32); 2] = [(55, 56), (40, 41)];
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
             .iter()
+            .chain(&DEPTH_AS_COLOR)
             .find(|&&(s, _)| s == format.0 as u32)
     {
         format.0 = linear as i32;
@@ -1059,6 +1063,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
+            let resource = crate::resource::unordered_twin(resource).unwrap_or(resource);
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
@@ -1515,6 +1520,29 @@ mod tests {
         };
         assert_eq!(format(r), 86);
         assert!(!crate::resource::widened(r as crate::object::This));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// An unordered access view of a depth texture is made on its twin, in
+    /// the color format of its bits.
+    #[test]
+    fn unordered_views_of_depth_textures_view_their_twin() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = Box::leak(vec![0u8; 0x2_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 55, 1, 0, 0, 0x6, 0];
+        let depth = crate::resource::texture_at(address, &desc).expect("a host texture");
+        for format in [55, 56] {
+            let view =
+                View::Unordered(depth as usize, 0, Some([format, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+            assert!(make(&view, heap.cpu(0)).is_some(), "format {format}");
+        }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
