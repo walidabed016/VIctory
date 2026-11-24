@@ -439,6 +439,8 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::descriptor::host::BINDING.set(self.pipeline);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -835,7 +837,8 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
+                    // An empty one is made null below, as other views.
+                    Some(View::Constant(address, size)) if size > 0 => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

@@ -353,13 +353,14 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds; `size` bytes, not 0: an
+    /// empty view is made by [`HostHeap::make_at`]).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None, [0, 0, view_kind::CBV]);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_size(size, || format!("constant view of list data {size:#x}")),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -493,24 +494,30 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// address and length, up to the end of its buffer (the host clamps a view
+/// running past it to the buffer's copy, see [`on_copy`]).
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
-    let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
-            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
-            desc,
-        ),
-        View::Placed(false, resource, desc) if resource[0] == 1 => (
+    let placed = |resource: &[u32; 14], desc: &[u32; 16]| {
+        (
             u64::from(desc[10]) | u64::from(desc[11]) << 32,
-            desc[..10].try_into().ok()?,
-        ),
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+        )
+    };
+    let ((base, size), words): ((u64, u64), &[u32; 10]) = match view {
+        View::Shader(r, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            ((data as u64, len), desc)
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            (placed(resource, desc), desc[..10].try_into().ok()?)
+        }
         View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
+            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            return unordered_range(data as u64, len, desc);
         }
         View::Placed(true, resource, desc) if resource[0] == 1 => {
-            let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
+            let (base, size) = placed(resource, desc);
+            return unordered_range(base, size, desc[..10].try_into().ok()?);
         }
         _ => return None,
     };
@@ -518,22 +525,39 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
+    Some(in_buffer(
+        base,
+        size,
+        buffer.FirstElement,
+        buffer.NumElements,
+        element,
     ))
 }
 
-/// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
+/// [`buffer_range`] of an unordered access view of the buffer at `base`
+/// (`size` bytes).
+fn unordered_range(base: u64, size: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = Some(unordered_element(&desc)).filter(|&e| e > 0)?;
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
+    Some(in_buffer(
+        base,
+        size,
+        buffer.FirstElement,
+        buffer.NumElements,
+        element,
     ))
+}
+
+/// Where `count` elements of `element` bytes from element `first` of the
+/// buffer at `base` (`size` bytes) lie in it: their address and length.
+fn in_buffer(base: u64, size: u64, first: u64, count: u32, element: u64) -> (u64, u64) {
+    let start = base.saturating_add(first.saturating_mul(element));
+    let end = start
+        .saturating_add(u64::from(count) * element)
+        .min(base.saturating_add(size));
+    (start, end.saturating_sub(start))
 }
 
 /// Bytes per element of a buffer unordered access view.
@@ -598,6 +622,84 @@ fn raw_elements(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64
     ))
 }
 
+/// How many of a buffer view's `count` elements of `element` bytes from
+/// byte `start` of its host copy lie on the copy: all of them, or the ones
+/// before its end (the view is clamped to it); `None` where none do, for a
+/// null view of its kind (the title's view is `view`). The host removes
+/// the device for a view off its resource (an empty raw view of the world's
+/// buffer, 2026-11-24, run 48).
+fn on_copy(
+    shadow: &crate::shadow::Shadow,
+    start: u64,
+    count: u32,
+    element: u64,
+    view: impl FnOnce() -> String,
+) -> Option<u32> {
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let left = u32::try_from(width.saturating_sub(start) / element).unwrap_or(u32::MAX);
+    let made = count.min(left);
+    #[cfg(feature = "diagnostics")]
+    if made < count {
+        let why = if made == 0 {
+            "has no element on its host copy: made null"
+        } else {
+            "runs past the end of its host copy: clamped to it"
+        };
+        note_view(why, || {
+            format!(
+                "{}: {made} of {count} elements of {element} bytes from byte {start:#x} of a {width:#x}-byte copy",
+                view()
+            )
+        });
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = view;
+    (made > 0).then_some(made)
+}
+
+/// Bytes of the host's largest constant buffer view.
+const LARGEST_CONSTANT: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+
+/// The host size of a constant view of `size` bytes (the title's is
+/// `view`): 256-byte whole, at most [`LARGEST_CONSTANT`], which is all
+/// shaders address; the host removes the device for a larger view.
+fn constant_size(size: u32, view: impl FnOnce() -> String) -> u32 {
+    #[cfg(feature = "diagnostics")]
+    if size > LARGEST_CONSTANT {
+        note_view(
+            "is larger than a host constant view: clamped to 64 KiB",
+            view,
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = view;
+    size.min(LARGEST_CONSTANT).next_multiple_of(256)
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The title pipeline whose draw or dispatch makes host slots on this
+    /// thread, for [`note_view`] (diagnostics).
+    pub(crate) static BINDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Logs, once per cause, a view of title memory the host does not make as
+/// the title describes it: why (`why`), the title's view and the program
+/// whose draw or dispatch made it (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn note_view(why: &'static str, view: impl FnOnce() -> String) {
+    static SEEN: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&why) {
+        return;
+    }
+    seen.push(why);
+    let pipeline = BINDING.get() as crate::object::This;
+    let program = crate::pipeline::host_pipeline(pipeline).map_or("none", |p| p.name.as_str());
+    tracing::warn!(program, view = %view(), "a view of title memory {why} (logged once)");
+}
+
 /// What a slot made by [`make`] holds.
 struct Kept {
     /// The host resource it views, if any.
@@ -624,13 +726,36 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let (format, stride, bits) = (desc.Format.0, buffer.StructureByteStride, buffer.Flags.0);
+    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    let view = || {
+        let (at, len) = in_buffer(address, u64::MAX, first, count, element);
+        format!(
+            "shader resource view (format {format}, stride {stride}, flags {bits:#x}) of title {at:#x}+{len:#x}"
+        )
+    };
+    if count == 0 {
+        #[cfg(feature = "diagnostics")]
+        note_view("is empty: made null", view);
+        return None;
+    }
+    let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
+    if element == 0 || stride == 0 && offset % element != 0 {
+        once!(
+            offset,
+            element,
+            "buffer view not on an element of its host copy"
+        );
+        return None;
+    }
+    let start = offset.saturating_add(first.saturating_mul(element));
+    buffer.NumElements = on_copy(&shadow, start, count, element, view)?;
     let mut lead = 0;
-    if buffer.StructureByteStride > 0 {
+    if stride > 0 {
         let raw = raw_elements(
             offset,
             buffer.FirstElement,
@@ -649,13 +774,6 @@ fn buffer_srv(
         buffer.StructureByteStride = 0;
         buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW;
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
-    } else if element == 0 || offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
-        return None;
     } else {
         buffer.FirstElement += offset / element;
     }
@@ -688,6 +806,22 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    let element = unordered_element(&desc);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let (format, stride, bits) = (desc.Format.0, buffer.StructureByteStride, buffer.Flags.0);
+    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    let view = || {
+        let (at, len) = in_buffer(address, u64::MAX, first, count, element);
+        format!(
+            "unordered access view (format {format}, stride {stride}, flags {bits:#x}) of title {at:#x}+{len:#x}"
+        )
+    };
+    if count == 0 {
+        #[cfg(feature = "diagnostics")]
+        note_view("is empty: made null", view);
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -695,13 +829,20 @@ fn buffer_uav(
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    let element = unordered_element(&desc);
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
+    if element == 0 || stride == 0 && offset % element != 0 {
+        once!(
+            offset,
+            element,
+            "unordered buffer view not on an element of its host copy"
+        );
+        return None;
+    }
+    let start = offset.saturating_add(first.saturating_mul(element));
+    buffer.NumElements = on_copy(&shadow, start, count, element, view)?;
     buffer.CounterOffsetInBytes = 0;
     let mut lead = 0;
-    if buffer.StructureByteStride > 0 {
+    if stride > 0 {
         let raw = raw_elements(
             offset,
             buffer.FirstElement,
@@ -720,9 +861,6 @@ fn buffer_uav(
         buffer.StructureByteStride = 0;
         buffer.Flags |= D3D12_BUFFER_UAV_FLAG_RAW;
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
-    } else if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
-        return None;
     } else {
         buffer.FirstElement += offset / element;
     }
@@ -804,6 +942,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            let view = || format!("constant view of title {address:#x}+{size:#x}");
+            if size == 0 {
+                #[cfg(feature = "diagnostics")]
+                note_view("is empty: made null", view);
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -813,9 +957,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 );
                 return None;
             }
+            let size = constant_size(size, view);
+            let blocks = on_copy(&shadow, shadow.offset(address), size / 256, 256, view)?;
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: blocks * 256,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -937,25 +1083,36 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// view; of a buffer, raw or typed as the host makes the title's view
+/// (raw and structured ones raw). Writes to it are dropped, reads give
+/// zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    // Unordered views: whether a buffer, and the title's view dimension.
+    // Whether the title's buffer view words (its stride at `stride`, its
+    // flags at 8) make a raw view: structured or raw.
+    let raw = |words: &[u32], stride: usize| words[stride] > 0 || words[8] & 1 != 0;
+    // Unordered views: whether a buffer (and then whether raw), and the
+    // title's view dimension. Without a description, typed as before.
     let (buffer, dimension) = match view {
         View::Unordered(r, _, desc) => (
-            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+            (is_buffer(r) || desc.is_some_and(|d| d[1] == 1))
+                .then(|| desc.is_some_and(|d| raw(&d, 5))),
             desc.map(|d| d[1]),
         ),
-        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
+        View::Placed(true, resource, desc) => {
+            ((resource[0] == 1).then(|| raw(desc, 5)), Some(desc[1]))
+        }
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
-        // reports it).
+        // reports it). Without a description, raw as before.
         View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
+            return null_buffer_view(desc.is_none_or(|d| raw(&d, 7)), at);
         }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            return null_buffer_view(raw(desc, 7), at);
+        }
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
@@ -969,14 +1126,9 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
-        }
-    } else {
-        null_uav_desc(dimension)
+    let desc = match buffer {
+        Some(raw) => null_buffer_uav_desc(raw),
+        None => null_uav_desc(dimension),
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -1029,26 +1181,65 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
-/// A buffer view that reads zeros (raw, as translated shaders mostly read
-/// buffers).
-fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
-    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_TYPELESS,
+/// A null buffer unordered access view of one element (none is empty):
+/// raw, or typed (R32_UINT).
+fn null_buffer_uav_desc(raw: bool) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: if raw {
+            DXGI_FORMAT_R32_TYPELESS
+        } else {
+            DXGI_FORMAT_R32_UINT
+        },
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: if raw {
+                    D3D12_BUFFER_UAV_FLAG_RAW
+                } else {
+                    D3D12_BUFFER_UAV_FLAG_NONE
+                },
+                ..Default::default()
+            },
+        },
+    }
+}
+
+/// A null buffer shader resource view of one element, as
+/// [`null_buffer_uav_desc`].
+fn null_buffer_srv_desc(raw: bool) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: if raw {
+            DXGI_FORMAT_R32_TYPELESS
+        } else {
+            DXGI_FORMAT_R32_UINT
+        },
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
             Buffer: D3D12_BUFFER_SRV {
                 NumElements: 1,
-                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                Flags: if raw {
+                    D3D12_BUFFER_SRV_FLAG_RAW
+                } else {
+                    D3D12_BUFFER_SRV_FLAG_NONE
+                },
                 ..Default::default()
             },
         },
-    };
+    }
+}
+
+/// A buffer view that reads zeros, raw or typed ([`null_buffer_srv_desc`]).
+fn null_buffer_view(raw: bool, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        host.device.CreateShaderResourceView(
+            None::<&ID3D12Resource>,
+            Some(&null_buffer_srv_desc(raw)),
+            at,
+        )
     };
 }
 
@@ -1247,5 +1438,264 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// Bytes of [`Title`] and of its host copy.
+    const TITLE_LEN: u64 = 1 << 16;
+
+    /// A title buffer the host copies, at an address its copy's length
+    /// divides (so a constant view at its start is 256-byte aligned).
+    struct Title {
+        _memory: Vec<u8>,
+        start: u64,
+    }
+
+    impl Title {
+        fn new() -> Title {
+            let memory = vec![0u8; 2 * TITLE_LEN as usize];
+            let start = (memory.as_ptr() as u64).next_multiple_of(TITLE_LEN);
+            crate::shadow::register(start as usize, start, TITLE_LEN);
+            Title {
+                _memory: memory,
+                start,
+            }
+        }
+
+        /// A buffer view of it as the title places one (`words`: the view
+        /// description's).
+        fn view(&self, unordered: bool, words: [u32; 10]) -> View {
+            let mut resource = [0u32; 14];
+            (resource[0], resource[4]) = (1, TITLE_LEN as u32);
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = (self.start as u32, (self.start >> 32) as u32);
+            View::Placed(unordered, resource, desc)
+        }
+
+        /// A shader resource view of `count` elements from `first`.
+        fn srv(&self, format: u32, stride: u32, flags: u32, first: u32, count: u32) -> View {
+            self.view(
+                false,
+                [format, 1, 0x1688, 0, first, 0, count, stride, flags, 0],
+            )
+        }
+
+        /// An unordered access view of `count` elements from `first`.
+        fn uav(&self, format: u32, stride: u32, flags: u32, first: u32, count: u32) -> View {
+            self.view(true, [format, 1, first, 0, count, stride, 0, 0, flags, 0])
+        }
+    }
+
+    impl Drop for Title {
+        fn drop(&mut self) {
+            crate::shadow::unregister(self.start as usize, self.start);
+        }
+    }
+
+    /// Runs `make`, which makes slot `index` of `heap`: the debug layer
+    /// reports no error, the device stays alive and the slot's record is
+    /// `record` (stride, lead and kind; `[0; 3]` for a null view).
+    fn check(heap: &HostHeap, index: u32, what: &str, make: impl FnOnce(), record: [u32; 3]) {
+        let host = host().expect("a heap's device");
+        let errors = crate::host::errors_of(make).unwrap_or_default();
+        assert!(errors.is_empty(), "{what}: {errors:?}");
+        // SAFETY: a plain device query.
+        let alive = unsafe { host.device.GetDeviceRemovedReason() };
+        assert!(alive.is_ok(), "{what}: {alive:?}");
+        let data = heap.strides.as_ref().map_or(0, |s| s.1);
+        // SAFETY: the slot's record in the mapped buffer.
+        let got = unsafe {
+            (data as *const [u32; 4])
+                .add(index as usize)
+                .read_volatile()
+        };
+        assert_eq!(got[..3], record, "{what}");
+    }
+
+    /// Makes each view in a slot of its own, as [`check`].
+    fn check_views(cases: &[(&str, View, [u32; 3])]) {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        for (index, (what, view, record)) in (0..).zip(cases) {
+            check(&heap, index, what, || heap.make_at(index, view), *record);
+        }
+    }
+
+    /// Raw views (R32_TYPELESS, flag 1) of the 16384 dwords of a copy: an
+    /// empty one and one starting at the copy's end are null and recorded
+    /// as nothing; one running past the end is clamped to it.
+    #[test]
+    fn raw_srvs_stay_on_their_copy() {
+        let title = Title::new();
+        check_views(&[
+            ("empty", title.srv(39, 0, 1, 0, 0), [0; 3]),
+            (
+                "past the end",
+                title.srv(39, 0, 1, 16_000, 1000),
+                [4, 0, view_kind::RAW_SRV],
+            ),
+            ("at the end", title.srv(39, 0, 1, 16_384, 1), [0; 3]),
+        ]);
+    }
+
+    /// As [`raw_srvs_stay_on_their_copy`], for 8-byte records (made raw).
+    #[test]
+    fn structured_srvs_stay_on_their_copy() {
+        let title = Title::new();
+        check_views(&[
+            ("empty", title.srv(0, 8, 0, 0, 0), [0; 3]),
+            (
+                "past the end",
+                title.srv(0, 8, 0, 8000, 500),
+                [8, 0, view_kind::RAW_SRV],
+            ),
+            ("at the end", title.srv(0, 8, 0, 8192, 1), [0; 3]),
+        ]);
+    }
+
+    /// As [`raw_srvs_stay_on_their_copy`], for R32G32B32A32_FLOAT elements.
+    #[test]
+    fn typed_srvs_stay_on_their_copy() {
+        let title = Title::new();
+        check_views(&[
+            ("empty", title.srv(2, 0, 0, 0, 0), [0; 3]),
+            (
+                "past the end",
+                title.srv(2, 0, 0, 4000, 200),
+                [16, 0, view_kind::TYPED_SRV],
+            ),
+            ("at the end", title.srv(2, 0, 0, 4096, 1), [0; 3]),
+        ]);
+    }
+
+    /// As [`raw_srvs_stay_on_their_copy`], for unordered access: the empty
+    /// raw view is the one that removed the device in the world's dispatch
+    /// (2026-11-24, run 48).
+    #[test]
+    fn raw_uavs_stay_on_their_copy() {
+        let title = Title::new();
+        check_views(&[
+            ("empty", title.uav(39, 0, 1, 0, 0), [0; 3]),
+            (
+                "past the end",
+                title.uav(39, 0, 1, 16_000, 1000),
+                [4, 0, view_kind::RAW_UAV],
+            ),
+            ("at the end", title.uav(39, 0, 1, 16_384, 1), [0; 3]),
+        ]);
+    }
+
+    /// As [`structured_srvs_stay_on_their_copy`], for unordered access.
+    #[test]
+    fn structured_uavs_stay_on_their_copy() {
+        let title = Title::new();
+        check_views(&[
+            ("empty", title.uav(0, 8, 0, 0, 0), [0; 3]),
+            (
+                "past the end",
+                title.uav(0, 8, 0, 8000, 500),
+                [8, 0, view_kind::RAW_UAV],
+            ),
+            ("at the end", title.uav(0, 8, 0, 8192, 1), [0; 3]),
+        ]);
+    }
+
+    /// As [`raw_srvs_stay_on_their_copy`], for R32_UINT unordered access.
+    #[test]
+    fn typed_uavs_stay_on_their_copy() {
+        let title = Title::new();
+        check_views(&[
+            ("empty", title.uav(42, 0, 0, 0, 0), [0; 3]),
+            (
+                "past the end",
+                title.uav(42, 0, 0, 16_000, 1000),
+                [4, 0, view_kind::TYPED_UAV],
+            ),
+            ("at the end", title.uav(42, 0, 0, 16_384, 1), [0; 3]),
+        ]);
+    }
+
+    /// Constant views: an empty one is null and recorded as nothing,
+    /// whether of title memory or of the list's; ones past or at the end of
+    /// a title buffer view the memory after it (a copy of their own).
+    #[test]
+    fn constant_views_stay_on_their_copy() {
+        let title = Title::new();
+        let end = title.start + TITLE_LEN;
+        check_views(&[
+            ("empty", View::Constant(title.start, 0), [0; 3]),
+            (
+                "past the end",
+                View::Constant(end - 256, 512),
+                [0, 0, view_kind::CBV],
+            ),
+            (
+                "at the end",
+                View::Constant(end, 256),
+                [0, 0, view_kind::CBV],
+            ),
+            (
+                "128 KiB",
+                View::Constant(title.start, 2 * TITLE_LEN as u32),
+                [0, 0, view_kind::CBV],
+            ),
+        ]);
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let copy = crate::shadow::find(title.start, TITLE_LEN).expect("a copy");
+        let gpu = copy.gpu(title.start);
+        let list_data = || heap.constant_at(0, gpu, 2 * TITLE_LEN as u32);
+        check(
+            &heap,
+            0,
+            "128 KiB of list data",
+            list_data,
+            [0, 0, view_kind::CBV],
+        );
+    }
+
+    /// The title memory a buffer view reads ends with its buffer (what the
+    /// host refreshes and copies back for it, from its buffer's copy).
+    #[test]
+    fn buffer_ranges_end_with_their_buffer() {
+        let title = Title::new();
+        let s = title.start;
+        let range = |view: View| buffer_range(&view);
+        assert_eq!(
+            range(title.srv(39, 0, 1, 16_000, 100)),
+            Some((s + 64_000, 400))
+        );
+        assert_eq!(
+            range(title.srv(39, 0, 1, 16_000, 1000)),
+            Some((s + 64_000, 1536))
+        );
+        assert_eq!(range(title.srv(2, 0, 0, 4096, 1)), Some((s + TITLE_LEN, 0)));
+        assert_eq!(
+            range(title.uav(0, 8, 0, 8000, 500)),
+            Some((s + 64_000, 1536))
+        );
+        assert_eq!(range(title.uav(42, 0, 0, 0, 0)), Some((s, 0)));
+    }
+
+    /// Null buffer views are raw or typed, as the views they stand for,
+    /// and never empty.
+    #[test]
+    fn null_buffer_views_are_raw_or_typed() {
+        for raw in [true, false] {
+            let (srv, uav) = (null_buffer_srv_desc(raw), null_buffer_uav_desc(raw));
+            // SAFETY: the buffer members the dimensions name.
+            let (s, u) = unsafe { (srv.Anonymous.Buffer, uav.Anonymous.Buffer) };
+            assert_eq!((s.NumElements, u.NumElements), (1, 1));
+            assert_eq!(s.Flags == D3D12_BUFFER_SRV_FLAG_RAW, raw);
+            assert_eq!(u.Flags == D3D12_BUFFER_UAV_FLAG_RAW, raw);
+            let format = if raw {
+                DXGI_FORMAT_R32_TYPELESS
+            } else {
+                DXGI_FORMAT_R32_UINT
+            };
+            assert_eq!((srv.Format, uav.Format), (format, format));
+        }
     }
 }

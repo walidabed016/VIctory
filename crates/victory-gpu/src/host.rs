@@ -48,8 +48,8 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
-    /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
-    /// layer's messages.
+    /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds) and in unit
+    /// tests: the debug layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
@@ -138,9 +138,10 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        // The debug layer only in builds with diagnostics, and in unit tests
+        // (which count its errors: [`errors_of`]).
+        let debug = cfg!(test)
+            || cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -256,6 +257,53 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         }
         Ok(adapter)
     }
+}
+
+/// The errors the debug layer reports for what `f` does on this thread
+/// (unit tests run in parallel on the one device); `None` without the
+/// debug layer.
+#[cfg(test)]
+pub(crate) fn errors_of(f: impl FnOnce()) -> Option<Vec<String>> {
+    use std::cell::RefCell;
+    thread_local! {
+        static ERRORS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+    // The layer calls it on the thread that made the call it reports.
+    unsafe extern "system" fn note(
+        _category: D3D12_MESSAGE_CATEGORY,
+        severity: D3D12_MESSAGE_SEVERITY,
+        _id: D3D12_MESSAGE_ID,
+        description: windows::core::PCSTR,
+        _context: *mut std::ffi::c_void,
+    ) {
+        if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+            // SAFETY: the layer passes a NUL-terminated string.
+            let text = unsafe { description.to_string() }.unwrap_or_default();
+            ERRORS.with_borrow_mut(|errors| errors.iter_mut().for_each(|e| e.push(text.clone())));
+        }
+    }
+    static COUNTING: OnceLock<bool> = OnceLock::new();
+    let counting = *COUNTING.get_or_init(|| {
+        let queue = host()
+            .and_then(|h| h.messages.as_ref())
+            .and_then(|q| q.cast::<ID3D12InfoQueue1>().ok());
+        let mut cookie = 0;
+        queue.is_some_and(|q| {
+            // SAFETY: a function that lives as long as the process.
+            unsafe {
+                q.RegisterMessageCallback(
+                    Some(note),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+            }
+            .is_ok()
+        })
+    });
+    ERRORS.set(counting.then(Vec::new));
+    f();
+    ERRORS.take()
 }
 
 #[cfg(test)]
