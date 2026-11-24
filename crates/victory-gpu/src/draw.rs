@@ -493,6 +493,26 @@ impl State {
                     }
                 }
             }
+            if let Some(param) = stage.view_strides {
+                // The record strides of the view heap the shader indexes.
+                let strides = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.strides());
+                let Some((buffer, gpu)) = strides else {
+                    once!("a shader reads view strides without a view heap that has them: dropped");
+                    return false;
+                };
+                list.keep(buffer);
+                // SAFETY: an open list; the buffer lives while the list does.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))

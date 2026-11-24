@@ -113,7 +113,8 @@ impl Host {
     }
 
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
+    /// parameter k, root views follow, then the view heap's records
+    /// if a stage reads them.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -152,6 +153,19 @@ impl Host {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        if stages.iter().any(|(s, _)| s.view_strides) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::VIEW_STRIDE_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -528,6 +542,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        view_strides: false,
     }
 }
 

@@ -49,6 +49,22 @@
 //!   title's view description says. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
+//! * **Records of the view heap** (added 2026-11-24): an indexed access
+//!   (`idxen` dword loads, stores, atomics) goes to the raw view the host
+//!   makes of every untyped buffer view (structured ones included) at byte
+//!   index * stride + offset, plus the view's lead for a heap descriptor.
+//!   Dwords `2i` and `2i + 1` of a raw root SRV `t0` in
+//!   [`VIEW_STRIDE_SPACE`] ([`HostShader::view_strides`]) hold the view at
+//!   heap index `i`'s element size, which is what the console descriptor's
+//!   stride field holds (a structured view's `StructureByteStride`, a typed
+//!   view's format size, 4 for a raw view, 0 where no buffer view is), and
+//!   its lead: the bytes its host raw view starts before the first record
+//!   (raw views start on 16 bytes, records on any dword). The stride is the
+//!   used-resource entry's where one names the descriptor, else the one read
+//!   at run time (a descriptor the program reads from the heap itself,
+//!   `ResourceDescriptorHeap[i]` in HLSL). Grand Theft Auto VI's instance
+//!   culling and ray-tracing material resolves read their instance and
+//!   geometry records this way.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
@@ -87,6 +103,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod stride_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -100,7 +118,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDE_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -159,6 +177,10 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Whether the shader reads the view heap's records: a root SRV `t0`
+    /// in [`VIEW_STRIDE_SPACE`] over two dwords (stride and lead) per slot
+    /// of the view heap it indexes (see the module notes).
+    pub view_strides: bool,
 }
 
 impl HostShader {
@@ -337,6 +359,7 @@ pub fn emit_with_waves(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        view_strides: l.view_strides,
     };
     Ok((shader, l.waves))
 }
@@ -595,6 +618,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            view_strides: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -605,6 +629,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                view_strides: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

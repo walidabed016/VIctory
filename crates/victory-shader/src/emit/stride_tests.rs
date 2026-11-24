@@ -1,0 +1,251 @@
+//! End-to-end tests of indexed buffer accesses whose record stride is only
+//! in the descriptor (a heap descriptor no used-resource entry names): the
+//! stride, and the bytes the host's raw view starts before the first
+//! record, come from the view heap's records at run time. Synthetic
+//! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present, and
+//! run on the host GPU and WARP against views of each kind.
+
+use super::host::{Dispatch, Host, Root, Stride, View};
+use super::{HostShader, lower, validator};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+};
+use crate::{io, ir, resource, structure};
+
+const LANES: u32 = 32;
+
+/// Lowers a wave32 program of 32 lanes with the resource heap at s0 and a
+/// table at s1 whose entry 0 is a raw UAV.
+fn build(words: &[u32]) -> HostShader {
+    let param = |root, user_data: u8| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: user_data,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![param(RootType::ResourceHeap, 0), param(RootType::Table, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [LANES, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    assert!(lowered.view_strides, "the stride is read at run time");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        view_strides: lowered.view_strides,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    } else {
+        eprintln!("no dxil.dll; validation skipped");
+    }
+    shader
+}
+
+/// Runs `shader` with `views` at heap indices 0.. and their `records`
+/// (stride and lead, one per view) on the hardware GPU and on WARP (each
+/// skipped without a device): per one that ran, each UAV's dwords in heap
+/// order.
+fn run(
+    shader: &HostShader,
+    views: &[View],
+    records: &[[u32; 2]],
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // The table starts at heap index 0; the view records follow the
+        // user data (no root views).
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let uavs = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: records.concat(),
+                            },
+                        ),
+                    ],
+                    views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push((label, uavs));
+    }
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    out
+}
+
+/// Each lane loads dwords 1 and 2 of record `lane` of the buffer at heap
+/// index 1 (`buffer_load_dwordx2 idxen offset:4`, a descriptor read from the
+/// heap) and stores them at dword 2 * lane of the UAV.
+const LOAD_RECORDS: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0 (the resource heap)
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 0x20 (heap index 1)
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE034_2004,
+    0x8002_0100, // buffer_load_dwordx2 v[1:2], v0, s[8:11], 0 idxen offset:4
+    0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE074_1000,
+    0x8003_0103, // buffer_store_dwordx2 v[1:2], v3, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// What [`LOAD_RECORDS`] stores from `data` read in records of `stride`
+/// bytes.
+fn loaded(data: &[u32], stride: u32) -> Vec<u32> {
+    (0..LANES)
+        .flat_map(|l| {
+            let first = (l * stride / 4 + 1) as usize;
+            [data[first], data[first + 1]]
+        })
+        .collect()
+}
+
+// The host makes raw views of untyped buffer views (structured ones
+// included), and keeps each view's element size (4 for raw views, the
+// structure's stride for structured ones) and lead: the bytes its raw view
+// starts before the first record, to start on 16 bytes.
+const RECORDS: [[u32; 2]; 5] = [[4, 0], [12, 0], [64, 0], [12, 8], [64, 12]];
+
+#[test]
+fn indexed_loads_read_records_of_the_views_own_stride() {
+    let shader = build(LOAD_RECORDS);
+    let mut failed = Vec::new();
+    for [stride, lead] in RECORDS {
+        // A record more for the last lane's second dword of 4-byte records.
+        let data: Vec<u32> = (0..(lead + LANES * stride) / 4 + 4)
+            .map(|i| 1000 + i)
+            .collect();
+        let views = [
+            View::RawUav(2 * LANES),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ];
+        let want = loaded(&data[lead as usize / 4..], stride);
+        for (label, uavs) in run(&shader, &views, &[[4, 0], [stride, lead]]) {
+            if uavs[0] != want {
+                failed.push(format!(
+                    "{label} {stride}+{lead}: got {:?}, want {want:?}",
+                    uavs[0]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Each lane stores its index to dword 1 of record `lane`, and adds 1 to
+/// dword 2 of record `lane & 3`, of the UAV at heap index 1 (indexed
+/// `buffer_store_dword` and `buffer_atomic_add` through a descriptor read
+/// from the heap).
+const STORE_RECORDS: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0 (the resource heap)
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 0x20 (heap index 1)
+    0x3606_0083, // v_and_b32 v3, 3, v0
+    0x7E04_0281, // v_mov_b32 v2, 1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_2004,
+    0x8002_0000, // buffer_store_dword v0, v0, s[8:11], 0 idxen offset:4
+    0xE0C8_2008,
+    0x8002_0203, // buffer_atomic_add v2, v3, s[8:11], 0 idxen offset:8
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn indexed_stores_and_atomics_write_records_of_the_views_own_stride() {
+    let shader = build(STORE_RECORDS);
+    let mut failed = Vec::new();
+    for [stride, lead] in [[12, 0], [64, 0], [12, 4]] {
+        let dwords = (lead + LANES * stride) / 4;
+        let views = [View::RawUav(1), View::RawUav(dwords)];
+        let mut want = vec![0u32; dwords as usize];
+        let at = |record: u32, dword: u32| ((lead + record * stride) / 4 + dword) as usize;
+        for lane in 0..LANES {
+            want[at(lane, 1)] = lane;
+        }
+        for record in 0..4 {
+            want[at(record, 2)] = LANES / 4;
+        }
+        for (label, uavs) in run(&shader, &views, &[[4, 0], [stride, lead]]) {
+            if uavs[1] != want {
+                failed.push(format!(
+                    "{label} {stride}+{lead}: got {:?}, want {want:?}",
+                    uavs[1]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
