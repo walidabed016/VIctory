@@ -60,8 +60,13 @@ impl Pending {
     }
 
     fn make(&self) {
+        let started = Instant::now();
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let ms = started.elapsed().as_millis() as u64;
+        if ms >= 1000 {
+            tracing::info!(ms, shaders = ?self.shaders, "slow host pipeline");
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -157,14 +162,17 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (three quarters of the logical processors, 2
+/// to 24), started on first use. A few driver compiles take tens of seconds
+/// (minutes with Aftermath's shader debug information): with 8 workers,
+/// those held every worker and the queue stood still for minutes (run 70).
 fn queue(p: Arc<Pending>) {
     static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers =
+            std::thread::available_parallelism().map_or(2, |n| (n.get() * 3 / 4).clamp(2, 24));
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned =
