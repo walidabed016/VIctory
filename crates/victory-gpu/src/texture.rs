@@ -45,6 +45,9 @@ pub(crate) struct Staging {
     mips: u32,
     memory: *const u8,
     last: Mutex<Last>,
+    /// What it is, for the per-texture refresh lines (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    name: String,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -182,9 +185,12 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        let us = started.elapsed().as_micros() as u64;
         let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[2].fetch_add(us, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        seen::note(self, None, us);
     }
 
     /// Returns the bytes of title memory read.
@@ -195,6 +201,8 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                #[cfg(feature = "diagnostics")]
+                seen::note(self, Some(seen::Outcome::Watched), 0);
                 return 0;
             }
             last.asked = now;
@@ -209,6 +217,8 @@ impl Staging {
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            #[cfg(feature = "diagnostics")]
+            seen::note(self, Some(seen::Outcome::WatchedWritten), 0);
             return size;
         }
         if !committed(self.memory, size) {
@@ -219,6 +229,8 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
+            #[cfg(feature = "diagnostics")]
+            seen::note(self, Some(seen::Outcome::Uncommitted), 0);
             return 0;
         }
         // SAFETY: committed memory of the texture's layout size.
@@ -231,8 +243,19 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            #[cfg(feature = "diagnostics")]
+            seen::note(self, Some(seen::Outcome::Hashed), 0);
             return size;
         }
+        #[cfg(feature = "diagnostics")]
+        seen::note(
+            self,
+            Some(match last.hash {
+                None => seen::Outcome::HashedFirst,
+                Some(_) => seen::Outcome::HashedChanged,
+            }),
+            0,
+        );
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
@@ -368,7 +391,190 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         memory,
         last: Mutex::default(),
+        #[cfg(feature = "diagnostics")]
+        name: format!(
+            "{}x{}x{} f{} mips {}, {}",
+            d.Width,
+            d.Height,
+            d.DepthOrArraySize,
+            d.Format.0,
+            d.MipLevels,
+            crate::resource::backing_text(resource)
+        ),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Diagnostics: what each texture's refreshes found, logged with the
+/// frame-rate line: totals by memory kind, then the textures that cost most
+/// and those that changed most (`VICTORY_TEXTURE_LINES` lines each, 12 by
+/// default).
+#[cfg(feature = "diagnostics")]
+pub(crate) mod seen {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Outcome {
+        /// Watched (or guarded), not written since it was detiled.
+        Watched,
+        /// Watched and written since: detiled.
+        WatchedWritten,
+        /// Not committed: left as it was.
+        Uncommitted,
+        /// Hashed, unchanged.
+        Hashed,
+        /// Hashed for the first time: detiled.
+        HashedFirst,
+        /// Hashed and changed: detiled.
+        HashedChanged,
+    }
+    const OUTCOMES: usize = 6;
+    const NAMES: [&str; OUTCOMES] = [
+        "unwritten",
+        "written",
+        "uncommitted",
+        "hashed same",
+        "hashed first",
+        "hashed changed",
+    ];
+
+    struct Seen {
+        name: String,
+        size: usize,
+        memory: &'static str,
+        refreshes: u64,
+        us: u64,
+        outcomes: [u64; OUTCOMES],
+        /// Hash changes while a copy of ours had written the memory since
+        /// the submission began.
+        ours: u64,
+    }
+
+    static SEEN: Mutex<Option<HashMap<usize, Seen>>> = Mutex::new(None);
+
+    /// A refresh of `staging` found `outcome`; `None`: it ended, taking
+    /// `us`.
+    pub(crate) fn note(staging: &super::Staging, outcome: Option<Outcome>, us: u64) {
+        let (start, end) = staging.memory();
+        let ours = matches!(outcome, Some(Outcome::HashedChanged))
+            && crate::watch::wrote_since(0, start, end);
+        let mut map = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let s = map
+            .get_or_insert_with(HashMap::new)
+            .entry(start)
+            .or_insert_with(|| Seen {
+                name: staging.name.clone(),
+                size: end - start,
+                memory: memory(start),
+                refreshes: 0,
+                us: 0,
+                outcomes: [0; OUTCOMES],
+                ours: 0,
+            });
+        match outcome {
+            Some(o) => s.outcomes[o as usize] += 1,
+            None => {
+                s.refreshes += 1;
+                s.us += us;
+            }
+        }
+        s.ours += u64::from(ours);
+    }
+
+    /// The kind of memory at `at`: a view (physical pages), write-watched,
+    /// or neither.
+    fn memory(at: usize) -> &'static str {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        if crate::watch::view(at) {
+            return "view";
+        }
+        let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+        // SAFETY: room for one answer; without the reset flag nothing changes.
+        let watched = unsafe {
+            GetWriteWatch(
+                0,
+                (at & !0xfff) as *const _,
+                0x1000,
+                (&raw mut found).cast(),
+                &mut count,
+                &mut granularity,
+            ) == 0
+        };
+        if watched { "watched" } else { "unwatched" }
+    }
+
+    /// Logs the textures refreshed per frame over `frames` frames.
+    pub(crate) fn log(frames: f64) {
+        let Some(map) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let lines = std::env::var("VICTORY_TEXTURE_LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let mut seen: Vec<(usize, Seen)> = map.into_iter().collect();
+        let hashes = |s: &Seen| s.outcomes[3] + s.outcomes[4] + s.outcomes[5];
+        let changes = |s: &Seen| s.outcomes[1] + s.outcomes[4] + s.outcomes[5];
+        for kind in ["view", "watched", "unwatched"] {
+            let of: Vec<&Seen> = seen
+                .iter()
+                .map(|(_, s)| s)
+                .filter(|s| s.memory == kind)
+                .collect();
+            if of.is_empty() {
+                continue;
+            }
+            let mut outcomes = [0u64; OUTCOMES];
+            for s in &of {
+                for (t, n) in outcomes.iter_mut().zip(s.outcomes) {
+                    *t += n;
+                }
+            }
+            let sum =
+                |f: &dyn Fn(&Seen) -> u64| of.iter().map(|s| f(s)).sum::<u64>() as f64 / frames;
+            let text: Vec<String> = NAMES
+                .iter()
+                .zip(outcomes)
+                .filter(|&(_, n)| n > 0)
+                .map(|(name, n)| format!("{name} {:.1}", n as f64 / frames))
+                .collect();
+            tracing::info!(
+                "textures refreshed per frame, {kind} memory: {} distinct, {:.1} refreshes {:.2} ms, {:.1} MB hashed, {:.1} MB detiled; {}; {:.1} hash changes after copies of ours",
+                of.len(),
+                sum(&|s| s.refreshes),
+                sum(&|s| s.us) / 1e3,
+                sum(&|s| hashes(s) * s.size as u64) / 1e6,
+                sum(&|s| changes(s) * s.size as u64) / 1e6,
+                text.join(", "),
+                sum(&|s| s.ours),
+            );
+        }
+        let line = |order: &str, at: usize, s: &Seen| {
+            let text: Vec<String> = NAMES
+                .iter()
+                .zip(s.outcomes)
+                .filter(|&(_, n)| n > 0)
+                .map(|(name, n)| format!("{name} {:.1}", n as f64 / frames))
+                .collect();
+            tracing::info!(
+                "  texture {order} {at:#x}+{:#x} ({}, {}): {:.1} refreshes {:.2} ms per frame; {}",
+                s.size,
+                s.memory,
+                s.name,
+                s.refreshes as f64 / frames,
+                s.us as f64 / 1e3 / frames,
+                text.join(", ")
+            );
+        };
+        seen.sort_by_key(|(_, s)| std::cmp::Reverse(s.us));
+        for (at, s) in seen.iter().take(lines) {
+            line("costing", *at, s);
+        }
+        seen.sort_by_key(|(_, s)| std::cmp::Reverse(changes(s)));
+        for (at, s) in seen.iter().take(lines).filter(|(_, s)| changes(s) > 0) {
+            line("changing", *at, s);
+        }
+    }
 }

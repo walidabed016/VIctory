@@ -882,6 +882,29 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// How a resource's memory is held (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn backing_text(this: This) -> String {
+    let r = resource(this);
+    match r.backing {
+        Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
+        Backing::Placed { offset, .. } => {
+            format!("placed at {offset:#x} of a heap at {:p}", heap_base(r))
+        }
+        Backing::Address(_) => "at a title address".into(),
+    }
+}
+
+/// The memory of the heap a placed resource lies in (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn heap_base(r: &Resource) -> *const u8 {
+    match r.backing {
+        // SAFETY: a placed resource holds a reference to its heap.
+        Backing::Placed { heap, .. } => unsafe { (*heap.cast::<Heap>()).memory.ptr.as_ptr() },
+        _ => std::ptr::null(),
+    }
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {

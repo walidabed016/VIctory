@@ -1956,6 +1956,7 @@ impl Meter {
             {
                 let span = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(span);
+                crate::texture::seen::log(span);
                 crate::shadow::log_roots(span);
                 log_gpu_times(span);
                 let seen = crate::indirect::SEEN.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
