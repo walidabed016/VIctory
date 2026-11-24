@@ -529,6 +529,8 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Loose-memory windows copied for the first time get their tiles.
+        crate::shadow::map_windows(&self.queue);
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1281,9 +1283,14 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// How far apart two ranges of a loose-memory mirror slab may be and still
+/// be refreshed as one ([`Batch::add`]).
+const NEAR: usize = 4 << 20;
+
+/// A submission's refreshes not done yet, merged per buffer copy (per
+/// region of a loose-memory mirror slab) into the range that covers them:
+/// done before a step that writes title memory or gives a range to shaders,
+/// and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -1304,10 +1311,15 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        // A slab of the loose-memory mirror spans a GiB of title memory: its
+        // ranges merge only with those near them (as in the 4 MiB windows
+        // it replaces), not into one range over everything between.
+        let near =
+            |from: usize, to: usize| !shadow.mirror() || address <= to + NEAR && from <= end + NEAR;
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, from, to)| std::sync::Arc::ptr_eq(s, shadow) && near(*from, *to))
         {
             Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
             None => self.refreshes.push((shadow.clone(), address, end)),
@@ -1651,7 +1663,9 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                let span = std::mem::take(&mut self.copy_stats_frames) as f64;
+                crate::copystat::log(span);
+                crate::shadow::log_roots(span);
                 let seen = crate::indirect::SEEN.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "indirect records run per frame: mesh {:.0} with groups, {:.0} empty; draws {:.0}, {:.0} empty; dispatches {:.0}, {:.0} empty",
@@ -2124,6 +2138,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    /// Ranges of a loose-memory mirror slab merge only with ranges near
+    /// them: a slab spans a GiB, and one range over all between two far
+    /// ranges would have the watch check all of it.
+    #[test]
+    fn mirror_slab_ranges_merge_only_when_near() {
+        use crate::shadow::tests::{gpu, release, title_memory};
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let p = title_memory(900, 512 << 20, 128 << 20, 1 << 20);
+        assert_ne!(p, 0, "no free address for test memory");
+        let slab = crate::shadow::find(p as u64, 1).unwrap();
+        let mut batch = Batch::default();
+        batch.add(&slab, p, 4096);
+        batch.add(&slab, p + (2 << 20), 4096);
+        batch.add(&slab, p + (100 << 20), 4096);
+        let ranges: Vec<(usize, usize)> = batch.refreshes.iter().map(|&(_, a, b)| (a, b)).collect();
+        let far = p + (100 << 20);
+        assert_eq!(ranges, [(p, p + (2 << 20) + 4096), (far, far + 4096)]);
+        batch.refreshes.clear();
+        drop(slab);
+        release(p);
     }
 
     #[test]

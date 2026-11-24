@@ -142,16 +142,28 @@ pub(crate) fn dispatched() -> u64 {
 pub(crate) static HEAP_SLOTS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
-/// other views as 1 MiB (both cut at their buffer's end).
+/// How far past its address a root shader-resource view is read. Root
+/// views have no size: Grand Theft Auto VI's skinning reads up to ~35.8 MiB
+/// past one (an offset of up to 32 MiB in its first word, then up to 65,535
+/// records of up to 60 bytes).
+const ROOT_SRV_REACH: u64 = 36 << 20;
+
+/// How far a root constant buffer view is read: 4,096 rows of 16 bytes.
+const ROOT_CBV_REACH: u64 = 1 << 16;
+
+fn root_reach(srv: bool) -> u64 {
+    if srv { ROOT_SRV_REACH } else { ROOT_CBV_REACH }
+}
+
+/// The host address of a root view: its host copy
+/// ([`crate::shadow::root`]), brought up to date as far as the view may be
+/// read, or for a constant buffer not 256-byte aligned there (the console
+/// needs 16) a copy in upload memory.
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let reach = root_reach(srv);
+    let (shadow, len) = crate::shadow::root(address, reach)?;
+    #[cfg(feature = "diagnostics")]
+    crate::shadow::note_root(address, reach, &shadow, len);
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -608,14 +620,16 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            let views = stage.root_cbvs.iter().map(|v| (v, false));
+            for (&(slot, _), srv) in views.chain(stage.root_srvs.iter().map(|v| (v, true))) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1).map(|s| {
-                        // Host address, bytes left in the copy, the copy's
-                        // title start and its first word there.
+                    let host = crate::shadow::root(*address, root_reach(srv)).map(|(s, held)| {
+                        // Host address, bytes of the view's reach the copy
+                        // holds, the copy's title start and its first word
+                        // there.
                         (
                             s.gpu(*address),
-                            s.left(*address),
+                            held,
                             *address - s.offset(*address),
                             s.peek(*address),
                         )
@@ -1316,4 +1330,160 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shadow::tests::{gpu, release, title_memory, word};
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    const MIB: usize = 1 << 20;
+
+    /// Reads eight words at offsets past a root shader-resource view.
+    const SOURCE: &str = r#"
+#define RS "SRV(t0), UAV(u0), RootConstants(num32BitConstants=8, b0)"
+cbuffer Offsets : register(b0) { uint4 a; uint4 b; };
+ByteAddressBuffer root : register(t0);
+RWByteAddressBuffer read : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    read.Store4(0, uint4(root.Load(a.x), root.Load(a.y), root.Load(a.z), root.Load(a.w)));
+    read.Store4(16, uint4(root.Load(b.x), root.Load(b.y), root.Load(b.z), root.Load(b.w)));
+}
+"#;
+
+    /// The words at `offsets` past a root view at title `address`, as a
+    /// dispatch reads them through the host address [`root_view`] gives.
+    /// Fails without dispatching where the root view's host copy ends
+    /// within 36 MiB of it: reading past a copy's end faults the hardware
+    /// adapter (`VICTORY_TEST_ROOT_PAST_COPY=1` dispatches anyway).
+    fn read_root(address: u64, offsets: [u32; 8]) -> [u32; 8] {
+        let host = crate::host::host().unwrap();
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("root"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: a shader with its root signature inside.
+        let (root, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let list = host.new_list().unwrap();
+        let at = root_view(&list, address, true).unwrap();
+        let held = crate::shadow::host_end(at).map_or(0, |end| end - at);
+        assert!(
+            held >= ROOT_SRV_REACH || std::env::var_os("VICTORY_TEST_ROOT_PAST_COPY").is_some(),
+            "the root view's host copy holds {held:#x} bytes past it, short of 36 MiB"
+        );
+        let (out, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: an open list; live buffers, pipeline and root signature.
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootShaderResourceView(0, at);
+            l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstants(2, 8, offsets.as_ptr().cast(), 0);
+            l.Dispatch(1, 1, 1);
+            l.Close().unwrap();
+        }
+        host.execute(&[&list]);
+        // SAFETY: the mapped words the dispatch wrote, waited for.
+        std::array::from_fn(|i| unsafe { data.cast::<u32>().add(i).read_volatile() })
+    }
+
+    /// A root view in loose memory reads the title's bytes 8 to 36 MiB past
+    /// it (Grand Theft Auto VI's skinning, run 40's page fault), brought
+    /// up to date at each submission.
+    #[test]
+    fn a_root_view_reads_title_memory_36_mib_past_it() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let p = title_memory(600, 512 * MIB, 48 * MIB, 48 * MIB);
+        assert_ne!(p, 0, "no free address for test memory");
+        // At an odd offset in its 4 MiB window, as run 40's root3.
+        let root = p + MIB + 0x1_4e60;
+        let offsets = [
+            0,
+            12,
+            96,
+            8 << 20,
+            (16 << 20) + 4,
+            (24 << 20) + 8,
+            (32 << 20) + 0x1fc,
+            (36 << 20) - 16,
+        ];
+        let mut want = offsets.map(|o| word(root + o as usize));
+        assert_eq!(read_root(root as u64, offsets), want);
+        let at = root + (24 << 20) + 8;
+        // SAFETY: committed test memory.
+        unsafe { (at as *mut u32).write(0x600d) };
+        want[5] = 0x600d;
+        assert_eq!(read_root(root as u64, offsets), want);
+        release(p);
+    }
+
+    /// Past the title's committed memory a root view reads zeros.
+    #[test]
+    fn a_root_view_reads_zeros_past_the_title_memory() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let p = title_memory(700, 512 * MIB, 64 * MIB, 16 * MIB);
+        assert_ne!(p, 0, "no free address for test memory");
+        let root = p + 8 * MIB + 0x40;
+        let offsets = [
+            0,
+            4 << 20,
+            (8 << 20) - 0x44,
+            (8 << 20) - 0x40,
+            20 << 20,
+            30 << 20,
+            35 << 20,
+            (36 << 20) - 4,
+        ];
+        let want = offsets.map(|o| {
+            let at = root + o as usize;
+            if at < p + 16 * MIB { word(at) } else { 0 }
+        });
+        assert_eq!(read_root(root as u64, offsets), want);
+        release(p);
+    }
 }

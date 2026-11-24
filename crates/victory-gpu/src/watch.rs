@@ -370,6 +370,15 @@ fn writable(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
+/// The journal and guards are the process's: tests that ask or remap (or
+/// submit, which asks) run one at a time (one asker's `forget_asked`
+/// changes another's answers).
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,14 +386,6 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
-
-    /// The journal and guards are the process's: tests that ask or remap
-    /// run one at a time (one asker's `forget_asked` changes another's
-    /// answers).
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
