@@ -43,7 +43,8 @@ impl Rng {
     }
 }
 
-/// Write-watched memory at `at`, committed and filled.
+/// Write-watched memory at `at`, committed and filled: a pool, as xmem
+/// reserves them.
 fn pool(at: usize, len: usize) -> usize {
     // SAFETY: a reservation at a free address (checked), committed whole.
     let p = unsafe {
@@ -58,6 +59,7 @@ fn pool(at: usize, len: usize) -> usize {
     // SAFETY: our reservation.
     let c = unsafe { VirtualAlloc(p as *const _, len, MEM_COMMIT, PAGE_READWRITE) as usize };
     assert_eq!(c, p);
+    crate::watch::title_memory_watched(p, len, true);
     fill(p, len);
     p
 }
@@ -250,9 +252,12 @@ fn world_frame() {
     for (k, &b) in small.iter().enumerate() {
         crate::shadow::unregister(2 + k, b as u64);
     }
-    for (at, _) in pools {
+    for (at, len) in pools {
         // SAFETY: our reservations.
-        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+        crate::watch::title_memory_unmapping(at, len, || unsafe {
+            VirtualFree(at as *mut _, 0, MEM_RELEASE)
+        });
+        crate::watch::title_memory_watched(at, len, false);
     }
     let mut maps: Vec<(usize, usize)> = views.clone();
     maps.extend(pages.iter().map(|&p| (p, 64 * 1024)));

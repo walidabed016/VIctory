@@ -153,6 +153,15 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() {
+        if kind & MEM_WRITE_WATCH != 0 {
+            // A pool: the GPU side guards what it copies of it.
+            victory_gpu::title_memory_watched(at as usize, size, true);
+        } else if !constrained && kind & MEM_COMMIT != 0 {
+            // Committed again: read-write, guarded pool pages too.
+            victory_gpu::title_memory_remapped(base as usize, size);
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -318,7 +327,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -327,6 +336,88 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
+    }
+}
+
+/// The host's `VirtualFree`, telling the GPU side what it unmaps of pools
+/// (decommitted or released pages; its guards would outlive them) and
+/// which pools are released.
+fn free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    // Size 0 frees the whole reservation `address` starts.
+    let len = if size == 0 {
+        reserved(address as usize)
+    } else {
+        size
+    };
+    // SAFETY: the caller's own arguments.
+    let freed = victory_gpu::title_memory_unmapping(address as usize, len, || unsafe {
+        VirtualFree(address, size, kind)
+    });
+    if freed != 0 && kind & MEM_RELEASE != 0 {
+        victory_gpu::title_memory_watched(address as usize, len, false);
+    }
+    freed
+}
+
+/// The size of the reservation starting at `at`, region by region (0 if
+/// none starts there).
+fn reserved(at: usize) -> usize {
+    let mut end = at;
+    loop {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a pseudo handle and a valid out pointer of the right size.
+        let n = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                end as *const c_void,
+                &mut info,
+                size_of_val(&info),
+            )
+        };
+        if n == 0 || info.AllocationBase as usize != at {
+            return end - at;
+        }
+        end = info.BaseAddress as usize + info.RegionSize;
+    }
+}
+
+/// The title's `VirtualAlloc` and `VirtualFree`: the host's, telling the
+/// GPU side when pool pages are committed again (read-write, no longer
+/// guarded), decommitted or released.
+pub(crate) mod memory {
+    use std::ffi::c_void;
+
+    use windows_sys::Win32::System::Memory::MEM_COMMIT;
+    use windows_sys::core::BOOL;
+
+    use crate::{HleModule, hle_export};
+
+    pub extern "system" fn VirtualAlloc(
+        base: *mut c_void,
+        size: usize,
+        kind: u32,
+        protect: u32,
+    ) -> *mut c_void {
+        // SAFETY: the title's own arguments.
+        let at =
+            unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(base, size, kind, protect) };
+        if !base.is_null() && !at.is_null() && kind & MEM_COMMIT != 0 {
+            victory_gpu::title_memory_remapped(base as usize, size);
+        }
+        at
+    }
+
+    pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+        super::free(address, size, kind)
+    }
+
+    pub(crate) fn module() -> HleModule {
+        HleModule {
+            name: "memory",
+            dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+            exports: vec![hle_export!(VirtualAlloc), hle_export!(VirtualFree)],
+        }
     }
 }
 
@@ -952,6 +1043,21 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A free of size 0 takes the whole reservation, which `reserved`
+    /// measures region by region; the title's own calls go through.
+    #[test]
+    fn reservations_are_measured_region_by_region() {
+        // SAFETY: a fresh reservation.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 3 * MIB, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        let p = p as usize;
+        let middle = memory::VirtualAlloc((p + MIB) as *mut _, MIB, MEM_COMMIT, PAGE_READWRITE);
+        assert_eq!(middle as usize, p + MIB);
+        assert_eq!(reserved(p), 3 * MIB);
+        assert_eq!(reserved(p + MIB), 0);
+        assert_ne!(memory::VirtualFree(p as *mut _, 0, MEM_RELEASE), 0);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

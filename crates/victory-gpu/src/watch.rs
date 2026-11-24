@@ -102,8 +102,6 @@ pub(crate) fn wrote(start: usize, end: usize) {
 /// asked about since [`forget_asked`] are not asked about again). `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -124,44 +122,49 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if at < last {
         gaps.push((at, last));
     }
+    // Pools are guarded as views are, not asked about ([`guard_pools`]).
+    let pools: Vec<(usize, usize)> = if guarded && guard_pools() {
+        let g = guards();
+        gaps.iter()
+            .flat_map(|&(a, b)| g.pools.within(a, b))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut pieces = Vec::new();
     for (from, to) in gaps {
-        let mut count = (to - from) * PAGE / KERNEL_PAGE;
-        j.found.resize(count.max(j.found.len()), 0);
-        let mut granularity = 0;
+        let mut at = from;
+        for &(a, b) in pools.iter().filter(|&&(a, b)| from <= a && b <= to) {
+            if at < a {
+                pieces.push((at, a, false));
+            }
+            pieces.push((a, b, true));
+            at = b;
+        }
+        if at < to {
+            pieces.push((at, to, false));
+        }
+    }
+    for (from, to, pool) in pieces {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (from * PAGE) as *const _,
-                (to - from) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{Op, cost};
-            cost(Op::Ask, started, from * PAGE, ((to - from) * PAGE) as u64);
-            if !failed && count > 0 {
-                cost(
-                    Op::Found,
-                    started,
-                    from * PAGE,
-                    (count * KERNEL_PAGE) as u64,
-                );
-            }
-        }
+        let asked = if pool {
+            None
+        } else {
+            ask(&mut j.found, from, to)
+        };
+        let (failed, count) = (asked.is_none(), asked.unwrap_or(0));
         let guarded = if failed {
-            count = 0;
             if !guarded {
                 return None;
             }
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let written = guard(from * PAGE, to * PAGE);
+            let written = if pool {
+                Some(guard_pool(&mut j.found, from, to))
+            } else {
+                guard(from * PAGE, to * PAGE)
+            };
             #[cfg(feature = "diagnostics")]
             crate::copystat::cost(
                 crate::copystat::Op::Guard,
@@ -337,6 +340,8 @@ struct Guards {
     armed: Blocks,
     /// Those saved, by block.
     saved: BTreeMap<usize, Vec<u8>>,
+    /// Write-watched title memory guarded instead ([`title_memory_watched`]).
+    pools: Blocks,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -344,6 +349,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: Blocks(BTreeMap::new()),
     armed: Blocks(BTreeMap::new()),
     saved: BTreeMap::new(),
+    pools: Blocks(BTreeMap::new()),
 });
 
 /// Held to read an armed block in place ([`in_place`]) and to arm blocks
@@ -435,50 +441,113 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// For view memory: the pages of `[start, end)`'s blocks written since
-/// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    if !view(start) {
-        return None;
+/// Asks the kernel which kernel pages of write-watched pages `[from, to)`
+/// were written since it was last asked, and forgets them: their
+/// addresses in `found`, and how many; `None` if the memory is not
+/// write-watched.
+fn ask(found: &mut Vec<usize>, from: usize, to: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (to - from) * PAGE / KERNEL_PAGE;
+    found.resize(count.max(found.len()), 0);
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (from * PAGE) as *const _,
+            (to - from) * PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{Op, cost};
+        cost(Op::Ask, started, from * PAGE, ((to - from) * PAGE) as u64);
+        if !failed && count > 0 {
+            cost(
+                Op::Found,
+                started,
+                from * PAGE,
+                (count * KERNEL_PAGE) as u64,
+            );
+        }
     }
+    (!failed).then_some(count)
+}
+
+/// For view memory: [`reguard`]. `None` if the memory is not a view.
+fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    view(start).then(|| reguard(start, end, false).0)
+}
+
+/// For pool pages `[from, to)`: [`reguard`]; the kernel answers for the
+/// blocks that cannot be guarded (not wholly committed).
+fn guard_pool(found: &mut Vec<usize>, from: usize, to: usize) -> Vec<usize> {
+    let (mut written, left) = reguard(from * PAGE, to * PAGE, true);
+    for (a, b) in left {
+        let n = ask(found, a * BLOCK / PAGE, b * BLOCK / PAGE).unwrap_or(0);
+        written.extend(found[..n].iter().map(|&at| at / PAGE));
+    }
+    written
+}
+
+/// The pages of `[start, end)`'s blocks written since they were last
+/// guarded (all of a block's pages; all of those never guarded), guarding
+/// them again before the caller copies them. Of a `pool`, the blocks that
+/// cannot be guarded are left out, as runs.
+fn reguard(start: usize, end: usize, pool: bool) -> (Vec<usize>, Vec<(usize, usize)>) {
     install();
     let mut g = guards();
-    let mut written = Vec::new();
+    let (mut written, mut left) = (Vec::new(), Vec::new());
     for (from, to) in g.clean.gaps(start / BLOCK, end.div_ceil(BLOCK)) {
-        written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
         // Blocks still read-only were written through the runtime: clean
         // again. The others are guarded again.
         let mut at = from;
         for (a, b) in g.protected.within(from, to) {
             if at < a {
-                protect(&mut g, at, a);
+                protect(&mut g, at, a, pool);
             }
             g.clean.insert(a, b);
             at = b;
         }
         if at < to {
-            protect(&mut g, at, to);
+            protect(&mut g, at, to, pool);
         }
+        let unguarded = match pool {
+            true => g.protected.gaps(from, to),
+            false => Vec::new(),
+        };
+        written.extend(
+            (from * BLOCK / PAGE..to * BLOCK / PAGE)
+                .filter(|&p| !unguarded.iter().any(|&(a, b)| a <= p && p < b)),
+        );
+        left.extend(unguarded);
     }
-    Some(written)
+    (written, left)
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
 /// block by block if they span views. A block not committed (unmapped) is
 /// noted clean, unguarded: copies took its zeros, and every asking used to
 /// report it written again, so each refresh of the world's sparse tiled
-/// heaps copied ~300 MB of unmapped pages a frame, 4 KiB at a time.
-fn protect(g: &mut Guards, from: usize, to: usize) {
+/// heaps copied ~300 MB of unmapped pages a frame, 4 KiB at a time. Of a
+/// `pool`, only a block wholly not committed is (the runtime tells when it
+/// commits pool memory).
+fn protect(g: &mut Guards, from: usize, to: usize, pool: bool) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
     };
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        // SAFETY: title view memory; only its protection changes.
-        let set = unsafe {
+        // SAFETY: title memory; only its protection changes.
+        let mut set = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
@@ -486,6 +555,22 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                 &mut old,
             ) != 0
         };
+        // Pools take the title's protection: memory it can execute (or
+        // otherwise not just read or write) is not guarded, since our
+        // handler gives write access back as plain read-write. Read-only
+        // is ours, guarded before and not opened since, or the title's.
+        if set && old != PAGE_READWRITE && old != PAGE_READONLY {
+            // SAFETY: as above, back as it was.
+            unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (to - from) * BLOCK,
+                    old,
+                    &mut old,
+                )
+            };
+            set = false;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::cost(
             crate::copystat::Op::Protect,
@@ -511,7 +596,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let n = query(block * BLOCK, &mut info);
-        if n != 0 && info.State != MEM_COMMIT {
+        let whole = !pool || info.BaseAddress as usize + info.RegionSize >= (block + 1) * BLOCK;
+        if n != 0 && info.State != MEM_COMMIT && whole {
             g.clean.insert(block, block + 1);
         }
     }
@@ -697,6 +783,40 @@ pub fn title_memory_unmapping<R>(at: usize, len: usize, unmap: impl FnOnce() -> 
     unguard(&mut guards(), from, to, false);
     UNMAPPED.fetch_add(1, Ordering::Relaxed);
     unmapped
+}
+
+/// The runtime reserved (`watched`) or released write-watched title memory
+/// `[at, at + len)`: xmem's pools, which copies guard as they do views
+/// ([`guard_pools`]). It commits pool memory, and changes its protection,
+/// through [`title_memory_remapped`]; it decommits and releases it through
+/// [`title_memory_unmapping`].
+pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
+    let mut g = guards();
+    let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if watched {
+        g.pools.insert(from, to);
+    } else {
+        g.pools.remove(from, to);
+    }
+}
+
+/// Whether copies guard pools instead of asking the kernel which pages the
+/// title wrote: asking costs ~1 us per MB asked about however few pages
+/// were written, and each answer that finds some ~65 us more (its TLB
+/// flush reaches every busy thread): ~43 ms a world frame. A guard costs a
+/// fault in the title's first write to a block, and ~5 us to guard it
+/// again. `VICTORY_WRITE_WATCH_POOLS` asks the kernel.
+fn guard_pools() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WRITE_WATCH_POOLS").is_none();
+        if !on {
+            tracing::info!(
+                "pools are asked about through the write watch (VICTORY_WRITE_WATCH_POOLS)"
+            );
+        }
+        on
+    })
 }
 
 /// Blocks `[from, to)` are guarded and armed no more; armed blocks still
@@ -1148,6 +1268,91 @@ mod tests {
         // SAFETY: a reservation of the free range.
         let kept = unsafe { VirtualAlloc(v as *const _, BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!kept.is_null());
+    }
+
+    /// A pool is guarded as views are, without asking the kernel: a block
+    /// counts as written when first guarded and after the title's write;
+    /// a decommitted block is clean until it is committed again (read-write,
+    /// then written and guarded again). A block partly committed is left to
+    /// the kernel, as are askers that do not guard.
+    #[test]
+    fn pools_are_guarded_instead_of_asked_about() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RESERVE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let _serial = serial();
+        // SAFETY: a write-watched reservation of five blocks, four of them
+        // committed and the second half of the fifth.
+        let p = unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                5 * BLOCK,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(p, 0);
+            let half = (p + 4 * BLOCK + BLOCK / 2) as *const _;
+            assert!(!VirtualAlloc(p as *const _, 4 * BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc(half, BLOCK / 2, MEM_COMMIT, PAGE_READWRITE).is_null());
+            p
+        };
+        title_memory_watched(p, 5 * BLOCK, true);
+        let b = p / BLOCK;
+        let pages = |w: &[(usize, u64)], at: u64| -> Vec<usize> {
+            w.iter()
+                .filter(|&&(_, a)| a == at)
+                .map(|&(page, _)| page)
+                .collect()
+        };
+        forget_asked();
+        let (first, w) = writes(p, p + 4 * BLOCK, true).expect("a pool");
+        assert_eq!(pages(&w, first), vec![b, b + 1, b + 2, b + 3]);
+        assert_eq!(guards().protected.within(b, b + 5), vec![(b, b + 4)]);
+        assert!(guards().clean.within(b + 4, b + 5).is_empty());
+        // SAFETY: our pool (guarded: our handler opens the block; the
+        // fifth is not guarded).
+        unsafe {
+            ((p + BLOCK + 8) as *mut u8).write(1);
+            ((p + 4 * BLOCK + BLOCK / 2 + 8) as *mut u8).write(1);
+        }
+        forget_asked();
+        let (now, w) = writes(p, p + 5 * BLOCK, true).expect("a pool");
+        assert_eq!(pages(&w, now), vec![b + 1, b + 4]);
+        assert!(writes(p, p + 4 * BLOCK, false).is_some());
+        // SAFETY: our pool's third block, decommitted.
+        title_memory_unmapping(p + 2 * BLOCK, BLOCK, || unsafe {
+            VirtualFree((p + 2 * BLOCK) as *mut _, BLOCK, MEM_DECOMMIT)
+        });
+        forget_asked();
+        writes(p, p + 4 * BLOCK, true).expect("a pool");
+        forget_asked();
+        let (now, w) = writes(p, p + 4 * BLOCK, true).expect("a pool");
+        assert!(pages(&w, now).is_empty());
+        assert_eq!(guards().clean.within(b + 2, b + 3), vec![(b + 2, b + 3)]);
+        // SAFETY: committed again, as the runtime's hooks tell.
+        let c = unsafe {
+            VirtualAlloc(
+                (p + 2 * BLOCK) as *const _,
+                BLOCK,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_eq!(c, p + 2 * BLOCK);
+        title_memory_remapped(c, BLOCK);
+        // SAFETY: our pool, read-write and not guarded.
+        unsafe { ((c + 8) as *mut u8).write(1) };
+        forget_asked();
+        let (now, w) = writes(p, p + 4 * BLOCK, true).expect("a pool");
+        assert_eq!(pages(&w, now), vec![b + 2]);
+        assert_eq!(guards().protected.within(b, b + 4), vec![(b, b + 4)]);
+        // SAFETY: our pool, decommitted; the reservation keeps its addresses
+        // from other tests, whose pages the journal would mix up with ours.
+        title_memory_unmapping(p, 5 * BLOCK, || unsafe {
+            VirtualFree(p as *mut _, 5 * BLOCK, MEM_DECOMMIT)
+        });
+        title_memory_watched(p, 5 * BLOCK, false);
     }
 
     /// Committed memory is told by the working set where it answers (view
