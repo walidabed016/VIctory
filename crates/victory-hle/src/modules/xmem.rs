@@ -455,6 +455,15 @@ struct Slice {
     index: usize,
 }
 
+impl Slice {
+    /// The page's number for the GPU side, which tells writes through one
+    /// address showing it from writes through another
+    /// (`victory_gpu::title_memory_shows`): consecutive within a section.
+    fn page(&self) -> u64 {
+        (self.section.0 as u64) << 32 | self.index as u64
+    }
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -639,7 +648,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
+        victory_gpu::physical_pages_writing(slice.page(), *n);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        victory_gpu::physical_pages_written(slice.page(), *n);
         (within, done) = (0, done + k);
     }
     true
@@ -647,11 +658,19 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
-/// would then copy.
+/// would then copy. The GPU side counts the pages written while it lives.
 pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// The first page's number and how many.
+    pages: (u64, usize),
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        victory_gpu::physical_pages_written(self.pages.0, self.pages.1);
+    }
 }
 
 impl PageWindow {
@@ -671,10 +690,13 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    victory_gpu::physical_pages_writing(slice.page(), *n);
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
+        pages: (slice.page(), *n),
     })
 }
 
@@ -849,8 +871,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
+    // New contents, read-write: the GPU side's copies no longer guard it,
+    // and a write through another address showing its pages is one to it.
     victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::title_memory_shows(base, len, slice.page());
     physical.views.insert(base, (len, slice));
     true
 }
