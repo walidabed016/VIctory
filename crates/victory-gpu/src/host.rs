@@ -81,7 +81,7 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 /// With VRAM twins ([`crate::shadow::twins_on`]): copies into them before
 /// submissions and out of them before copy-back (microseconds and bytes
 /// each), since the last frame-rate line.
-static TWINS: [std::sync::atomic::AtomicU64; 4] =
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture

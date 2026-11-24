@@ -232,6 +232,12 @@ fn world_frame() {
         println!("warm-up frame {round}: {took:.2?}");
     }
     copystat::lines(1.0);
+    let twins = || {
+        crate::host::TWINS
+            .each_ref()
+            .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64)
+    };
+    twins();
     const FRAMES: usize = 4;
     let mut took = std::time::Duration::ZERO;
     for round in 0..FRAMES {
@@ -240,6 +246,14 @@ fn world_frame() {
     println!(
         "world frame, host side: {:.1} ms",
         took.as_secs_f64() * 1e3 / FRAMES as f64
+    );
+    let [up_us, up, down_us, down] = twins().map(|n| n / FRAMES as f64);
+    println!(
+        "VRAM twins per frame: {:.1} ms copying {:.1} MB up, {:.1} ms copying {:.1} MB down",
+        up_us / 1e3,
+        up / 1e6,
+        down_us / 1e3,
+        down / 1e6
     );
     for line in copystat::lines(FRAMES as f64) {
         println!("{line}");
