@@ -1026,3 +1026,151 @@ fn waves_of_a_group_with_a_barrier_keep_64_lane_waves() {
         Waves::Wave64("a lane mask read as data where the two 32-lane halves do not meet")
     );
 }
+
+/// `op_dpp vdst, vsrc0, vsrc1` (VOP2) with DPP8 lane selects `sel`.
+const fn dpp8(op: u8, vdst: u8, vsrc0: u8, vsrc1: u8, sel: [u32; 8]) -> [u32; 2] {
+    let mut s = 0;
+    let mut i = 0;
+    while i < 8 {
+        s |= sel[i] << (3 * i);
+        i += 1;
+    }
+    [vop2(op, vdst, 0xE9, vsrc1), vsrc0 as u32 | s << 8]
+}
+
+/// `op_dpp vdst, vsrc0, vsrc1` (VOP2) with DPP control `ctrl`,
+/// `bound_ctrl:1`, all rows and banks.
+const fn dpp16(op: u8, vdst: u8, vsrc0: u8, vsrc1: u8, ctrl: u16) -> [u32; 2] {
+    [
+        vop2(op, vdst, 0xFA, vsrc1),
+        vsrc0 as u32 | (ctrl as u32) << 8 | 1 << 19 | 0xF << 24 | 0xF << 28,
+    ]
+}
+
+/// A VOP3 instruction of three sources.
+const fn vop3_3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+const EXEC_HI: u8 = 127;
+
+/// A whole-wave reduction as the console compiler expands it (EXEC every
+/// lane, saved in s[20:21]): VOP2 `op` over v`src` in the lanes of s[24:25]
+/// and the saved EXEC, from `ident` (in v2 and v3), to s`dst`.
+fn wave_reduction(op: u8, ident: u32, src: u8, dst: u8) -> Vec<u32> {
+    let mut w = vec![sop1(0x25, 20, ONES as u8)];
+    w.extend(mov_k(2, ident));
+    w.push(sop2(0x0F, 22, 24, 20));
+    w.extend(vop3_3(0x101, 2, v(2), v(src), 22));
+    for sel in [
+        [1, 0, 3, 2, 5, 4, 7, 6],
+        [2, 2, 0, 0, 6, 6, 4, 4],
+        [4, 4, 4, 4, 0, 0, 0, 0],
+    ] {
+        w.extend(dpp8(op, 2, 2, 2, sel));
+    }
+    // row_mirror, then the other row of the half, then the other half.
+    w.extend(dpp16(op, 2, 2, 2, 0x140));
+    w.extend(vop3_3(0x378, 3, v(2), ZERO, ZERO));
+    w.push(vop2(op, 2, v(3), 2));
+    w.extend(vop3(0x360, 15, v(2), inline(32)));
+    w.push(vop2(op, 2, 15, 2));
+    w.extend(vop3(0x360, dst, v(2), ZERO));
+    w.push(sop1(0x04, EXEC_LO, 20));
+    w
+}
+
+/// An exclusive whole-wave prefix sum as the console compiler expands it,
+/// of v`src` in the lanes of s[24:25] and the saved EXEC, to v2 (with v3
+/// and v7, and s14): `row_shr` within rows, the row below through
+/// `v_permlanex16` under a constant EXEC, the lower half through
+/// `v_readlane`, less the lane's own term.
+fn wave_prefix_sum(src: u8) -> Vec<u32> {
+    let mut w = vec![
+        sop1(0x25, 20, ONES as u8),
+        vop1(0x001, 2, ZERO),
+        sop2(0x0F, 22, 24, 20),
+    ];
+    w.extend(vop3_3(0x101, 7, v(2), v(src), 22));
+    w.push(vop1(0x001, 2, v(7)));
+    for n in [1, 2, 4, 8] {
+        w.extend(dpp16(0x25, 2, 2, 2, 0x110 + n));
+    }
+    w.extend(vop3_3(0x378, 3, v(2), ONES, ONES));
+    w.extend([sop1(0x03, EXEC_LO, 255), 0xFFFF_0000]);
+    w.extend([sop1(0x03, EXEC_HI, 255), 0xFFFF_0000]);
+    w.push(vop2(0x25, 2, v(3), 2));
+    w.extend(vop3(0x360, 14, v(2), inline(31)));
+    w.extend([
+        sop1(0x03, EXEC_LO, ZERO as u8),
+        sop1(0x03, EXEC_HI, ONES as u8),
+    ]);
+    w.push(vop2(0x25, 2, 14, 2));
+    w.push(sop1(0x04, EXEC_LO, ONES as u8));
+    w.push(vop2(0x26, 2, v(2), 7));
+    w.push(sop1(0x04, EXEC_LO, 20));
+    w
+}
+
+#[test]
+fn whole_wave_reductions_and_prefixes_where_lanes_split_are_the_console_waves() {
+    // Lanes whose index has bit 0 or 3 set go in (`v_cmpx`,
+    // `s_cbranch_execz`); there whole-wave sections over the lanes of a mask
+    // (index bit 1 clear) and the saved EXEC give each the sum of 3f + 1,
+    // its exclusive prefix sum and the float minimum of f ^ 42.
+    let threads = [64, 1, 1];
+    let mut w = prologue(threads);
+    w.extend([vop2(0x0B, 11, inline(3), 3), vop2(0x25, 11, inline(1), 11)]);
+    w.extend([vop2(0x1D, 14, inline(42), 3), vop1(0x006, 14, v(14))]);
+    w.extend([
+        vop2(0x1B, 12, inline(2), 3),
+        vopc(0xC2, ZERO, 12),
+        sop1(0x04, 24, VCC_LO),
+    ]);
+    for r in [5, 6, 8] {
+        w.extend(mov_k(r, DEAD));
+    }
+    w.push(vop2(0x1B, 13, inline(9), 3));
+    w.extend([SAVE_EXEC, vopc(0xD5, ZERO, 13)]);
+    let mut region = wave_reduction(0x25, 0, 11, 26);
+    region.push(vop1(0x001, 5, 26));
+    region.extend(wave_prefix_sum(11));
+    region.push(vop1(0x001, 6, v(2)));
+    region.extend(wave_reduction(0x0F, 0x7F80_0000, 14, 27));
+    region.push(vop1(0x001, 8, 27));
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    for (k, r) in [5u8, 6, 8].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    let inside = |f: u32| f & 9 != 0;
+    let counted: Vec<u32> = (0..64).filter(|&f| inside(f) && f & 2 == 0).collect();
+    let sum = |below: u32| -> u32 {
+        counted
+            .iter()
+            .filter(|&&g| g < below)
+            .map(|&g| 3 * g + 1)
+            .sum()
+    };
+    let min = counted
+        .iter()
+        .map(|&g| (g ^ 42) as f32)
+        .fold(f32::INFINITY, f32::min)
+        .to_bits();
+    for (label, got) in run(&shader, 64 * SLOTS) {
+        for f in 0..64u32 {
+            let want = if inside(f) {
+                [sum(64), sum(f), min]
+            } else {
+                [DEAD; 3]
+            };
+            assert_eq!(slots(&got, f, 3), want, "{label}: thread {f}");
+        }
+    }
+}

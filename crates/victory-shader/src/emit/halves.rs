@@ -33,7 +33,8 @@
 //!   take each branch the wave takes (on values every thread has alike),
 //!   EXEC and the lane masks are values (the wave's ballots), and each
 //!   vector instruction runs under the thread's own EXEC bit, so every
-//!   block meets.
+//!   block meets. A whole-wave section's scalar instructions run there too,
+//!   so the masks it makes from the saved EXEC are values like any other.
 //! * **In turn.** A group of several console waves that never meet (no
 //!   LDS, no barrier, nothing in a loop through which one could wait for
 //!   another) runs in lockstep too: the host group is one console wave,

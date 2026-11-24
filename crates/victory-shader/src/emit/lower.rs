@@ -1006,10 +1006,15 @@ impl<'a> Lower<'a> {
     }
 
     /// An instruction inside a whole-wave section: the values that leave
-    /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
+    /// the section are made from what the simulation found them to be. In
+    /// lockstep, where lane masks are values, scalar instructions (those
+    /// that make the section's masks from the saved EXEC) run as anywhere.
+    fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
+        if self.lockstep() && matches!(inst.fields, Fields::Sop { .. }) {
+            return self.inst(b, i);
+        }
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
@@ -1022,6 +1027,7 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+        Ok(())
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -1264,7 +1270,7 @@ impl<'a> Lower<'a> {
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        self.section_inst(b, j, i)?;
                     }
                     i = end;
                     continue;
