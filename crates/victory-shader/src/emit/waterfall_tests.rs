@@ -257,6 +257,59 @@ fn a_gather_at_a_level_matches_the_gather_at_level_zero() {
     }
 }
 
+/// A sample with gradients and a least level of detail
+/// (`image_sample_d_cl`) samples no level below it: with zero gradients,
+/// even lanes (least level 0) read level 0 of a two-level texture (red 1.0),
+/// odd lanes (least level 1) level 1 (red 2.0).
+#[test]
+fn a_sample_with_gradients_keeps_to_its_least_level() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E02_0280, // v_mov_b32 v1, 0 (du/dx)
+        0x7E04_0280, // v_mov_b32 v2, 0 (dv/dx)
+        0x7E06_0280, // v_mov_b32 v3, 0 (du/dy)
+        0x7E08_0280, // v_mov_b32 v4, 0 (dv/dy)
+        0x7E0A_02F0, // v_mov_b32 v5, 0.5 (u)
+        0x7E0C_02F0, // v_mov_b32 v6, 0.5 (v)
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x7E0E_0D07, // v_cvt_f32_u32 v7, v7 (the least level)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF08C_0108,
+        0x0043_0801, // image_sample_d_cl v8, v[1:7], s[12:19], s[8:11] dmask:0x1 dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let shader = lower_cs(&words, false).0;
+    let mut texels = vec![[1.0f32, 0.0, 0.0, 1.0]; 4];
+    texels.push([2.0, 0.0, 0.0, 1.0]);
+    let views = [
+        View::Mips(2, 2, 2, &texels),
+        View::Texture(1, 1, &texels[..1]),
+        View::RawUav(32),
+    ];
+    let want: Vec<f32> = (0..32)
+        .map(|l| if l & 1 == 0 { 1.0 } else { 2.0 })
+        .collect();
+    let ran = run(&shader, &views);
+    assert!(!ran.is_empty(), "no SM 6.6 device");
+    for (label, words) in ran {
+        let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
 #[test]
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;
