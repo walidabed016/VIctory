@@ -79,6 +79,9 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+mod halves;
+#[cfg(all(test, windows))]
+mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -185,6 +188,20 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// How the console's 64-lane waves of a wave64 compute program whose
+/// lanes interact (or which shares LDS within one wave) run on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waves {
+    /// On host waves of any size: no such program.
+    Any,
+    /// Each as two 32-lane host waves ([`halves`]).
+    Halves,
+    /// As 64-lane host waves (the program declares `WaveSize(64)`, which
+    /// hosts with only 32-lane waves refuse), for this reason the halves
+    /// cannot run it.
+    Wave64(&'static str),
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -223,6 +240,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with_waves(c, native, p, st, io, res).map(|e| e.0)
+}
+
+/// [`emit`], and how the program's waves run.
+pub fn emit_with_waves(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Waves), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -289,7 +318,7 @@ pub fn emit(
         prims,
         mesh_stride,
     })?;
-    Ok(HostShader {
+    let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -308,7 +337,8 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
-    })
+    };
+    Ok((shader, l.waves))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

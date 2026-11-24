@@ -71,6 +71,9 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// How emitted wave64 compute programs' waves run (see
+    /// `emit::Waves`) → programs, and the first one.
+    waves: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -136,6 +139,9 @@ impl Tally {
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
+        }
+        for (how, (n, example)) in other.waves {
+            self.waves.entry(how).or_insert((0, example)).0 += n;
         }
     }
 }
@@ -270,6 +276,13 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "waves        {} emitted wave64 compute programs:",
+        t.waves.values().map(|w| w.0).sum::<usize>()
+    );
+    for (how, (n, example)) in &t.waves {
+        println!("  {n:>7}  {how}  (e.g. {example})");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -390,9 +403,20 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
-                        Ok(shader) => {
+                    match emit::emit_with_waves(&container, &p, &program, &s, &i, &r) {
+                        Ok((shader, waves)) => {
                             *counter(t, p.stage, 1) += 1;
+                            if compute && p.wave64 {
+                                let how = match waves {
+                                    emit::Waves::Any => "any wave size".to_owned(),
+                                    emit::Waves::Halves => "32-lane halves".to_owned(),
+                                    emit::Waves::Wave64(why) => format!("64-lane waves: {why}"),
+                                };
+                                if t.list {
+                                    t.lines.push(format!("{}  waves: {how}", label()));
+                                }
+                                t.waves.entry(how).or_insert_with(|| (0, label())).0 += 1;
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
