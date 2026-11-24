@@ -723,63 +723,109 @@ fn on_copy(
     (made > 0).then_some(made)
 }
 
-/// Host copies of constant views of title memory not on 256 bytes (the
-/// console allows them; host constant views start on 256), by title
-/// address and size: 256-byte places in slabs of shared memory, filled
-/// from title memory when a submission reads the view (see
-/// `crate::draw`).
-/// shortcut: places are never given back; past [`ALIGNED_SLABS`] slabs
-/// such views are made null.
-struct Aligned {
+/// Host copies of views of title memory the host cannot make on the
+/// memory's host copy: constant views not on 256 bytes (the console allows
+/// them) and typed buffer views not on an element of the copy (its start
+/// lies between two). By title address and length: places in slabs of
+/// shared memory, on the view's alignment, filled from title memory when a
+/// submission reads the view (see `crate::draw`).
+/// shortcut: places are never given back, and past [`OWN_SLABS`] slabs
+/// such views are made null. A view of memory the GPU writes earlier in
+/// the same submission reads what title memory held before.
+struct OwnCopies {
     /// Each slab and its host address and mapping.
     slabs: Vec<(ID3D12Resource, u64, usize)>,
     /// Bytes handed out of the last slab.
     used: u64,
-    places: std::collections::HashMap<(u64, u32), (ID3D12Resource, u64, usize)>,
+    /// By title address and length: the slab, offset in it and mapping.
+    places: std::collections::HashMap<(u64, u64), (ID3D12Resource, u64, u64, usize)>,
 }
 
 // SAFETY: D3D12 resources are free-threaded; the mappings are written
 // only at submission.
-unsafe impl Send for Aligned {}
+unsafe impl Send for OwnCopies {}
 
-const ALIGNED_SLAB: u64 = 4 << 20;
-const ALIGNED_SLABS: usize = 16;
+const OWN_SLAB: u64 = 4 << 20;
+const OWN_SLABS: usize = 16;
 
-/// The aligned host copy of the constant view of `size` bytes at title
-/// `address` ([`Aligned`]), made on first use: its buffer, host address
-/// and mapping.
-pub(crate) fn aligned_constant(address: u64, size: u32) -> Option<(ID3D12Resource, u64, *mut u8)> {
-    static ALIGNED: Mutex<Option<Aligned>> = Mutex::new(None);
-    let mut aligned = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
-    let a = aligned.get_or_insert_with(|| Aligned {
+/// A view's own host copy ([`OwnCopies`]) of `len` bytes at title
+/// `address`, on `align` bytes, made on first use: its buffer, offset in
+/// it, host address and mapping.
+fn own_copy(address: u64, len: u64, align: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+    static OWN: Mutex<Option<OwnCopies>> = Mutex::new(None);
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    let o = own.get_or_insert_with(|| OwnCopies {
         slabs: Vec::new(),
-        used: ALIGNED_SLAB,
+        used: OWN_SLAB,
         places: std::collections::HashMap::new(),
     });
-    let bytes = u64::from(size.clamp(1, LARGEST_CONSTANT).next_multiple_of(256));
-    if let Some((buffer, gpu, data)) = a.places.get(&(address, size)) {
-        return Some((buffer.clone(), *gpu, *data as *mut u8));
+    if let Some((buffer, offset, gpu, data)) = o.places.get(&(address, len)) {
+        return Some((buffer.clone(), *offset, *gpu, *data as *mut u8));
     }
-    if a.used + bytes > ALIGNED_SLAB {
-        if a.slabs.len() == ALIGNED_SLABS {
-            once!("constant views off 256 bytes past their copies' room: made null");
+    let bytes = len.max(1).next_multiple_of(align);
+    if bytes > OWN_SLAB {
+        once!(len, "a view too large for its own host copy: made null");
+        return None;
+    }
+    let mut at = o.used.next_multiple_of(align);
+    if at + bytes > OWN_SLAB {
+        if o.slabs.len() == OWN_SLABS {
+            once!("views needing their own host copy past the copies' room: made null");
             return None;
         }
-        let (buffer, data) = host()?.shared_buffer(ALIGNED_SLAB)?;
+        let (buffer, data) = host()?.shared_buffer(OWN_SLAB)?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        a.slabs.push((buffer, gpu, data as usize));
-        a.used = 0;
+        o.slabs.push((buffer, gpu, data as usize));
+        at = 0;
     }
-    let (buffer, gpu, data) = a.slabs.last()?.clone();
-    let place = (buffer, gpu + a.used, data + a.used as usize);
-    a.used += bytes;
-    a.places.insert((address, size), place.clone());
-    Some((place.0, place.1, place.2 as *mut u8))
+    let (buffer, gpu, data) = o.slabs.last()?.clone();
+    o.used = at + bytes;
+    let place = (buffer, at, gpu + at, data + at as usize);
+    o.places.insert((address, len), place.clone());
+    Some((place.0, place.1, place.2, place.3 as *mut u8))
+}
+
+/// Where a submission must fill `view`'s own host copy ([`OwnCopies`])
+/// from title memory, if it reads one: its mapping and bytes. `range` is
+/// what the view reads ([`buffer_range`], or a constant view's address
+/// and size), `shadow` the host copy of that memory.
+pub(crate) fn own_copy_of(
+    view: &View,
+    shadow: &crate::shadow::Shadow,
+    (address, len): (u64, u64),
+) -> Option<(*mut u8, u64)> {
+    const BUFFER: u32 = 1;
+    let typed = |words: &[u32; 10]| {
+        typed_element(&srv_desc(words)).filter(|&e| !shadow.offset(address).is_multiple_of(e))
+    };
+    let (len, align) = match view {
+        View::Constant(..) if !shadow.gpu(address).is_multiple_of(256) => {
+            (len.min(u64::from(LARGEST_CONSTANT)), 256)
+        }
+        View::Shader(_, Some(words)) => (len, typed(words)?),
+        View::Placed(false, resource, desc) if resource[0] == BUFFER => {
+            (len, typed(desc[..10].try_into().ok()?)?)
+        }
+        _ => return None,
+    };
+    own_copy(address, len, align).map(|(.., data)| (data, len))
+}
+
+/// Bytes per element of a typed buffer shader view: `None` for other
+/// views (structured and raw ones the host places on any dword).
+fn typed_element(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<u64> {
+    const BUFFER: i32 = 1;
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    (desc.ViewDimension.0 == BUFFER && buffer.StructureByteStride == 0 && !raw)
+        .then(|| element_size(desc))
+        .filter(|&e| e > 0)
 }
 
 /// Bytes of the host's largest constant buffer view.
-pub(crate) const LARGEST_CONSTANT: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+const LARGEST_CONSTANT: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
 
 /// The host size of a constant view of `size` bytes (the title's is
 /// `view`): 256-byte whole, at most [`LARGEST_CONSTANT`], which is all
@@ -847,6 +893,7 @@ fn buffer_srv(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let element = element_size(&desc);
+    let typed = typed_element(&desc).is_some();
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let (format, stride, bits) = (desc.Format.0, buffer.StructureByteStride, buffer.Flags.0);
@@ -864,13 +911,24 @@ fn buffer_srv(
     }
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
-    if element == 0 || stride == 0 && offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
+    if element == 0 {
+        once!(offset, "buffer view of elements of no size");
         return None;
+    }
+    if typed && !offset.is_multiple_of(element) {
+        // The view reads its own copy, on an element.
+        let (start, bytes) = in_buffer(address, len, first, count, element);
+        let n = u32::try_from(bytes / element).ok().filter(|&n| n > 0)?;
+        let (copy, place, ..) = own_copy(start, bytes, element)?;
+        (buffer.FirstElement, buffer.NumElements) = (place / element, n);
+        // SAFETY: a live buffer and a slot of our heap; the elements lie
+        // in it.
+        unsafe {
+            host()?
+                .device
+                .CreateShaderResourceView(&copy, Some(&desc), at)
+        };
+        return Kept::of(&copy, view_kind::TYPED_SRV);
     }
     let start = offset.saturating_add(first.saturating_mul(element));
     buffer.NumElements = on_copy(&shadow, start, count, element, view)?;
@@ -1076,7 +1134,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
-                let (buffer, gpu, _) = aligned_constant(address, size)?;
+                let len = u64::from(size.min(LARGEST_CONSTANT));
+                let (buffer, _, gpu, _) = own_copy(address, len, 256)?;
                 let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                     BufferLocation: gpu,
                     SizeInBytes: constant_size(size, view),
@@ -1582,10 +1641,11 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
-    /// A constant view of title memory off 256 bytes is made on its
-    /// aligned copy.
+    /// A constant view of title memory off 256 bytes, or a typed buffer
+    /// view off an element of the memory's host copy, is made on its own
+    /// copy.
     #[test]
-    fn constant_views_off_256_bytes_are_made() {
+    fn views_off_their_host_copy_are_made_on_their_own() {
         let Some(host) = host() else {
             return; // no host GPU
         };
@@ -1596,8 +1656,18 @@ mod tests {
         let base = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
         crate::resource::buffer_at(base, 0x1000);
         let kept = make(&View::Constant(base + 0x80, 0x180), heap.cpu(0)).expect("a view");
-        let (buffer, ..) = aligned_constant(base + 0x80, 0x180).expect("its copy");
+        let (buffer, ..) = own_copy(base + 0x80, 0x180, 256).expect("its copy");
         assert_eq!(kept.resource, Some(buffer));
+        // A typed view of four R32G32B32_FLOAT elements 4 bytes into the
+        // buffer: off an element of its host copy.
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0]);
+        (words[10], words[11]) = ((base + 4) as u32, ((base + 4) >> 32) as u32);
+        let mut buffer = [0u32; 14];
+        (buffer[0], buffer[4]) = (1, 0x100);
+        let kept = make(&View::Placed(false, buffer, words), heap.cpu(1)).expect("a view");
+        let (copy, at, ..) = own_copy(base + 4, 48, 12).expect("its copy");
+        assert_eq!((kept.resource, at % 12), (Some(copy), 0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

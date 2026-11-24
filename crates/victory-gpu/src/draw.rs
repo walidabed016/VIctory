@@ -1331,12 +1331,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
-        // A constant view off 256 bytes on the host reads its own copy.
-        if let View::Constant(_, size) = *view
-            && shadow.gpu(address) % 256 != 0
-            && let Some((_, _, data)) = crate::descriptor::host::aligned_constant(address, size)
+        // A view the host cannot make on the copy reads its own.
+        if let Some((data, len)) =
+            crate::descriptor::host::own_copy_of(view, &shadow, (address, len))
         {
-            let len = len.min(u64::from(crate::descriptor::host::LARGEST_CONSTANT));
             list.defer_fill(data, address as *const u8, len as usize);
         }
         if kind == ResourceType::Uav {
@@ -1766,10 +1764,11 @@ void main() {
         assert_eq!(got, want, "words and kinds read through slots 37 and 9");
     }
 
-    /// A constant view of title memory off 256 bytes reads an aligned
-    /// copy, filled from title memory when its list is submitted.
+    /// A constant view of title memory off 256 bytes, or a typed buffer
+    /// view off an element of the memory's host copy, reads its own copy,
+    /// filled from title memory when its list is submitted.
     #[test]
-    fn constant_views_off_256_bytes_read_aligned_copies() {
+    fn views_off_their_host_copy_read_their_own() {
         let _serial = crate::watch::serial();
         let Some(host) = crate::host::host() else {
             return; // no host GPU
@@ -1789,12 +1788,37 @@ void main() {
         // SAFETY: an open list.
         unsafe { list.list.Close() }.unwrap();
         host.execute(&[&list]);
-        let (_, gpu, data) =
-            crate::descriptor::host::aligned_constant(address, 0x80).expect("a copy");
-        assert_eq!(gpu % 256, 0);
+        let view = View::Constant(address, 0x80);
+        let (data, len) = crate::descriptor::host::own_copy_of(&view, &shadow, (address, 0x80))
+            .expect("its own copy");
+        assert_eq!(len, 0x80);
         // SAFETY: the copy's mapped bytes, filled at submission.
         let copy = unsafe { std::slice::from_raw_parts(data, 0x80) };
         assert!(copy.iter().enumerate().all(|(i, &b)| b == i as u8 ^ 0xa5));
+        // A typed view of four R32G32B32_FLOAT elements 4 bytes into the
+        // buffer, off an element of its host copy, reads its own copy too.
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0]);
+        (words[10], words[11]) = ((base + 4) as u32, ((base + 4) >> 32) as u32);
+        let mut buffer = [0u32; 14];
+        (buffer[0], buffer[4]) = (1, 0x100);
+        let view = View::Placed(false, buffer, words);
+        for i in 0..48 {
+            // SAFETY: inside the leaked memory.
+            unsafe { ((base + 4 + i) as *mut u8).write(i as u8 ^ 0x3c) };
+        }
+        let list = host.new_list().unwrap();
+        readable(&list, ResourceType::Srv, &view);
+        // SAFETY: an open list.
+        unsafe { list.list.Close() }.unwrap();
+        host.execute(&[&list]);
+        let range = crate::descriptor::host::buffer_range(&view).expect("its range");
+        assert_eq!(range, (base + 4, 48));
+        let (data, len) =
+            crate::descriptor::host::own_copy_of(&view, &shadow, range).expect("its own copy");
+        // SAFETY: the copy's mapped bytes, filled at submission.
+        let copy = unsafe { std::slice::from_raw_parts(data, len as usize) };
+        assert!(copy.iter().enumerate().all(|(i, &b)| b == i as u8 ^ 0x3c));
         let _ = title;
     }
 
