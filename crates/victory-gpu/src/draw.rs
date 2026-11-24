@@ -469,6 +469,8 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why("no dynamic slots for its tables".to_owned());
                 return false;
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -971,12 +973,6 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -990,6 +986,34 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        if kind != DISPATCH {
+            let mut raw = [0u8; 4];
+            let title = crate::host::read_into(arguments as *const u8, &mut raw).then(|| u32::from_le_bytes(raw));
+            let host = args.peek(arguments);
+            self.trace(&format!("indirect{kind} title {title:?} host {host:?}"), max, stride);
+            if kind == MESH {
+                let bucket = |groups: Option<u32>| match groups {
+                    None => "unread",
+                    Some(0) => "0",
+                    Some(1..=64) => "1-64",
+                    Some(65..=1024) => "65-1024",
+                    Some(1025..=65535) => "1025-65535",
+                    Some(_) => "over 65535",
+                };
+                crate::pipeline::note_why(format!(
+                    "(not a drop) indirect mesh groups before recording: title {}, host copy {}",
+                    bucket(title),
+                    bucket(host)
+                ));
+            }
+        }
+        // Skip before the argument clamp can mutate the indirect buffer.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            dropped(self.pipeline);
+            return false;
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),

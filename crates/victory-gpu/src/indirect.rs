@@ -25,7 +25,7 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -59,6 +59,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
+    }
+    if (counted != 0) {
+        // Diagnostics: records with work and empty ones, per kind.
+        uint base = kind >= 10 ? 1u : (kind == 2 ? 5u : 3u);
+        uint seen;
+        budget.InterlockedAdd((base + (cost == 0 ? 1u : 0u)) * 4, 1, seen);
     }
     uint before;
     budget.InterlockedAdd(0, cost, before);
@@ -157,7 +163,7 @@ pub(crate) fn bound(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(cfg!(feature = "diagnostics"))];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -180,6 +186,12 @@ pub(crate) fn bound(
     }
     true
 }
+
+/// Diagnostics: indirect records the clamp saw run, as (with work, empty)
+/// for mesh dispatches, draws and dispatches, added from each list's
+/// budget words when it is used again.
+#[cfg(feature = "diagnostics")]
+pub(crate) static SEEN: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.

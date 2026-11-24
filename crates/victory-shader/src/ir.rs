@@ -841,6 +841,9 @@ fn effects(
             }
             if let Some(d) = dst {
                 regs(d, &mut w)?;
+                if name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
             }
             if *gds
                 || name.starts_with("ds_gws")

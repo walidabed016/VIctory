@@ -14,6 +14,15 @@
 //! date (vertex and index buffer views, constant buffers in tables, root
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
+//!
+//! A title buffer of at least [`IN_PLACE_MIN`] bytes in committed private
+//! memory needs no copy: a heap opened on its pages
+//! (`OpenExistingHeapFromAddress1`) holds a buffer that is title memory
+//! itself, as on the console, so the GPU reads what the title wrote and
+//! the title reads what shaders wrote, with nothing to refresh, watch or
+//! copy back. The world's big buffers, copied, cost ~1 s per frame
+//! (dozens of overlapping 174 MB ranges per submission).
+//! `VICTORY_COPY_TITLE_MEMORY=1` turns this off.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -37,12 +46,13 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
+    /// Ranges shaders of the submission write, until it is copied back.
     pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The buffer is title memory itself ([`in_place`]): nothing to copy.
+    in_place: bool,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -99,6 +109,15 @@ impl Shadow {
         address - self.start
     }
 
+    /// The word the copy holds at a title address inside the buffer
+    /// (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, address: u64) -> Option<u32> {
+        let (from, to) = self.inside(address as usize, 4);
+        // SAFETY: inside the mapping.
+        (to - from == 4).then(|| unsafe { self.data.add(from).cast::<u32>().read_unaligned() })
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -106,8 +125,11 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
-        let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, in_place: bool) -> Shadow {
+        let pages = match in_place {
+            true => 0,
+            false => (start + len).div_ceil(PAGE as u64) - start / PAGE as u64,
+        };
         Shadow {
             buffer,
             data,
@@ -118,6 +140,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            in_place,
         }
     }
 
@@ -149,6 +172,9 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.in_place {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -188,6 +214,16 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.in_place {
+            // Shaders wrote title memory; copies and textures of it that
+            // the kernel's watch cannot tell (no CPU wrote) take it again.
+            let (from, to) = self.inside(address, len);
+            if from < to {
+                let start = self.start as usize;
+                crate::watch::wrote(start + from, start + to);
+            }
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -263,41 +299,26 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                at = at.max(e);
-            }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
-        }
+        // Ranges the submission's shaders write ([`Shadow::writing`]) are
+        // brought up to date as well: the submission has not run, so the
+        // title's bytes are what its shaders start from, and the snapshot
+        // takes them too ([`Shadow::copy`]), so they do not count as the
+        // shaders' writes. Leaving those ranges out left every read after
+        // the first dispatch writing the world's 174 MB heap with bytes of
+        // earlier frames: indirect arguments the title had cleared read as
+        // millions of groups.
         self.update_free(from, to)
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
+    /// [`Shadow::update`] of `[from, to)` (inside the buffer).
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -354,13 +375,23 @@ impl Shadow {
         bytes
     }
 
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// Copies title memory `[from, to)`, cut to the buffer, into the copy,
+    /// and into the snapshot of ranges shaders write where it has them.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((taken, bytes)) = &mut *before {
+            let (a, b) = ((from - start).max(*taken), (to - start).min(*taken + bytes.len()));
+            if a < b {
+                // SAFETY: inside the mapping, just written.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+                bytes[a - *taken..b - *taken].copy_from_slice(host);
+            }
+        }
         to - from
     }
 }
@@ -409,6 +440,20 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none()
+        && let Some((buffer, start, len)) = in_place(key.0, entry.end - key.0)
+    {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        crate::host::name(&buffer, || format!("title memory in place {start:#x}+{len:#x}"));
+        if len >= 16 << 20 {
+            tracing::info!(start = format_args!("{start:#x}"), len, "large buffer used in place");
+        } else {
+            tracing::debug!(start = format_args!("{start:#x}"), len, "buffer used in place");
+        }
+        let shadow = Shadow::new(buffer, start as *mut u8, gpu, start as u64, len as u64, true);
+        entry.shadow = Some(Arc::new(shadow));
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -430,9 +475,132 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len, false)));
     }
     entry.shadow.clone()
+}
+
+/// The smallest title buffer used in place: below it a copy is cheap, and
+/// each heap opened locks its pages.
+pub(crate) const IN_PLACE_MIN: u64 = 1 << 20;
+
+/// A host buffer that is title memory `[start, start + len)` itself
+/// (whole 64 KiB pages around it): the buffer, its first address and its
+/// length. `None` where the memory is not all committed private
+/// read-write memory (physical-page views, reservations) or the host cannot
+/// open it as a heap; such buffers are copied.
+///
+/// shortcut: memory the title frees while a submission still holds the
+/// buffer stays locked to it, and title buffers keep their heaps until
+/// released; loose memory ([`loose`]) is always copied (its windows are
+/// never released).
+fn in_place(start: u64, len: u64) -> Option<(ID3D12Resource, usize, usize)> {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    static OFF: OnceLock<bool> = OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("VICTORY_COPY_TITLE_MEMORY").is_some()) || len < IN_PLACE_MIN {
+        return None;
+    }
+    let from = start as usize & !(PAGE - 1);
+    let to = usize::try_from(start + len).ok()?.next_multiple_of(PAGE);
+    let mut at = from;
+    while at < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT
+            || info.Type != MEM_PRIVATE && info.Type != MEM_MAPPED
+            || info.Protect & 0xff != PAGE_READWRITE
+        {
+            if len >= 16 << 20 {
+                tracing::info!(
+                    at = format_args!("{at:#x}"),
+                    state = format_args!("{:#x}", info.State),
+                    kind = format_args!("{:#x}", info.Type),
+                    protect = format_args!("{:#x}", info.Protect),
+                    "a large title buffer is copied: its memory is not all committed read-write"
+                );
+            }
+            return None;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+    let host = host()?;
+    static DEVICE: OnceLock<Option<ID3D12Device13>> = OnceLock::new();
+    let device = DEVICE.get_or_init(|| match host.device.cast::<ID3D12Device13>() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::warn!(error = %e, "title buffers are copied: the host cannot open heaps on title memory");
+            None
+        }
+    });
+    let device = device.as_ref()?;
+    // SAFETY: committed read-write memory of ours for the heap's life (the
+    // title's buffer).
+    let heap: ID3D12Heap = match unsafe { device.OpenExistingHeapFromAddress1(from as *const _, to - from) } {
+        Ok(heap) => heap,
+        Err(e) => {
+            if len >= 16 << 20 {
+                // How many host allocations (views, placeholders split) the
+                // range spans: a heap wraps one.
+                let (mut at, mut pieces, mut first) = (from, Vec::new(), 0);
+                while at < to {
+                    // SAFETY: plain data filled in by the query.
+                    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid out pointer of the right size.
+                    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+                        break;
+                    }
+                    let base = info.AllocationBase as usize;
+                    if base != first {
+                        first = base;
+                        pieces.push((base, info.Type, 0usize));
+                    }
+                    if let Some(p) = pieces.last_mut() {
+                        p.2 += (info.BaseAddress as usize + info.RegionSize).min(to) - at;
+                    }
+                    at = info.BaseAddress as usize + info.RegionSize;
+                }
+                let sizes: Vec<String> = pieces.iter().take(8).map(|(b, t, n)| format!("{b:#x}:{t:#x}:{n:#x}")).collect();
+                tracing::warn!(error = %e, from = format_args!("{from:#x}"), len = to - from, allocations = pieces.len(), first = ?sizes, "a large title buffer is copied: no heap on its memory");
+            }
+            return None;
+        }
+    };
+    // SAFETY: a plain query of a live heap.
+    let shared = unsafe { heap.GetDesc() }.Flags.contains(D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: (to - from) as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: match shared {
+            true => D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            false => D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        },
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: a buffer the size of the heap at its start.
+    let made = unsafe {
+        host.device
+            .CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+    };
+    if let Err(e) = made {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(error = %e, len = to - from, "a title buffer is copied: no buffer in its heap"));
+        return None;
+    }
+    Some((buffer?, from, to - from))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -461,7 +629,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, false));
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }

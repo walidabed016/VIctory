@@ -501,6 +501,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        crate::watch::forget_asked();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -594,6 +595,7 @@ impl Host {
         }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
+            crate::watch::forget_asked();
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
@@ -1121,10 +1123,31 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
+            #[cfg(feature = "diagnostics")]
+            {
+                // SAFETY: the list's own mapped word.
+                let used = unsafe { (at as *const u32).read_volatile() };
+                let spent = match used {
+                    0 => "none",
+                    1..=0xff_ffff => "under 2^24",
+                    0x100_0000..=0x7ff_ffff => "2^24-2^27",
+                    _ => "all (records ran empty)",
+                };
+                crate::pipeline::note_why(format!("(not a drop) indirect budget at list reuse: {spent}"));
+                for (k, seen) in crate::indirect::SEEN.iter().enumerate() {
+                    // SAFETY: the list's own mapped words.
+                    let n = unsafe { (at as *const u32).add(k + 1).read_volatile() };
+                    seen.fetch_add(u64::from(n), Ordering::Relaxed);
+                }
+            }
             // SAFETY: the list's own mapped word, written before it runs.
             deferred
                 .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+                .push(Step::Host(Box::new(move || unsafe {
+                    for k in 0..8 {
+                        (at as *mut u32).add(k).write_volatile(0);
+                    }
+                })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -1171,13 +1194,14 @@ impl HostList {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    batch.title_copied(dst, len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
+                        add(C::CopyUs, started.elapsed().as_micros() as u64);
                     }
-                    batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -1213,7 +1237,11 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    #[cfg(feature = "diagnostics")]
+                    let snapshot = std::time::Instant::now();
                     shadow.writing(*address, *len);
+                    #[cfg(feature = "diagnostics")]
+                    add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1240,6 +1268,11 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Ranges brought up to date since the last title write, with the
+    /// asking before: (copy, asking, from, to). They change only where we
+    /// wrote since (`watch::wrote`). Each flush asked about the world's
+    /// 174 MB heap whole again (~0.2 s per frame).
+    done: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -1263,23 +1296,71 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// After a copy into title memory `[dst, dst + len)`: its pages count
+    /// as written (ranges already asked about in this submission take them
+    /// again), and textures are checked again. Pending refreshes wait: the
+    /// world's ~7,000 small copies per frame each flushed them and made
+    /// every range be asked about again (~0.3 s per frame).
+    fn title_copied(&mut self, dst: usize, len: usize) {
+        self.textures.clear();
+        crate::watch::wrote(dst, dst + len);
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.done.clear();
+        crate::watch::forget_asked();
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let asking = crate::watch::asking();
+            let mut copied = 0;
+            for (a, b) in self.stale(&shadow, from, to) {
+                copied += shadow.update(a, b - a);
+            }
+            self.done.push((shadow, asking, from, to));
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+    }
+
+    /// The parts of `[from, to)` of `shadow` not brought up to date since
+    /// the last title write, or written by us since.
+    fn stale(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut current: Vec<(usize, usize)> = self
+            .done
+            .iter()
+            .filter(|(s, asking, a, b)| {
+                std::sync::Arc::ptr_eq(s, shadow)
+                    && *a < to
+                    && *b > from
+                    && !crate::watch::wrote_since(*asking, *a, *b)
+            })
+            .map(|&(_, _, a, b)| (a, b))
+            .collect();
+        current.sort_unstable();
+        let (mut parts, mut at) = (Vec::new(), from);
+        for (a, b) in current {
+            if a > at {
+                parts.push((at, a.min(to)));
+            }
+            at = at.max(b);
+            if at >= to {
+                break;
+            }
+        }
+        if at < to {
+            parts.push((at, to));
+        }
+        parts
     }
 }
 
@@ -1303,12 +1384,19 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
+        // Through memory of ours, the kernel checking both sides: unmapped
+        // source pages read as zeros, unmapped destination pages are left
+        // alone (asking `VirtualQuery` first cost as much as the copies).
+        let mut bytes = vec![0u8; len];
+        copy_mapped(bytes.as_mut_ptr(), src, len, false);
+        write_mapped(dst, bytes.as_ptr(), len);
+        return;
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
@@ -1344,28 +1432,30 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// Copies `len` bytes from `src` to `dst` through the kernel, which checks
+/// both: false (and some bytes copied) if a source page is not readable or
+/// a destination page not writable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    // SAFETY: the kernel probes both ranges and reports a fault instead of
+    // raising it.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
-/// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// Copies host memory into title memory (what shaders wrote, title copies
+/// at submission), leaving pages that are not mapped alone. Guarded blocks
+/// must have been opened (`watch::writing`): the kernel does not write
+/// read-only pages. `ReadProcessMemory` into the destination, not
+/// `WriteProcessMemory`, which asks every call for the destination's
+/// protection (as slow as `VirtualQuery` in the title's big pools: ~20 us
+/// a copy, ~0.15 s per world frame).
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        // The kernel reads our host memory and checks the destination.
+        read(from, at as *mut u8, n)
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -1538,6 +1628,11 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                let seen = crate::indirect::SEEN.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "indirect records run per frame: mesh {:.0} with groups, {:.0} empty; draws {:.0}, {:.0} empty; dispatches {:.0}, {:.0} empty",
+                    seen[0], seen[1], seen[2], seen[3], seen[4], seen[5]
+                );
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

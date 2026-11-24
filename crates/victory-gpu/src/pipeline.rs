@@ -216,7 +216,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 #[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
-        .split(',')
+        .split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
@@ -238,7 +238,10 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        match value.strip_prefix('@') {
+            Some(path) => parse_skip_hashes(&std::fs::read_to_string(path).unwrap_or_default()),
+            None => parse_skip_hashes(&value),
+        }
     });
     if hashes.is_empty() {
         return None;

@@ -112,7 +112,7 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");

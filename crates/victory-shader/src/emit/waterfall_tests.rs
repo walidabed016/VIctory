@@ -12,10 +12,20 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+/// Lowers a waterfall of [`lower_cs`]: one access with each lane's own
+/// heap index, no wave operation.
+fn build(words: &[u32], buffers: bool) -> HostShader {
+    let (shader, nonuniform_handles, wave_ops) = lower_cs(words, buffers);
+    assert_eq!(nonuniform_handles, 1);
+    assert!(!wave_ops);
+    shader
+}
+
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
-/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
-fn build(words: &[u32], buffers: bool) -> HostShader {
+/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1; with its
+/// non-uniform handles and whether it uses wave operations.
+fn lower_cs(words: &[u32], buffers: bool) -> (HostShader, u32, bool) {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,9 +81,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    let (nonuniform_handles, wave_ops) = (lowered.nonuniform_handles, lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -89,7 +97,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, nonuniform_handles, wave_ops)
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
@@ -158,6 +166,92 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         .into_iter()
         .map(|(label, words)| (label, words.into_iter().map(f32::from_bits).collect()))
         .collect()
+}
+
+/// A gather at an explicit level (`image_gather4_l`, emulated) returns the
+/// texels the hardware's `image_gather4_lz` returns, in gather order and
+/// clamped at the edges, and a level past the last is the last.
+#[test]
+fn a_gather_at_a_level_matches_the_gather_at_level_zero() {
+    // Lane l gathers red at u = (l & 7) / 8 + 1/16, v = (l >> 3) / 4 + 0.1
+    // from a 4x4 texture whose red is x + 4y, and stores the four texels as
+    // a + 16b + 256c + 4096d.
+    let program = |gather: [u32; 2], lod: u32| {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x3602_0087, // v_and_b32 v1, 7, v0
+            0x2C04_0083, // v_lshrrev_b32 v2, 3, v0
+            0x7E02_0D01, // v_cvt_f32_u32 v1, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x1002_02FF,
+            0x3E00_0000, // v_mul_f32 v1, 0.125, v1
+            0x0602_02FF,
+            0x3D80_0000, // v_add_f32 v1, 0.0625, v1
+            0x1004_04FF,
+            0x3E80_0000, // v_mul_f32 v2, 0.25, v2
+            0x0604_04FF,
+            0x3DCC_CCCD,       // v_add_f32 v2, 0.1, v2
+            0x7E06_0200 | lod, // v_mov_b32 v3, lod
+            0x3420_0082,       // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F,       // s_waitcnt lgkmcnt(0)
+        ];
+        words.extend(gather);
+        words.extend([
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x5608_0AFF,
+            0x4180_0000, // v_fmac_f32 v4, 16.0, v5
+            0x5608_0CFF,
+            0x4380_0000, // v_fmac_f32 v4, 256.0, v6
+            0x5608_0EFF,
+            0x4580_0000, // v_fmac_f32 v4, 4096.0, v7
+            0xE070_1000,
+            0x800A_0410, // buffer_store_dword v4, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        lower_cs(&words, false).0
+    };
+    // image_gather4_l / _lz v[4:7], v[1:3], s[12:19], s[8:11] dmask:0x1 dim:2D
+    let at_level = [0xF110_0108, 0x0043_0401];
+    let level_zero = [0xF11C_0108, 0x0043_0401];
+    let texels: Vec<[f32; 4]> = (0..16).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect();
+    let views = [
+        View::Texture(4, 4, &texels),
+        View::Texture(1, 1, &texels[..1]),
+        View::RawUav(32),
+    ];
+    let want: Vec<f32> = (0..32)
+        .map(|l: i32| {
+            let x = ((l & 7) as f32 / 8.0 + 0.0625) * 4.0 - 0.5;
+            let y = ((l >> 3) as f32 / 4.0 + 0.1) * 4.0 - 0.5;
+            let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+            let red = |x: i32, y: i32| (x.clamp(0, 3) + 4 * y.clamp(0, 3)) as f32;
+            [(x0, y0 + 1), (x0 + 1, y0 + 1), (x0 + 1, y0), (x0, y0)]
+                .iter()
+                .zip([1.0, 16.0, 256.0, 4096.0])
+                .map(|(&(x, y), k)| red(x, y) * k)
+                .sum()
+        })
+        .collect();
+    // v3 = 0.0 (128) and 1.0 (242).
+    for (name, gather, lod) in [
+        ("image_gather4_lz", level_zero, 128),
+        ("image_gather4_l level 0", at_level, 128),
+        ("image_gather4_l level 1", at_level, 242),
+    ] {
+        for (label, words) in run(&program(gather, lod), &views) {
+            let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            assert_eq!(got, want, "{label}: {name}");
+        }
+    }
 }
 
 #[test]

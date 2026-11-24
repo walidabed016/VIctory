@@ -504,6 +504,14 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        // An address the compiler computed in VGPRs and knows is uniform (a
+        // first-lane offset alone stays the waterfall's term).
+        if let Some(x) = self.first_lane_source(v) {
+            let s = self.sum(Term::Value(x));
+            if s.base.is_some() {
+                return s;
+            }
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -692,6 +700,9 @@ impl<'a> Tracer<'a> {
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high) || self.carried(b, high);
+        }
+        if let Some(x) = self.first_lane_source(v) {
+            return self.carried(Term::Value(x), high);
         }
         let Some(inst) = self.def(v) else {
             return false;

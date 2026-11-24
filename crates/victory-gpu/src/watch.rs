@@ -35,18 +35,69 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page ranges asked about since [`forget_asked`] (in order, apart),
+    /// and whether they are view memory (guarded, so only askers that guard
+    /// may skip them). Asked again before the title can have written them
+    /// for this submission, the kernel (or the guard) only finds writes
+    /// later submissions read, and their own askings take those; the
+    /// world's overlapping copies of its big buffers asked about the same
+    /// pages ~8 GB a frame.
+    fresh: Vec<(usize, usize, bool)>,
+    /// Our own writes since [`forget_asked`]: (asking, start, end).
+    ours: Vec<(u64, usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    fresh: Vec::new(),
+    ours: Vec::new(),
 });
+
+/// The title may have written its memory since (a submission begins, its
+/// copies into title memory ran, or its shaders' writes go back): every
+/// range is asked about again.
+pub(crate) fn forget_asked() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.fresh.clear();
+    j.ours.clear();
+}
+
+/// The latest asking's number.
+pub(crate) fn asking() -> u64 {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
+}
+
+/// Whether we wrote title memory in `[start, end)` ([`wrote`]) after
+/// asking `asked`, since [`forget_asked`].
+pub(crate) fn wrote_since(asked: u64, start: usize, end: usize) -> bool {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.ours
+        .iter()
+        .rev()
+        .take_while(|w| w.0 > asked)
+        .any(|w| w.1 < end && w.2 > start)
+}
+
+/// We wrote `[start, end)` of title memory: shaders in place (no CPU write
+/// the kernel sees) or a copy at submission (seen by the kernel only at the
+/// next asking of a range not asked about since [`forget_asked`]). Its pages
+/// count as written now.
+pub(crate) fn wrote(start: usize, end: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for page in start / PAGE..end.div_ceil(PAGE) {
+        j.written.insert(page, now);
+    }
+    j.ours.push((now, start, end));
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
+/// the latest asking's number, which no page in the list exceeds (pages
+/// asked about since [`forget_asked`] are not asked about again). `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -54,45 +105,66 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
+    let mut gaps = Vec::new();
+    let mut at = first;
+    for &(a, b, view) in &j.fresh {
+        if b <= at || view && !guarded {
+            continue;
         }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
-    };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        if a >= last {
+            break;
+        }
+        if a > at {
+            gaps.push((at, a));
+        }
+        at = b;
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    if at < last {
+        gaps.push((at, last));
+    }
+    for (from, to) in gaps {
+        let mut count = (to - from) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (from * PAGE) as *const _,
+                (to - from) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        let guarded = if failed {
+            count = 0;
+            if !guarded {
+                return None;
+            }
+            guard(from * PAGE, to * PAGE)?
+        } else {
+            Vec::new()
+        };
+        let at = j.fresh.partition_point(|&(a, ..)| a < from);
+        j.fresh.insert(at, (from, to, failed));
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        j.asked += 1;
+        let now = j.asked;
+        let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+        for page in pages.collect::<Vec<_>>() {
+            j.written.insert(page, now);
+        }
     }
     Some((
-        now,
+        j.asked,
         j.written
             .range(first..last)
             .map(|(&p, &w)| (p, w))
@@ -106,7 +178,9 @@ const BLOCK: usize = PAGE;
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
-    /// Of those, the ones not written since a copy took them.
+    /// Of those, the ones not written since a copy took them; and blocks
+    /// not mapped at all (placeholders in the title's tiled heaps), which
+    /// read as zeros until the runtime maps them ([`title_memory_remapped`]).
     clean: BTreeSet<usize>,
 }
 
@@ -156,9 +230,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// block by block if they span views, leaving out any that fail (unmapped).
+/// block by block if they span views. A block not committed (unmapped) is
+/// noted clean, unguarded: copies took its zeros, and every asking used to
+/// report it written again, so each refresh of the world's sparse tiled
+/// heaps copied ~300 MB of unmapped pages a frame, 4 KiB at a time.
 fn protect(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+    };
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -182,6 +261,14 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+            continue;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n != 0 && info.State != MEM_COMMIT {
+            g.clean.insert(block);
         }
     }
 }
@@ -218,13 +305,14 @@ pub fn writing(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
+    }
+    // Unmapped blocks are clean without being guarded.
+    let blocks: Vec<usize> = g.clean.range(range).copied().collect();
+    for block in blocks {
         g.clean.remove(&block);
     }
 }
@@ -290,8 +378,17 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// The journal and guards are the process's: tests that ask or remap
+    /// run one at a time (one asker's `forget_asked` changes another's
+    /// answers).
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _serial = serial();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -303,13 +400,20 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        forget_asked();
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        // Asked about already in this submission: the write shows in the
+        // next one.
+        let (_, same) = writes(start, end, false).expect("watched");
+        assert!(same.is_empty());
+        forget_asked();
         let (now, after) = writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
+        forget_asked();
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
@@ -330,6 +434,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _serial = serial();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -374,8 +479,84 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _serial = serial();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A block of view memory with nothing mapped (a placeholder in a tiled
+    /// heap) is taken as written once (copies read its zeros), then clean
+    /// until the runtime maps memory there.
+    #[test]
+    fn unmapped_view_blocks_are_reported_once() {
+        let _serial = serial();
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let null = std::ptr::null_mut();
+        // SAFETY: a placeholder of two blocks of ours; the first becomes a
+        // view of a pagefile section, the second stays a placeholder.
+        let p = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                null,
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                null,
+                0,
+            );
+            assert_eq!(view.Value as usize, p);
+            p
+        };
+        let (mapped, unmapped) = (p / PAGE, p / PAGE + 1);
+        let last = |w: &[(usize, u64)], page: usize| w.iter().find(|e| e.0 == page).map(|e| e.1);
+        forget_asked();
+        let (first, w) = writes(p, p + 2 * BLOCK, true).expect("view memory");
+        assert_eq!(last(&w, mapped), Some(first));
+        assert_eq!(last(&w, unmapped), Some(first));
+        // Asked about in this submission already: not asked again.
+        let (_, w) = writes(p, p + 2 * BLOCK, true).expect("view memory");
+        assert_eq!(last(&w, unmapped), Some(first));
+        forget_asked();
+        let (_, w) = writes(p, p + 2 * BLOCK, true).expect("view memory");
+        assert_eq!(last(&w, unmapped), Some(first), "unmapped: clean");
+        assert_eq!(last(&w, mapped), Some(first), "guarded, not written");
+        // The runtime maps memory there: taken again.
+        title_memory_remapped(p + BLOCK, BLOCK);
+        forget_asked();
+        let (third, w) = writes(p, p + 2 * BLOCK, true).expect("view memory");
+        // Askers that do not guard get no answer for view memory, though
+        // guarded askers asked about it in this submission.
+        assert!(writes(p, p + 2 * BLOCK, false).is_none());
+        assert_eq!(last(&w, unmapped), Some(third));
+        assert_eq!(last(&w, mapped), Some(first));
+        title_memory_remapped(p, 2 * BLOCK);
+        // The memory stays: the journal keeps its pages, which another test
+        // given the same addresses would read as its own.
     }
 }

@@ -65,10 +65,24 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// DS `op vdst, vaddr, vdata offset:offset`.
+const fn ds(op: u8, vdst: u8, vaddr: u8, vdata: u8, offset: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | offset as u32,
+        (vdst as u32) << 24 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, 0, 1)
+}
+
+/// As [`build_valu_cs`], with `lds_granules` × 512 bytes of LDS and
+/// `threads` threads (the thread's index in `v0`).
+fn build_cs(body: &[u32], lds_granules: u32, threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -116,8 +130,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            rsrc2: 5 << 1 | lds_granules << 15, // 5 user SGPRs: s0..s4
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -238,6 +252,92 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | ((u32::from(exp) + 112) << 23) | (u32::from(mant) << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+/// Byte and half LDS writes change only their bytes of the dword; byte and
+/// half reads zero- or sign-extend, and the d16 forms keep the other half.
+#[test]
+fn lds_bytes_and_halves() {
+    let inputs = [0x80F1_7F02, 0x0000_ABCD, 0xBEEF_0000, 0x1234_5678];
+    let v0_from_v4 = vop1(0x001, 0, vgpr(4));
+    let read = ds(0x36, 0, 5, 0, 0);
+    let cases: &[(&str, Vec<u32>, u32)] = &[
+        (
+            "ds_write_b8 offset:1",
+            [ds(0x1e, 0, 5, 2, 1), read].concat(),
+            0x80F1_CD02,
+        ),
+        (
+            "ds_write_b16 offset:2",
+            [ds(0x1f, 0, 5, 2, 2), read].concat(),
+            0xABCD_7F02,
+        ),
+        (
+            "ds_write_b8_d16_hi offset:3",
+            [ds(0xa0, 0, 5, 3, 3), read].concat(),
+            0xEFF1_7F02,
+        ),
+        (
+            "ds_write_b16_d16_hi offset:0",
+            [ds(0xa1, 0, 5, 3, 0), read].concat(),
+            0x80F1_BEEF,
+        ),
+        ("ds_read_u8 offset:3", ds(0x3a, 0, 5, 0, 3).to_vec(), 0x80),
+        (
+            "ds_read_i8 offset:3",
+            ds(0x39, 0, 5, 0, 3).to_vec(),
+            0xFFFF_FF80,
+        ),
+        (
+            "ds_read_i8 offset:2",
+            ds(0x39, 0, 5, 0, 2).to_vec(),
+            0xFFFF_FFF1,
+        ),
+        (
+            "ds_read_u16 offset:2",
+            ds(0x3c, 0, 5, 0, 2).to_vec(),
+            0x80F1,
+        ),
+        (
+            "ds_read_i16 offset:2",
+            ds(0x3b, 0, 5, 0, 2).to_vec(),
+            0xFFFF_80F1,
+        ),
+        (
+            "ds_read_i16 offset:0",
+            ds(0x3b, 0, 5, 0, 0).to_vec(),
+            0x7F02,
+        ),
+        (
+            "ds_read_u8_d16_hi offset:1",
+            [[v0_from_v4].as_slice(), &ds(0xa3, 0, 5, 0, 1)].concat(),
+            0x007F_5678,
+        ),
+        (
+            "ds_read_i8_d16 offset:3",
+            [[v0_from_v4].as_slice(), &ds(0xa4, 0, 5, 0, 3)].concat(),
+            0x1234_FF80,
+        ),
+        (
+            "ds_read_u16_d16 offset:2",
+            [[v0_from_v4].as_slice(), &ds(0xa6, 0, 5, 0, 2)].concat(),
+            0x1234_80F1,
+        ),
+    ];
+    for (name, body, want) in cases {
+        // Each thread its own dword (more threads than a wave, so no wave
+        // size is asked for): v5 = 4 × thread, which holds v1, then the case.
+        let mut words = vop3(0x11a, 5, 130, vgpr(0), 0).to_vec();
+        words.extend(ds(0x0d, 0, 5, 1, 0));
+        words.extend(body);
+        let shader = build_cs(&words, 1, 33);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(
+                got, *want,
+                "{backend}: {name}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
 }
 
 #[test]

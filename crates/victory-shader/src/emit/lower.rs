@@ -2164,7 +2164,47 @@ impl<'a> Lower<'a> {
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                return Err("an LDS read of bytes or halves");
+                // Bytes and halves: the dword holding them, shifted down to
+                // bit 0 and extended; the d16 forms keep the other half.
+                let bits = match rest {
+                    "_u8" | "_i8" | "_u8_d16" | "_u8_d16_hi" | "_i8_d16" | "_i8_d16_hi" => 8,
+                    "_u16" | "_i16" | "_u16_d16" | "_u16_d16_hi" => 16,
+                    _ => return Err("an LDS read of bytes or halves"),
+                };
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let p = dword(self, offset);
+                let w = self.s.m.load(c, p);
+                let o = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, a, o);
+                let align = self.s.m.i32(if bits == 8 { 3 } else { 2 });
+                let at = self.s.m.bin(c, Bin::And, at, align);
+                let three = self.s.m.i32(3);
+                let sh = self.s.m.bin(c, Bin::Shl, at, three);
+                let k32 = self.s.m.i32(32 - bits);
+                let left = self.s.m.bin(c, Bin::Sub, k32, sh);
+                let x = self.s.m.bin(c, Bin::Shl, w, left);
+                let signed = if rest.starts_with("_i") {
+                    Bin::AShr
+                } else {
+                    Bin::LShr
+                };
+                let x = self.s.m.bin(c, signed, x, k32);
+                let x = match rest.strip_suffix("_hi") {
+                    _ if !rest.contains("_d16") => x,
+                    Some(_) => {
+                        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.i32(0),
+                        };
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let old = self.s.m.bin(c, Bin::And, old, low);
+                        let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                        self.s.m.bin(c, Bin::Or, old, x)
+                    }
+                    None => self.low_half(inst, reg, x),
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
             let mut n = 0;
@@ -2184,7 +2224,38 @@ impl<'a> Lower<'a> {
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                return Err("an LDS write of bytes or halves");
+                // Bytes and halves: cleared, then set, in the dword holding
+                // them, each atomically, so lanes writing other bytes of the
+                // same dword keep theirs.
+                let bits = match rest {
+                    "_b8" | "_b8_d16_hi" => 8,
+                    "_b16" | "_b16_d16_hi" => 16,
+                    _ => return Err("an LDS write of bytes or halves"),
+                };
+                let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                if rest.ends_with("_d16_hi") {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                }
+                let o = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, a, o);
+                let align = self.s.m.i32(if bits == 8 { 3 } else { 2 });
+                let at = self.s.m.bin(c, Bin::And, at, align);
+                let three = self.s.m.i32(3);
+                let sh = self.s.m.bin(c, Bin::Shl, at, three);
+                let field = self.s.m.i32(((1u64 << bits) - 1) as u32);
+                let x = self.s.m.bin(c, Bin::And, x, field);
+                let x = self.s.m.bin(c, Bin::Shl, x, sh);
+                let mask = self.s.m.bin(c, Bin::Shl, field, sh);
+                let ones = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, mask, ones);
+                let p = dword(self, offset);
+                use super::bitcode::Rmw;
+                let at = self.begin_guarded(guard);
+                self.s.m.atomic(self.cur, Rmw::And, p, keep);
+                self.s.m.atomic(self.cur, Rmw::Or, p, x);
+                self.end_guarded(at, &[]);
+                return Ok(());
             };
             let mut stores = Vec::new();
             for (e, (off, w)) in elements.into_iter().enumerate() {
@@ -5788,7 +5859,8 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6032,6 +6104,29 @@ impl<'a> Lower<'a> {
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
                     }
+                    if name.starts_with("image_gather4_l") && !name.starts_with("image_gather4_lz")
+                    {
+                        if !matches!(kind, 2 | 7) || *d16 {
+                            return Err("a gather at a level of a cube, 1D, 3D or d16 view");
+                        }
+                        let lod = addr_val(self, first + coords)?;
+                        let lod = to_float(self, lod);
+                        let Operand::Vector { reg, .. } = *data else {
+                            return Err("an image result");
+                        };
+                        let texels = self.gather_at_level(
+                            (h, sh),
+                            &cs,
+                            [os[0], os[1]],
+                            lod,
+                            dmask.trailing_zeros(),
+                        );
+                        for (k, x) in texels.into_iter().enumerate() {
+                            let x = self.as_int(x);
+                            self.write(inst, Reg::V(reg + k as u8), x, guard);
+                        }
+                        return Ok(());
+                    }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
                     self.s.op(
@@ -6109,6 +6204,87 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A gather at an explicit level (`image_gather4_l`), which DXIL lacks:
+    /// the four texels of the 2×2 footprint at the nearest level, each
+    /// sampled at its centre through the same sampler (so its address mode
+    /// holds), in gather order: (-,+), (+,+), (+,-), (-,-).
+    fn gather_at_level(
+        &mut self,
+        (h, sh): (V, V),
+        cs: &[V],
+        offsets: [V; 2],
+        lod: V,
+        channel: u32,
+    ) -> [V; 4] {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let z = self.s.m.i32(0);
+        let top = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+        let levels = self.s.m.extract(c, top, 3);
+        let one = self.s.m.i32(1);
+        let last = self.s.m.bin(c, Bin::Sub, levels, one);
+        let nearest = self.unary(26, lod);
+        let fz = self.s.m.f32(0);
+        let nearest = self.binary(35, nearest, fz);
+        let level = self.s.m.cast(c, Cast::FpToSi, nearest, i32t);
+        let level = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 37, &[level, z]);
+        let level = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 38, &[level, last]);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, level]);
+        let (half, three_halves) = (
+            self.s.m.f32(0.5f32.to_bits()),
+            self.s.m.f32(1.5f32.to_bits()),
+        );
+        let mut centres = [[fz; 2]; 2];
+        for k in 0..2 {
+            let n = self.s.m.extract(c, d, k as u32);
+            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::Mul, cs[k], n);
+            let x = self.s.m.bin(c, Bin::Sub, x, half);
+            let x = self.unary(27, x);
+            let o = self.s.m.cast(c, Cast::SiToFp, offsets[k], f32t);
+            let x = self.s.m.bin(c, Bin::Add, x, o);
+            for (j, step) in [half, three_halves].into_iter().enumerate() {
+                let t = self.s.m.bin(c, Bin::Add, x, step);
+                centres[k][j] = self.s.m.bin(c, Bin::SDiv, t, n);
+            }
+        }
+        let level = self.s.m.cast(c, Cast::SiToFp, level, f32t);
+        let (fu, iu) = (self.s.m.undef(f32t), self.s.m.undef(i32t));
+        [(0, 1), (1, 1), (1, 0), (0, 0)].map(|(i, j)| {
+            let args = [
+                h,
+                sh,
+                centres[0][i],
+                centres[1][j],
+                cs[2],
+                fu,
+                iu,
+                iu,
+                iu,
+                level,
+            ];
+            let r = self.s.op(
+                c,
+                "sampleLevel.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                62,
+                &args,
+            );
+            self.s.m.extract(c, r, channel)
+        })
     }
 
     /// The direction a cube sample's face coordinates stand for: the
@@ -6696,15 +6872,25 @@ impl<'a> Lower<'a> {
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let vertices = self.s.mesh.ok_or("a primitive export outside a mesh shader")?.max_vertices;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let vertices = self.s.m.i32(vertices);
+        // An index past the declared vertices is undefined on the host (a
+        // driver reset on NVIDIA); such a primitive is culled.
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let outside = self.s.m.cmp(c, pred::IUGE, i, vertices);
+            culled = self.s.m.bin(c, Bin::Or, culled, outside);
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
