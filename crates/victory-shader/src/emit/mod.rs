@@ -289,6 +289,17 @@ pub fn a16_bias() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_A16_BIAS").is_none())
 }
 
+/// Whether an operation on a value control flow joins from a load on some
+/// edge (a register a branch reuses where the other paths leave a stale lane
+/// mask) is data, not a mask operation (upstream 0b35b7f, in DexNom); taken
+/// as a mask otherwise. On unless `VICTORY_NO_LOADED_JOINS` is set. The
+/// value is part of the translation, so the shader cache must key on it
+/// (`victory-gpu`'s does).
+pub fn loaded_joins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_LOADED_JOINS").is_none())
+}
+
 /// How mesh programs take the console's tests of whether a lane mask has a
 /// lane set and its wave minimums, maximums, ANDs and ORs
 /// (`VICTORY_MESH_WAVE_OPS`). The value is part of the translation, so the
