@@ -5365,20 +5365,29 @@ impl<'a> Lower<'a> {
             Source::Built { .. } => Err("a descriptor built around a root descriptor"),
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+                // join picks one with a phi. A phi an edge brings is one of
+                // an earlier join (code paths that merge, then merge again),
+                // which dominates the edge.
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
                     }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
+                    let Some(tail) = self.tail[q] else {
                         return Err("a descriptor chosen by control flow");
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
+                    let index = match arg {
+                        Source::Loaded { load, first } => {
+                            let here = std::mem::replace(&mut self.cur, at);
+                            let index = self.heap_index(*load, *first, sampler);
+                            self.cur = here;
+                            index?
+                        }
+                        Source::Phi { .. } => self.heap_slot(arg, sampler)?.0,
+                        _ => return Err("a descriptor chosen by control flow"),
+                    };
+                    incoming.push((index, at));
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
