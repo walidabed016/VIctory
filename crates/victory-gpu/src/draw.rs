@@ -80,6 +80,17 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// What the title set straight on the host list, set again on a new
+    /// one when the title list is cut at a wait ([`State::replay`]):
+    /// whether the topology was set, the targets and depth (handles),
+    /// viewports, scissors, blend factor, stencil reference, depth bounds.
+    topology_set: bool,
+    target_handles: Option<(Vec<u64>, u64)>,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend: Option<Option<[f32; 4]>>,
+    stencil: Option<u32>,
+    depth_bounds: Option<(f32, f32)>,
 }
 
 impl Drop for State {
@@ -256,6 +267,7 @@ impl State {
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
+        self.topology_set = true;
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
@@ -334,8 +346,79 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
+    /// Viewports, scissors, blend factor, stencil reference and depth
+    /// bounds: on the host list at once, and kept for [`State::replay`].
+    pub(crate) fn set_viewports(&mut self, list: &HostList, set: &[D3D12_VIEWPORT]) {
+        self.viewports.clear();
+        self.viewports.extend_from_slice(set);
+        viewports(list, set);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.scissors.clear();
+        self.scissors.extend_from_slice(rects);
+        scissors(list, rects);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend = Some(factor.copied());
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.stencil = Some(reference);
+        stencil_ref(list, reference);
+    }
+
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        depth_bounds(list, min, max);
+    }
+
+    /// The title list was cut at a wait and records into a new host list
+    /// (`crate::list`), which has nothing set: what the title set so far
+    /// is set again. The pipeline, root signatures and heaps are set by the
+    /// next draw or dispatch, which is told here that the host list has
+    /// none; root arguments, vertex and index buffers are set by every draw
+    /// anyway. The tables made in dynamic slots stay: the parts before the
+    /// cut have not run yet, and the slots go back when the title list is
+    /// reset.
+    /// shortcut: the render target views are made again from the handles'
+    /// descriptors as they are now, not as they were when the title set
+    /// the targets.
+    pub(crate) fn replay(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        if let Some((handles, depth)) = self.target_handles.clone() {
+            self.set_targets(list, &handles, depth);
+        }
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if let Some(factor) = self.blend {
+            blend_factor(list, factor.as_ref());
+        }
+        if let Some(reference) = self.stencil {
+            stencil_ref(list, reference);
+        }
+        if let Some((min, max)) = self.depth_bounds {
+            depth_bounds(list, min, max);
+        }
+    }
+
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        let kept = self.target_handles.get_or_insert_with(Default::default);
+        kept.0.clear();
+        kept.0.extend_from_slice(handles);
+        kept.1 = depth;
         let Some(host) = crate::host::host() else {
             return;
         };

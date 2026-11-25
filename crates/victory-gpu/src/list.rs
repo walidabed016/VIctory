@@ -119,6 +119,77 @@ struct List {
     host: crate::host::Recording,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The parts of the recording cut at its waits for memory values
+    /// ([`cut_at`]).
+    #[cfg(windows)]
+    parts: std::sync::Mutex<Parts>,
+}
+
+/// A title list cut at its waits for memory values ([`cut_at`]): the parts
+/// recorded before its host list, in order, each closed and behind the
+/// waits its queue stands at before running it; and the waits before the
+/// host list's first work.
+#[cfg(windows)]
+#[derive(Default)]
+struct Parts {
+    earlier: Vec<(Vec<ValueWait>, Box<crate::host::HostList>)>,
+    gate: Vec<ValueWait>,
+}
+
+#[cfg(windows)]
+impl List {
+    /// Before a reset, and when the title lets go of the list: the parts it
+    /// was cut into go to the queues (`crate::queue::leave`), which keep
+    /// them until nothing holds or runs them; so do its host list, upload
+    /// memory and draw state if a queue still holds any of its parts. The
+    /// title list records into a spare host list then (or none, `gone`).
+    /// A reset does not wait for a queue that holds a submission: the title
+    /// may be about to give another queue what it waits for.
+    fn leave_parts(&self, gone: bool) {
+        let parts = std::mem::take(&mut *self.parts.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut lists: Vec<Box<crate::host::HostList>> =
+            parts.earlier.into_iter().map(|(_, host)| host).collect();
+        let held = lists
+            .iter()
+            .map(|host| &**host)
+            .chain(self.host.get())
+            .any(|host| crate::queue::holds(std::ptr::from_ref(host) as usize));
+        if !held {
+            if !lists.is_empty() {
+                crate::queue::leave(crate::queue::Left {
+                    lists,
+                    _uploads: Vec::new(),
+                    _state: None,
+                });
+            }
+            return;
+        }
+        let current = if gone {
+            self.host.take()
+        } else {
+            let spare = crate::host::host().and_then(|h| h.spare_list());
+            if spare.is_none() {
+                // Run what the queues hold: then only flights run the list.
+                crate::queue::release_held(true);
+            }
+            spare.and_then(|fresh| self.host.replace(fresh))
+        };
+        lists.extend(current);
+        crate::queue::leave(crate::queue::Left {
+            lists,
+            _uploads: std::mem::take(&mut *self.uploads.lock().unwrap_or_else(|e| e.into_inner())),
+            _state: Some(std::mem::take(
+                &mut *self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            )),
+        });
+    }
+}
+
+#[cfg(windows)]
+impl Drop for List {
+    fn drop(&mut self) {
+        self.leave_parts(true);
+    }
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -225,6 +296,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         })),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(windows)]
+        parts: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -271,7 +344,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Every submission of the list has run (submissions are waited for;
-    // pipelined, waited for here, or left the host list they run).
+    // pipelined, waited for here, or left the host list they run); a queue
+    // that holds its host lists keeps them.
+    #[cfg(windows)]
+    // SAFETY: as above.
+    unsafe { &*this.cast::<List>() }.leave_parts(false);
     #[cfg(windows)]
     // SAFETY: as above.
     unsafe { &(*this.cast::<List>()).host }.before_reset(uploads);
@@ -1030,7 +1107,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1052,30 +1129,23 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
-        }
+        with_state(this, |list, s| {
+            s.set_viewports(list, items(viewports, count))
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
-            // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
-        }
+        // SAFETY: the title passes four floats or null.
+        let factor = unsafe { factor.as_ref() };
+        with_state(this, |list, s| s.set_blend_factor(list, factor));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::depth_bounds(list, min, max);
-        }
+        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1347,10 +1417,209 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// A GPU wait for a memory value `(address, comparison, reference, ...)`,
+/// 32 and 64 bits: the list's commands after it run once the value at
+/// `address` compares as asked with `reference`. The title orders work
+/// between its queues this way. With waits honoured
+/// (`crate::queue::waits`) the list is cut there ([`cut_at`]) and its queue
+/// stands at the wait; otherwise lists run when they are submitted and
+/// nothing waits.
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    #[cfg(windows)]
+    wait_for(this, address, comparison, reference, false);
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
+extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
+    #[cfg(windows)]
+    wait_for(this, address, comparison, reference, true);
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
+
+/// A list's wait for a memory value ([`wait_value`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValueWait {
+    address: u64,
+    comparison: u32,
+    reference: u64,
+    wide: bool,
+}
+
+#[cfg(windows)]
+impl ValueWait {
+    /// Whether memory holds what is waited for now. Memory that cannot be
+    /// read counts as met.
+    pub(crate) fn met(&self) -> bool {
+        let bytes = if self.wide { 8 } else { 4 };
+        let mut raw = [0u8; 8];
+        self.address == 0
+            || !crate::host::read_into(self.address as *const u8, &mut raw[..bytes])
+            || self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// Where the value waited for is: address and bytes.
+    pub(crate) fn place(&self) -> (usize, usize) {
+        (self.address as usize, if self.wide { 8 } else { 4 })
+    }
+
+    /// Whether the wait is met with `value` at its address (its low half
+    /// for a 32-bit wait).
+    /// shortcut: the comparison codes are taken to be the comparison
+    /// functions' (1 never .. 8 always, value against reference); one not
+    /// known counts as met.
+    pub(crate) fn holds_for(&self, value: u64) -> bool {
+        let (value, reference) = if self.wide {
+            (value, self.reference)
+        } else {
+            (value & 0xFFFF_FFFF, self.reference & 0xFFFF_FFFF)
+        };
+        match self.comparison {
+            1 => false,
+            2 => value < reference,
+            3 => value == reference,
+            4 => value <= reference,
+            5 => value > reference,
+            6 => value != reference,
+            7 => value >= reference,
+            _ => true,
+        }
+    }
+}
+
+/// Since the last [`take_waits`]: waits for memory values recorded, and
+/// cuts they made.
+#[cfg(windows)]
+static WAITS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+pub(crate) fn take_waits() -> [u64; 2] {
+    WAITS
+        .each_ref()
+        .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(windows)]
+fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    if !crate::queue::waits() {
+        return;
+    }
+    let wait = ValueWait {
+        address,
+        comparison,
+        reference,
+        wide,
+    };
+    let seen = WAITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if seen == 0 || LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(
+            address = format_args!("{address:#x}"),
+            comparison,
+            reference,
+            wide,
+            met = wait.met(),
+            "a list waits for a memory value"
+        );
+    }
+    cut_at(this, wait);
+}
+
+/// The title list `this` waits for a memory value: its queue runs nothing
+/// recorded after the wait until the value is there, and what was recorded
+/// before has run then, as on the console; other queues may be waiting for
+/// exactly that (the title's lists are chains of jobs, each behind a wait
+/// for a value another queue's list writes in the middle of its own). So
+/// the recording is cut here: the host list so far is closed and kept as a
+/// part of its own ([`Parts`]), the title's calls record into a spare
+/// host list from here on, and the wait stands before it. A submission
+/// gives the queue the parts in order ([`pieces`]). A wait before any work
+/// cuts nothing: it joins the waits before the host list.
+/// shortcut: a bottom-of-pipe write is done when its part has run, not at
+/// its place in the part: a queue waiting for it starts later than on the
+/// console, never earlier.
+#[cfg(windows)]
+fn cut_at(this: This, wait: ValueWait) {
+    let Some(current) = host_list(this) else {
+        return;
+    };
+    // SAFETY: the title passes one of our lists, recorded by one thread at
+    // a time.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut parts = list.parts.lock().unwrap_or_else(|e| e.into_inner());
+    if current.untouched() {
+        parts.gate.push(wait);
+        return;
+    }
+    let Some(fresh) = crate::host::host().and_then(|h| h.spare_list()) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "no host list for the part after a wait: the wait moves to the part's start"
+            )
+        });
+        parts.gate.push(wait);
+        return;
+    };
+    fresh.reset();
+    crate::indirect::close(current);
+    current.close();
+    let Some(done) = list.host.replace(fresh) else {
+        return;
+    };
+    let gate = std::mem::replace(&mut parts.gate, vec![wait]);
+    parts.earlier.push((gate, done));
+    drop(parts);
+    WAITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    with_state(this, |host, state| state.replay(host));
+}
+
+/// Whether title list `this` waits for a memory value ([`cut_at`]).
+#[cfg(windows)]
+pub(crate) fn is_cut(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: one of our lists, closed and submitted.
+    let list = unsafe { &*this.cast::<List>() };
+    let parts = list.parts.lock().unwrap_or_else(|e| e.into_inner());
+    !parts.earlier.is_empty() || !parts.gate.is_empty()
+}
+
+/// What a queue is given for submitted `lists`: their host lists
+/// (addresses), each list's parts ([`cut_at`]) in order, in runs each
+/// behind the waits it stands at first; host lists without waits join the
+/// run before them. The lists keep their parts: the title may submit them
+/// again.
+#[cfg(windows)]
+pub(crate) fn pieces(lists: &[This]) -> Vec<(Vec<ValueWait>, Vec<usize>)> {
+    let mut runs: Vec<(Vec<ValueWait>, Vec<usize>)> = vec![(Vec::new(), Vec::new())];
+    for &this in lists {
+        let Some(current) = host_list(this) else {
+            continue;
+        };
+        // SAFETY: one of our lists, closed and submitted.
+        let list = unsafe { &*this.cast::<List>() };
+        let parts = list.parts.lock().unwrap_or_else(|e| e.into_inner());
+        let all = parts
+            .earlier
+            .iter()
+            .map(|(waits, host)| (waits, &**host))
+            .chain(std::iter::once((&parts.gate, current)));
+        for (waits, host) in all {
+            if !waits.is_empty() {
+                runs.push((waits.clone(), Vec::new()));
+            }
+            if let Some((_, hosts)) = runs.last_mut() {
+                hosts.push(std::ptr::from_ref(host) as usize);
+            }
+        }
+    }
+    runs.retain(|(_, hosts)| !hosts.is_empty());
+    runs
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1456,7 +1725,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (72, wait_value64 as *const ()),              // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1617,5 +1886,85 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// The title's async compute: a list that waits for a value another
+    /// queue's list stores at the bottom of the pipe runs the commands
+    /// after its wait once that list has run, though submitted first; what
+    /// it recorded before the wait runs at once. The title may reset the
+    /// list meanwhile: the queue keeps what it holds.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_waits_for_what_another_queues_list_writes() {
+        let _serial = crate::watch::serial();
+        if crate::host::host().is_none() || !crate::queue::waits() {
+            return;
+        }
+        let null = std::ptr::null();
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let queue = |kind: u32| {
+            let (desc, mut q) = ([kind, 0, 0, 0], null);
+            assert_eq!(
+                crate::queue::create(null, desc.as_ptr().cast(), &queue_iid, &mut q),
+                S_OK
+            );
+            q
+        };
+        let (graphics, compute) = (queue(0), queue(2));
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let list = || {
+            let mut l = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut l),
+                S_OK
+            );
+            l
+        };
+        let (producer, consumer) = (list(), list());
+        // The value the producer stores, and the consumer's marks before
+        // and after its wait.
+        let memory: &'static mut [u32] = Box::leak(vec![0u32; 3].into_boxed_slice());
+        let at = |i: usize| memory.as_ptr().wrapping_add(i) as u64;
+        // SAFETY: the words are ours, written by lists that have run.
+        let read = |i: usize| unsafe { memory.as_ptr().add(i).read_volatile() };
+        write32(consumer, at(1), 1, 0, 0);
+        wait_value(consumer, at(0), 3, 7);
+        write32(consumer, at(2), 1, 0, 0);
+        close(consumer);
+        assert!(is_cut(consumer));
+        write32(producer, at(0), 7, 0, 0);
+        close(producer);
+        let execute = |q: This, l: This| {
+            slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &l)
+        };
+        execute(compute, consumer);
+        crate::pipelined::wait_all();
+        assert_eq!(
+            (read(1), read(2)),
+            (1, 0),
+            "only what came before the wait ran"
+        );
+        assert_eq!(reset(consumer, allocator, null), S_OK);
+        assert!(!is_cut(consumer));
+        execute(graphics, producer);
+        crate::pipelined::wait_all();
+        assert_eq!(
+            (read(0), read(2)),
+            (7, 1),
+            "the rest ran behind the producer"
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for o in [producer, consumer, allocator, graphics, compute] {
+            assert_eq!(release(o), 0);
+        }
     }
 }

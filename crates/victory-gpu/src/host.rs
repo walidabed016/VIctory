@@ -1092,6 +1092,15 @@ static RECYCLER: Mutex<Recycler> = Mutex::new(Recycler {
     free: Vec::new(),
 });
 
+/// Keeps `list`, closed, which nothing runs or holds any more, for
+/// [`Host::spare_list`], if fewer than [`free_lists`] are kept.
+pub(crate) fn give_back(list: Box<HostList>) {
+    let mut recycler = RECYCLER.lock().unwrap_or_else(|e| e.into_inner());
+    if recycler.free.len() < free_lists() {
+        recycler.free.push(Held(list));
+    }
+}
+
 /// Host lists title lists' resets took since the last frame-rate line
 /// (diagnostics): free ones, new ones.
 #[cfg(feature = "diagnostics")]
@@ -1137,6 +1146,24 @@ impl Recording {
         // SAFETY: made by `Box::into_raw`; freed when the title list is,
         // or held until its submissions complete.
         unsafe { self.0.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// Records into `list` from now on: the host list recorded into until
+    /// now, for the caller to run or keep (a title list cut at a wait, or
+    /// one let go of while a queue holds its host list: `crate::list`).
+    pub(crate) fn replace(&self, list: Box<HostList>) -> Option<Box<HostList>> {
+        self.swap(Box::into_raw(list))
+    }
+
+    /// The host list, taken: the title list has none from now on.
+    pub(crate) fn take(&self) -> Option<Box<HostList>> {
+        self.swap(std::ptr::null_mut())
+    }
+
+    fn swap(&self, list: *mut HostList) -> Option<Box<HostList>> {
+        let left = self.0.swap(list, Ordering::AcqRel);
+        // SAFETY: made by `Box::into_raw`, and no longer the title list's.
+        (!left.is_null()).then(|| unsafe { Box::from_raw(left) })
     }
 
     /// Before the title list is reset: waits for the submissions in flight
@@ -1290,6 +1317,13 @@ impl Host {
             list.stamp_start();
             Ok(list)
         }
+    }
+
+    /// A closed host list nothing runs: a free one, or a new one. For the
+    /// parts of title lists cut at their waits, and for title lists let go
+    /// of while a queue holds their host lists (`crate::list`).
+    pub(crate) fn spare_list(&self) -> Option<Box<HostList>> {
+        self.free_list(crate::pipelined::flying)
     }
 
     /// A closed host list for a title list's reset ([`recycling`]): a free
@@ -2592,6 +2626,42 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// The values the list stores at the bottom of the pipe once it has
+    /// run, timestamps aside: address, value, bytes.
+    pub(crate) fn value_writes(&self) -> Vec<(usize, u64, usize)> {
+        self.deferred()
+            .writes
+            .iter()
+            .filter_map(|&(at, what, bytes)| match what {
+                crate::queue::Written::Value(value) => Some((at, value, bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether nothing recorded since the list was opened does any work: no
+    /// draw or dispatch (each keeps its pipeline), copy, clear, upload or
+    /// resolve (they defer a step or move a texture's state), and no
+    /// bottom-of-pipe write. State set on the list does not count.
+    pub(crate) fn untouched(&self) -> bool {
+        let deferred = {
+            let d = self.deferred();
+            d.copies.is_empty()
+                && d.uploads.is_empty()
+                && d.kept.is_empty()
+                && d.textures.is_empty()
+                && d.staged.is_empty()
+                && d.writes.is_empty()
+                && !d.budget_zeroed
+        };
+        deferred
+            && self
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -3629,6 +3699,7 @@ impl Meter {
                      down whole; copy-back skipped {skipped:.1} MB unchanged"
                 );
             }
+            crate::queue::log_holds(logged);
             #[cfg(feature = "diagnostics")]
             {
                 let span = std::mem::take(&mut self.copy_stats_frames) as f64;

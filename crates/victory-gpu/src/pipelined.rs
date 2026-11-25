@@ -1056,6 +1056,20 @@ pub(crate) fn wait_signal(fence: This, value: u64) -> bool {
     on() && PIPELINE.wait_signal(fence as usize, value)
 }
 
+/// Whether a signal of `fence` to `value` or past it is deferred to a
+/// submission queued or in flight: the fence gets there when it completes.
+pub(crate) fn will_signal(fence: This, value: u64) -> bool {
+    on() && {
+        let reaches = |signals: &[(usize, u64)]| {
+            signals
+                .iter()
+                .any(|&(x, v)| x == fence as usize && v >= value)
+        };
+        let s = PIPELINE.lock();
+        s.queued.iter().any(|q| reaches(&q.signals)) || s.flying.iter().any(|f| reaches(&f.signals))
+    }
+}
+
 /// Logs and resets the counts, over `frames` frames.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log(frames: f64) {
