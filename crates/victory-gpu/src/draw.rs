@@ -801,6 +801,8 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            #[cfg(feature = "diagnostics")]
+            note_data(&view, u);
             readable(list, u.kind, &view);
         }
     }
@@ -885,6 +887,13 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                for u in &entries {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if let Some(view) = crate::descriptor::view(handle) {
+                        note_data(&view, u);
+                    }
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -914,6 +923,10 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     // An empty one is made null below, as other views.
                     Some(View::Constant(address, size)) if size > 0 => {
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(u) = used {
+                            note_data(&View::Constant(address, size), u);
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -924,6 +937,8 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
+                            #[cfg(feature = "diagnostics")]
+                            note_data(&view, u);
                             readable(list, u.kind, &view);
                         }
                     }
@@ -1418,6 +1433,19 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             crate::list::ensure_state(list, resource, UNORDERED_ACCESS);
         }
         _ => {}
+    }
+}
+
+/// Logs the data of a constant or buffer view a table entry `u` holds, for
+/// the programs `VICTORY_DUMP_DATA` names (diagnostics builds).
+#[cfg(feature = "diagnostics")]
+fn note_data(view: &View, u: &UsedResource) {
+    let range = match *view {
+        View::Constant(address, size) => Some((address, u64::from(size))),
+        _ => crate::descriptor::host::buffer_range(view),
+    };
+    if let Some((address, len)) = range {
+        crate::capture::note_data(u.slot, u.table_offset_dwords * 4, address, len);
     }
 }
 

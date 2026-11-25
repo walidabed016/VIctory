@@ -281,6 +281,67 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// Whether pipeline `name` holds a program `VICTORY_DUMP_DATA` names
+/// (comma-separated hashes): its constant and buffer data is logged, and
+/// the dumped targets it reads or writes are saved raw too.
+fn data_wanted(name: &str) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES
+        .get_or_init(|| {
+            let list = std::env::var("VICTORY_DUMP_DATA").unwrap_or_default();
+            list.split(',')
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .iter()
+        .any(|h| name.contains(h.as_str()))
+}
+
+/// Logs the words of a constant or buffer view (at most 2 KB) that the
+/// pipeline being bound reads from table `slot` at byte `offset`, once a
+/// view per frame, when it holds a program `VICTORY_DUMP_DATA` names and
+/// the frame being built is listed. The words are title memory's when the
+/// draw is recorded; data the GPU writes later in the frame is not in them.
+pub(crate) fn note_data(slot: u8, offset: u32, address: u64, len: u64) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<(u64, u64, String)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let frame = crate::queue::presented() + 1;
+    if address == 0 || len == 0 || !dump_on() || !listed(frame) {
+        return;
+    }
+    let pipeline = crate::descriptor::host::BINDING.get() as crate::object::This;
+    let Some(name) = crate::pipeline::host_pipeline(pipeline).map(|p| p.name.clone()) else {
+        return;
+    };
+    if !data_wanted(&name)
+        || !SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((frame, address, name.clone()))
+    {
+        return;
+    }
+    // SAFETY: a view's range in title memory, which the host copies from.
+    let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, len.min(2048) as usize) };
+    let words: Vec<String> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| format!("{:08x}", u32::from_le_bytes(*w)))
+        .collect();
+    tracing::info!(
+        frame,
+        pipeline = %name,
+        slot,
+        offset = format_args!("{offset:#x}"),
+        address = format_args!("{address:#x}"),
+        len,
+        words = %words.join(" "),
+        "shader data"
+    );
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
@@ -340,18 +401,26 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        let raw = accesses
+            .iter()
+            .any(|(r, _, name)| r == resource && data_wanted(name));
+        let resource = *resource as crate::object::This;
+        let prefix = format!("frame-{frame}-{i:02}-{resource:?}");
+        dump_one(host, texture, state, resource, &prefix, &d, raw);
     }
 }
 
+/// Saves one target as `<prefix>-<w>x<h>[x<d>]-f<format>.png`, and with
+/// `raw` its rows as read back (`RowPitch` bytes apart, slices after each
+/// other) in a `.bin` beside it.
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,
-    frame: u64,
-    i: usize,
     resource: crate::object::This,
+    prefix: &str,
     d: &D3D12_RESOURCE_DESC,
+    raw: bool,
 ) {
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
@@ -385,6 +454,12 @@ fn dump_one(
         // the other.
         let height = f.Height * f.Depth;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), rows_bytes(&f) as usize);
+        let depth = if f.Depth > 1 {
+            format!("x{}", f.Depth)
+        } else {
+            String::new()
+        };
+        let name = format!("{prefix}-{}x{}{depth}-f{}", d.Width, d.Height, d.Format.0);
         if let Some(rgba) = to_rgba(
             f.Format.0 as u32,
             f.Width as usize,
@@ -392,18 +467,18 @@ fn dump_one(
             pitch,
             rows,
         ) {
-            let depth = if f.Depth > 1 {
-                format!("x{}", f.Depth)
-            } else {
-                String::new()
-            };
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}{depth}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
             save_as(&name, f.Width, height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+        }
+        if raw && let Some(folder) = folder() {
+            let path = folder.join(format!("{name}.bin"));
+            match std::fs::write(&path, rows) {
+                Ok(()) => tracing::info!(path = %path.display(), pitch, "raw target saved"),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "raw target not saved")
+                }
+            }
         }
         buffer.Unmap(0, None);
     }
