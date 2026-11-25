@@ -460,10 +460,27 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        // Slots viewing placed textures whose memory the title reused, if
-        // not written again since: they would hold the textures.
-        for (slot, record) in crate::resource::stale_slots(std::ptr::from_ref(self) as usize) {
-            if made.get(slot as usize) == Some(&record) {
+        // Slots viewing placed textures let go of as the title placed
+        // another in their memory, if not written again since: they view
+        // that texture, as the title's descriptors view the memory.
+        let heap = std::ptr::from_ref(self) as usize;
+        for (slot, record, address, desc) in crate::resource::stale_slots(heap) {
+            if made.get(slot as usize) != Some(&record) {
+                continue;
+            }
+            let view = match view_at(record as u32, (record >> 32) as u32) {
+                Some(View::Placed(false, old, words)) => {
+                    crate::resource::replacement(&old, &words, address, &desc)
+                        .map(|(texture, words)| View::Shader(texture as usize, Some(words)))
+                }
+                _ => None,
+            };
+            let kept = view
+                .as_ref()
+                .and_then(|v| Some((record_stride(v), make(v, self.cpu(slot))?)));
+            if let Some((stride, k)) = kept {
+                self.keep(slot, k.resource, [stride, k.lead, k.kind]);
+            } else {
                 made[slot as usize] = 0;
                 self.make_null(slot);
             }
@@ -484,13 +501,12 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                crate::resource::placing(!for_draw, || make(&view, self.cpu(index)))
             };
             if kept.is_some()
                 && let View::Placed(_, resource, desc) = &view
             {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let heap = std::ptr::from_ref(self) as usize;
                 crate::resource::placed_slot(address, resource, heap, index, key);
             }
             if kept.is_none() && !self.sampler {
@@ -1713,11 +1729,10 @@ mod tests {
         assert!(placed_texture(&View::Placed(false, texture, words)).is_some());
     }
 
-    /// A slot viewing a placed texture whose memory another texture takes
-    /// is made null, so it no longer holds the texture; a slot viewing the
-    /// new texture keeps it.
+    /// A slot viewing a placed texture whose memory the title places another
+    /// texture in views that texture, so it no longer holds the old one.
     #[test]
-    fn slots_of_placed_textures_whose_memory_is_reused_are_made_null() {
+    fn slots_of_placed_textures_whose_memory_is_reused_view_the_new_texture() {
         let _serial = crate::watch::serial();
         if host().is_none() {
             return; // no host GPU
@@ -1742,16 +1757,16 @@ mod tests {
         crate::descriptor::record(handles[0], view(28));
         let first = heap.mirror(0, handles[0], false);
         let later = crate::queue::presented() + 2;
-        let reused = crate::resource::texture_at_in(address, &texture(87), later);
+        let reused = crate::resource::texture_at_in(address, &texture(87), later, true);
         crate::descriptor::record(handles[1], view(87));
         let second = heap.mirror(1, handles[1], false);
         BINDLESS_TEXTURES.set(false);
         assert!(first.is_some() && reused.is_some() && second.is_some());
         let kept = heap.kept.lock().unwrap();
-        assert!(kept[0].is_none(), "memory reused: made null");
         assert!(kept[1].is_some());
+        assert_eq!(kept[0], kept[1], "memory reused: the new texture");
         drop(kept);
-        assert_eq!(heap.made.lock().unwrap()[0], 0, "made again if read");
+        assert_ne!(heap.made.lock().unwrap()[0], 0, "still the title's view");
     }
 
     /// With `VICTORY_BINDLESS_TEXTURES=1`, the view of a texture the title

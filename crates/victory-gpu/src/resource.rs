@@ -1553,10 +1553,9 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// A texture the title placed in its own memory, as [`PLACED_TEXTURES`]
-/// keeps it: its resource (none once let go of while heap slots still view
-/// it), the end of its memory, its bytes, the frame it was last asked for,
-/// and the heap slots made from views of it (heap, slot, the record the
-/// slot was made from).
+/// keeps it: its resource, the end of its memory, its bytes, the frame it
+/// was last asked for, and the heap slots made from views of it (heap, slot,
+/// the record the slot was made from).
 #[cfg(windows)]
 struct Placed {
     resource: usize,
@@ -1570,8 +1569,8 @@ struct Placed {
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description (its padding words
 /// zeroed): a resource at that address, made the first time a view is
-/// made. One the title no longer asks for whose memory another texture
-/// takes is let go of, and so are the heap slots that view it
+/// made. One whose memory the title places another texture in is let go
+/// of, and the heap slots that view it move to that texture
 /// ([`texture_at_in`]).
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), Placed>> =
@@ -1590,23 +1589,34 @@ static PLACED_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static PLACED_DYING: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
-/// Heap slots that view placed textures whose memory another texture took,
-/// for their heaps to make null ([`stale_slots`]): heap, slot, record.
+/// Heap slots that view placed textures let go of as the title placed
+/// another in their memory, for their heaps to move to that texture
+/// ([`stale_slots`]): heap, slot, record, and the texture's address and
+/// description.
 #[cfg(windows)]
-static STALE_SLOTS: std::sync::Mutex<Vec<(usize, u32, u64)>> = std::sync::Mutex::new(Vec::new());
+#[allow(clippy::type_complexity)]
+static STALE_SLOTS: std::sync::Mutex<Vec<(usize, u32, u64, u64, [u32; 14])>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Whether [`STALE_SLOTS`] holds any.
 #[cfg(windows)]
 static STALE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Placed textures' bytes now (those with resources), those let go of and
-/// slots made null so far.
+/// Placed textures' bytes now, those let go of and heap slots moved so far.
 #[cfg(windows)]
 static PLACED_COUNTS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// The bytes of placed textures past which those asked for longest ago are
-/// let go of: `VICTORY_PLACED_TEXTURE_MIB` MiB (12288).
+std::thread_local! {
+    /// Whether this thread makes the view of a descriptor the title wrote
+    /// ([`placing`]).
+    #[cfg(windows)]
+    static PLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The bytes of placed textures past which those asked for longest ago that
+/// no heap slot views are let go of: `VICTORY_PLACED_TEXTURE_MIB` MiB
+/// (12288).
 #[cfg(windows)]
 fn placed_budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1619,22 +1629,31 @@ fn placed_budget() -> u64 {
     })
 }
 
-/// Placed textures with resources and their MiB; those let go of whose
-/// resources heap slots still hold and their MiB; those let go of and slots
-/// made null so far.
+/// Placed textures and their MiB; those heap slots view and their MiB;
+/// those let go of and heap slots moved so far.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> [u64; 6] {
     use std::sync::atomic::Ordering::Relaxed;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut live, mut held, mut held_bytes) = (0, 0, 0);
-    for p in map.values() {
-        match p.resource {
-            0 => (held, held_bytes) = (held + 1, held_bytes + p.bytes),
-            _ => live += 1,
-        }
+    let (mut viewed, mut viewed_bytes) = (0, 0);
+    for p in map.values().filter(|p| !p.slots.is_empty()) {
+        (viewed, viewed_bytes) = (viewed + 1, viewed_bytes + p.bytes);
     }
-    let [bytes, gone, nulled] = PLACED_COUNTS.each_ref().map(|n| n.load(Relaxed));
-    [live, bytes >> 20, held, held_bytes >> 20, gone, nulled]
+    let live = map.len() as u64;
+    drop(map);
+    let [bytes, gone, moved] = PLACED_COUNTS.each_ref().map(|n| n.load(Relaxed));
+    [live, bytes >> 20, viewed, viewed_bytes >> 20, gone, moved]
+}
+
+/// Runs `f`, in which views of textures placed in memory are made for a
+/// descriptor the title wrote if `on`: a texture made then lets go of those
+/// whose memory it takes ([`texture_at_in`]).
+#[cfg(windows)]
+pub(crate) fn placing<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let was = PLACING.replace(on);
+    let out = f();
+    PLACING.set(was);
+    out
 }
 
 /// Heap slot `slot` of heap `heap` was made from view record `record` of
@@ -1650,21 +1669,22 @@ pub(crate) fn placed_slot(address: u64, desc: &[u32; 14], heap: usize, slot: u32
     }
 }
 
-/// Of heap `heap`'s slots, those viewing placed textures whose memory
-/// another texture took, with the records they were made from: to make
-/// null where the title has not written them again since.
+/// Of heap `heap`'s slots, those viewing placed textures let go of as the
+/// title placed another in their memory, with the records they were made
+/// from and that texture's address and description: to move to it where
+/// the title has not written them again since.
 #[cfg(windows)]
-pub(crate) fn stale_slots(heap: usize) -> Vec<(u32, u64)> {
+pub(crate) fn stale_slots(heap: usize) -> Vec<(u32, u64, u64, [u32; 14])> {
     use std::sync::atomic::Ordering::Relaxed;
     if !STALE_ANY.load(Relaxed) {
         return Vec::new();
     }
     let mut stale = STALE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut mine = Vec::new();
-    stale.retain(|&(h, slot, record)| {
+    stale.retain(|&(h, slot, record, address, desc)| {
         let other = h != heap;
         if !other {
-            mine.push((slot, record));
+            mine.push((slot, record, address, desc));
         }
         other
     });
@@ -1673,33 +1693,67 @@ pub(crate) fn stale_slots(heap: usize) -> Vec<(u32, u64)> {
     mine
 }
 
+/// For a view `words` of a texture `old` let go of as the title placed the
+/// texture `desc` at `address` in its memory: that texture and the words
+/// to view it with. Those words where both describe the same texture but
+/// for more mips; a view of every mip where both are 2D textures of one
+/// slice; none otherwise, or where the GPU writes the new texture.
+#[cfg(windows)]
+pub(crate) fn replacement(
+    old: &[u32; 14],
+    words: &[u32; 16],
+    address: u64,
+    desc: &[u32; 14],
+) -> Option<(This, [u32; 10])> {
+    const GPU_WRITTEN: u32 = 0x7;
+    const TEXTURE_2D: u32 = 3;
+    const VIEW_2D: u32 = 4;
+    if desc[12] & GPU_WRITTEN != 0 {
+        return None;
+    }
+    let mut view: [u32; 10] = words[..10].try_into().ok()?;
+    let mips = |d: &[u32; 14]| d[7] >> 16;
+    let alike = old[0] == desc[0]
+        && old[4..7] == desc[4..7]
+        && old[7] & 0xffff == desc[7] & 0xffff
+        && old[8] == desc[8]
+        && (mips(old) == mips(desc) || mips(old) != 0 && mips(old) <= mips(desc));
+    if !alike {
+        if desc[0] != TEXTURE_2D || desc[7] & 0xffff != 1 || view[1] != VIEW_2D {
+            return None;
+        }
+        (view[0], view[4], view[5]) = (desc[8], 0, u32::MAX);
+    }
+    Some((texture_at(address, desc)?, view))
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    texture_at_in(address, desc, crate::queue::presented())
+    let place = PLACING.get() || !crate::descriptor::host::bindless_textures();
+    texture_at_in(address, desc, crate::queue::presented(), place)
 }
 
-/// [`texture_at`] in frame `now`. A texture made lets go of the read-only
-/// ones its memory overlaps that were not asked for in this frame or the
-/// one before, and of the heap slots that view them: the title reused
-/// their memory (streaming). Past [`placed_budget`], it lets go of the
-/// read-only ones asked for longest ago, but not of the heap slots that view
-/// them, which may still be read; those go when their memory is reused.
-/// Textures the GPU writes (render targets, depth, unordered) hold contents
-/// of their own and are kept, as are views of one memory used together.
-/// One let go of that the title views again is made again from its memory.
+/// [`texture_at`] in frame `now`. A texture made for a descriptor the title
+/// wrote (`place`) lets go of the read-only ones its memory overlaps that
+/// were not asked for in this frame or the one before: the title reused
+/// their memory (streaming); the heap slots that view them move to it.
+/// Others made (views made again for a stage or a draw) let go of none.
+/// Past [`placed_budget`], it lets go of the read-only ones asked for
+/// longest ago that no heap slot views. Textures the GPU writes (render
+/// targets, depth, unordered) hold contents of their own and are kept, as
+/// are views of one memory used together. One let go of that the title
+/// views again is made again from its memory.
 #[cfg(windows)]
-pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64) -> Option<This> {
+pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<This> {
     use std::sync::atomic::Ordering::Relaxed;
     const GPU_WRITTEN: u32 = 0x7;
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(placed) = map.get_mut(&(address, desc))
-        && placed.resource != 0
-    {
+    if let Some(placed) = map.get_mut(&(address, desc)) {
         placed.used = now;
         return Some(placed.resource as This);
     }
@@ -1729,28 +1783,29 @@ pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64) -> Option<
     let bytes = footprint(&d).map_or(1, |info| info.size.max(1));
     let end = address.saturating_add(bytes);
     let longest = PLACED_LONGEST.fetch_max(bytes, Relaxed).max(bytes);
-    let slots = map
-        .remove(&(address, desc))
-        .map(|p| p.slots)
-        .unwrap_or_default();
-    let reused: Vec<(u64, [u32; 14])> = map
-        .range((address.saturating_sub(longest), [0; 14])..(end, [0; 14]))
-        .filter(|&(&(_, words), p)| {
-            p.end > address && words[12] & GPU_WRITTEN == 0 && p.used.saturating_add(2) <= now
-        })
-        .map(|(&key, _)| key)
-        .collect();
+    let reused: Vec<(u64, [u32; 14])> = if place {
+        map.range((address.saturating_sub(longest), [0; 14])..(end, [0; 14]))
+            .filter(|&(&(_, words), p)| {
+                p.end > address && words[12] & GPU_WRITTEN == 0 && p.used.saturating_add(2) <= now
+            })
+            .map(|(&key, _)| key)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut gone = Vec::with_capacity(reused.len());
-    let mut stale = Vec::new();
+    let mut slots = Vec::new();
     for key in reused {
         if let Some(p) = map.remove(&key) {
-            if p.resource != 0 {
-                PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
-                gone.push(p.resource);
-            }
-            stale.extend(p.slots);
+            PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
+            gone.push(p.resource);
+            slots.extend(p.slots);
         }
     }
+    let stale: Vec<_> = slots
+        .iter()
+        .map(|&(heap, slot, record)| (heap, slot, record, address, desc))
+        .collect();
     map.insert(
         (address, desc),
         Placed {
@@ -1762,14 +1817,16 @@ pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64) -> Option<
         },
     );
     PLACED_COUNTS[0].fetch_add(bytes, Relaxed);
-    // Past the budget: the read-only ones asked for longest ago go, down to
-    // nine tenths of it; heap slots that view them keep them meanwhile.
+    // Past the budget: the read-only ones asked for longest ago that no heap
+    // slot holds go, down to nine tenths of it.
     let budget = placed_budget();
     if PLACED_COUNTS[0].load(Relaxed) > budget {
         let mut old: Vec<(u64, (u64, [u32; 14]))> = map
             .iter()
             .filter(|&(&(_, words), p)| {
-                p.resource != 0 && words[12] & GPU_WRITTEN == 0 && p.used.saturating_add(2) <= now
+                p.slots.is_empty()
+                    && words[12] & GPU_WRITTEN == 0
+                    && p.used.saturating_add(2) <= now
             })
             .map(|(&key, p)| (p.used, key))
             .collect();
@@ -1778,11 +1835,9 @@ pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64) -> Option<
             if PLACED_COUNTS[0].load(Relaxed) <= budget / 10 * 9 {
                 break;
             }
-            let Some(p) = map.get_mut(&key) else { continue };
-            PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
-            gone.push(std::mem::take(&mut p.resource));
-            if p.slots.is_empty() {
-                map.remove(&key);
+            if let Some(p) = map.remove(&key) {
+                PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
+                gone.push(p.resource);
             }
         }
     }
@@ -2102,20 +2157,20 @@ mod tests {
         let a = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 0, 0];
         let b = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 87, 1, 0, 0, 0, 0];
         let target = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 1, 0];
-        let first = texture_at_in(at, &a, 10).expect("a host texture");
+        let first = texture_at_in(at, &a, 10, true).expect("a host texture");
         let padded = [3, 7, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 0, 9];
         assert_eq!(
-            texture_at_in(at, &padded, 11),
+            texture_at_in(at, &padded, 11, true),
             Some(first),
             "padding ignored"
         );
-        texture_at_in(at, &target, 11).expect("a render target");
-        texture_at_in(at, &b, 12).expect("another texture in that memory");
+        texture_at_in(at, &target, 11, true).expect("a render target");
+        texture_at_in(at, &b, 12, true).expect("another texture in that memory");
         assert!(held(at, a), "asked for in the frame before");
-        texture_at_in(at + 0x1_0000, &a, 14).expect("a texture after it");
+        texture_at_in(at + 0x1_0000, &a, 14, true).expect("a texture after it");
         assert!(held(at, b), "no overlap");
         let wider = [3, 0, 0, 0, 256, 0, 256, 0x1_0001, 28, 1, 0, 0, 0, 0];
-        texture_at_in(at, &wider, 16).expect("a larger texture over them");
+        texture_at_in(at, &wider, 16, true).expect("a larger texture over them");
         assert!(!held(at, a) && !held(at, b), "memory reused: let go");
         assert!(!held(at + 0x1_0000, a), "overlapped too");
         assert!(held(at, target), "the GPU writes it: kept");
