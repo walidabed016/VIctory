@@ -128,22 +128,47 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
-/// Depth textures and their unordered twins.
-type Twins = std::cell::RefCell<Vec<(This, This)>>;
+/// Depth textures, their unordered twins and the planes they hold.
+type Twins = std::cell::RefCell<Vec<(This, This, u32)>>;
 
 thread_local! {
     /// The depth textures the draw or dispatch being recorded on this
     /// thread writes through their unordered twins, and the twins
     /// ([`crate::resource::unordered_twin`]): copied back after it.
     static TWINS: Twins = const { std::cell::RefCell::new(Vec::new()) };
+    /// Those of them whose twins hold a plane each, to fill after its
+    /// tables ([`twins_in`]).
+    static FILLS: Twins = const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether [`State::bind`] binds again after filling them.
+    static REBINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fills the plane twins the draw or dispatch being bound writes through
+/// from their textures ([`crate::planes`]). Returns whether that recorded
+/// a compute pass, replacing the list's compute root signature, pipeline
+/// and root arguments.
+fn twins_in(list: &HostList) -> bool {
+    const UNORDERED_ACCESS: u32 = 0x8;
+    let mut passes = false;
+    for (depth, twin, plane) in FILLS.take() {
+        passes |= crate::planes::exchange(list, depth, twin, plane, false);
+        crate::list::ensure_state(list, twin, UNORDERED_ACCESS);
+    }
+    passes
 }
 
 /// Copies what the draw or dispatch just recorded wrote into unordered
-/// twins back into their depth textures.
-fn twins_back(list: &HostList) {
+/// twins back into their depth textures. Returns whether that recorded a
+/// compute pass, replacing the list's compute root signature and pipeline.
+fn twins_back(list: &HostList) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    for (depth, twin) in TWINS.take() {
+    let mut passes = false;
+    for (depth, twin, plane) in TWINS.take() {
+        if crate::planes::split(depth) {
+            passes |= crate::planes::exchange(list, depth, twin, plane, true);
+            continue;
+        }
         let (Some(to), Some(from)) = (
             crate::resource::host_resource(depth),
             crate::resource::host_resource(twin),
@@ -155,6 +180,7 @@ fn twins_back(list: &HostList) {
         // SAFETY: an open list; live textures of one description.
         unsafe { list.list.CopyResource(to, from) };
     }
+    passes
 }
 
 pub(crate) fn dispatched() -> u64 {
@@ -494,7 +520,10 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         crate::descriptor::host::BINDING.set(self.pipeline);
-        TWINS.take();
+        if !REBINDING.get() {
+            TWINS.take();
+            FILLS.take();
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -616,7 +645,24 @@ impl State {
                 }
             }
         }
+        if twins_in(list) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            REBINDING.set(true);
+            let bound = self.bind(list, p, compute);
+            REBINDING.set(false);
+            return bound;
+        }
         true
+    }
+
+    /// [`twins_back`], forgetting the bound compute root signature and
+    /// pipeline when it replaced them.
+    fn twins_back(&mut self, list: &HostList) {
+        if twins_back(list) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
     }
 
     /// Runs a dispatch on the host.
@@ -651,7 +697,7 @@ impl State {
         crate::indirect::close(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        twins_back(list);
+        self.twins_back(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -714,7 +760,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
-                    twins_back(list);
+                    self.twins_back(list);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1063,7 +1109,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            twins_back(list);
+            self.twins_back(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1152,7 +1198,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            twins_back(list);
+            self.twins_back(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1308,7 +1354,7 @@ impl State {
                 count_at.unwrap_or(0),
             )
         };
-        twins_back(list);
+        self.twins_back(list);
         if kind == DISPATCH {
             // Its groups may write arguments later executions read.
             crate::indirect::close(list);
@@ -1432,25 +1478,33 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, words), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_depth_unordered(view);
             let mut resource = *resource as This;
             crate::resource::alias::gpu_wrote(list, resource);
             // A depth texture's twin starts as the texture is.
-            if let Some(twin) = crate::resource::unordered_twin(resource)
+            let plane = crate::planes::plane(words.as_ref());
+            if let Some(twin) = crate::resource::unordered_twin(resource, plane)
                 && let (Some(to), Some(from)) = (
                     crate::resource::host_resource(twin),
                     crate::resource::host_resource(resource),
                 )
             {
-                const COPY_DEST: u32 = 0x400;
-                const COPY_SOURCE: u32 = 0x800;
-                crate::list::ensure_state(list, resource, COPY_SOURCE);
-                crate::list::ensure_state(list, twin, COPY_DEST);
-                // SAFETY: an open list; live textures of one description.
-                unsafe { list.list.CopyResource(to, from) };
-                TWINS.with_borrow_mut(|t| t.push((resource, twin)));
+                let twins = (resource, twin, plane);
+                if !TWINS.with_borrow(|t| t.contains(&twins)) {
+                    if crate::planes::split(resource) {
+                        FILLS.with_borrow_mut(|f| f.push(twins));
+                    } else {
+                        const COPY_DEST: u32 = 0x400;
+                        const COPY_SOURCE: u32 = 0x800;
+                        crate::list::ensure_state(list, resource, COPY_SOURCE);
+                        crate::list::ensure_state(list, twin, COPY_DEST);
+                        // SAFETY: an open list; live textures of one description.
+                        unsafe { list.list.CopyResource(to, from) };
+                    }
+                    TWINS.with_borrow_mut(|t| t.push(twins));
+                }
                 resource = twin;
             }
             #[cfg(feature = "diagnostics")]
@@ -1927,7 +1981,7 @@ void main() {
         // A 64x64 16-bit depth texture, also unordered.
         let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 53, 1, 0, 0, 0x6, 0];
         let depth = crate::resource::texture_at(address, &desc).expect("a host texture");
-        let twin = crate::resource::unordered_twin(depth).expect("a twin");
+        let twin = crate::resource::unordered_twin(depth, 0).expect("a twin");
         let flags = |r: This| {
             let t = crate::resource::host_resource(r).unwrap();
             // SAFETY: a live resource.
@@ -1935,7 +1989,7 @@ void main() {
         };
         assert_eq!((flags(depth), flags(twin)), (0x2, 0x4));
         assert_eq!(
-            crate::resource::unordered_twin(depth),
+            crate::resource::unordered_twin(depth, 0),
             Some(twin),
             "made once"
         );
@@ -1999,6 +2053,327 @@ void main() {
         );
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A compute's writes to a depth-stencil texture's planes through
+    /// unordered views reach later depth and stencil tests, and the rest of
+    /// the texture stays as it was: the console's D16_UNORM_S8_UINT (D24S8
+    /// on the host) written as R16_UNORM and R8_UINT, then tested as Grand
+    /// Theft Auto VI's tiled lighting tests it (a material's depth, equal).
+    #[test]
+    fn unordered_writes_to_depth_stencil_planes_reach_later_tests() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        const DEPTH_WRITE: u32 = 0x10;
+        const CS: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
+RWTexture2D<uint> stencil : register(u0);
+RWTexture2D<unorm float> depth : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x < 32) {
+        stencil[id.xy] = 0x25;
+        depth[id.xy] = 5.0 / 65535.0;
+    }
+}
+"#;
+        const DRAW: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0)"
+cbuffer Draw : register(b0) { float z; float color; };
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * float2(2, -2) + float2(-1, 1), z, 1);
+}
+[RootSignature(RS)]
+float4 ps() : SV_Target { return color; }
+"#;
+        let _serial = crate::watch::serial();
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        if !crate::planes::stencil_twins() {
+            return; // VICTORY_NO_STENCIL_TWIN=1
+        }
+        let device = &host.device;
+        let memory = Box::leak(vec![0u8; 0x4_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        // A 64x64 D16_UNORM_S8_UINT texture, also unordered.
+        let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 118, 1, 0, 0, 0x6, 0];
+        let depth = crate::resource::texture_at(address, &desc).expect("a host texture");
+        let texture = crate::resource::host_resource(depth).unwrap();
+        let format = |r: This| {
+            let t = crate::resource::host_resource(r).unwrap();
+            // SAFETY: a live resource.
+            unsafe { t.GetDesc() }.Format.0
+        };
+        let twins =
+            [0, 1].map(|plane| crate::resource::unordered_twin(depth, plane).expect("a twin"));
+        assert_eq!(twins.map(format), [53, 60]);
+        let heap = |kind, flags| -> ID3D12DescriptorHeap {
+            // SAFETY: a plain description.
+            unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: 2,
+                    Flags: flags,
+                    NodeMask: 0,
+                })
+            }
+            .unwrap()
+        };
+        let views = heap(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+        );
+        let dsvs = heap(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+            D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        );
+        let rtvs = heap(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        );
+        // SAFETY: live heaps.
+        let (first, step, dsv, rtv) = unsafe {
+            (
+                views.GetCPUDescriptorHandleForHeapStart(),
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                dsvs.GetCPUDescriptorHandleForHeapStart(),
+                rtvs.GetCPUDescriptorHandleForHeapStart(),
+            )
+        };
+        // The views as the title describes them: the stencil plane as
+        // R8_UINT, the depth plane as R16_UNORM.
+        let unordered = [
+            View::Unordered(depth as usize, 0, Some([62, 4, 0, 1, 0, 0, 0, 0, 0, 0])),
+            View::Unordered(depth as usize, 0, Some([56, 4, 0, 0, 0, 0, 0, 0, 0, 0])),
+        ];
+        for (i, view) in unordered.iter().enumerate() {
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: first.ptr + i * step as usize,
+            };
+            assert!(crate::descriptor::host::made(view, at), "view {i}");
+        }
+        let sample = DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        };
+        // A 64x64 R8_UNORM target for the tests' draws.
+        let mut target: Option<ID3D12Resource> = None;
+        // SAFETY: plain descriptions; the out pointer ours.
+        unsafe {
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 64,
+                    Height: 64,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT(61),
+                    SampleDesc: sample,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                None,
+                &mut target,
+            )
+        }
+        .unwrap();
+        let target = target.unwrap();
+        let dsv_desc = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT(45),
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        // SAFETY: live resources and heap slots.
+        unsafe {
+            device.CreateDepthStencilView(texture, Some(std::ptr::from_ref(&dsv_desc)), dsv);
+            device.CreateRenderTargetView(&target, None, rtv);
+        }
+        let (cs_root, cs) = compute(CS);
+        let blob = |entry, target| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call.
+            unsafe {
+                D3DCompile(
+                    DRAW.as_ptr().cast(),
+                    DRAW.len(),
+                    s!("draw"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            }
+            .unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+        // SAFETY: the blobs' own bytes.
+        let bytes = |b: &ID3DBlob| unsafe {
+            std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+        };
+        let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes(b).as_ptr().cast(),
+            BytecodeLength: bytes(b).len(),
+        };
+        // SAFETY: a shader with its root signature inside.
+        let draw_root: ID3D12RootSignature =
+            unsafe { device.CreateRootSignature(0, bytes(&vs)) }.unwrap();
+        let equal = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_EQUAL,
+        };
+        let mut pipeline = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer; the description never releases it.
+            pRootSignature: unsafe { std::mem::transmute_copy(&draw_root) },
+            VS: code(&vs),
+            PS: code(&ps),
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_EQUAL,
+                StencilEnable: true.into(),
+                StencilReadMask: 0xff,
+                StencilWriteMask: 0,
+                FrontFace: equal,
+                BackFace: equal,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            DSVFormat: DXGI_FORMAT(45),
+            SampleDesc: sample,
+            ..Default::default()
+        };
+        pipeline.RTVFormats[0] = DXGI_FORMAT(61);
+        pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        // SAFETY: a description of live shaders and root signature.
+        let draw: ID3D12PipelineState =
+            unsafe { device.CreateGraphicsPipelineState(&pipeline) }.unwrap();
+        let (read, back) = host.shared_buffer(64 * 256).unwrap();
+        let list = host.new_list().unwrap();
+        let l = &list.list;
+        crate::list::ensure_state(&list, depth, DEPTH_WRITE);
+        let both = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+        // SAFETY: an open list; a live view.
+        unsafe { l.ClearDepthStencilView(dsv, both, 1.0, 0x80, None) };
+        // The dispatch: its tables, its twins filled, its writes, back.
+        for view in &unordered {
+            readable(&list, ResourceType::Uav, view);
+        }
+        assert!(twins_in(&list), "the depth plane's pass");
+        // SAFETY: an open list; the heap, root signature and pipeline live.
+        unsafe {
+            l.SetDescriptorHeaps(&[Some(views.clone())]);
+            l.SetComputeRootSignature(&cs_root);
+            l.SetPipelineState(&cs);
+            l.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+            l.Dispatch(8, 8, 1);
+        }
+        assert!(twins_back(&list), "the depth plane's pass");
+        // Over the whole target: the material the compute wrote (depth 5 of
+        // 65,535, stencil 0x25), then what the clear left (1.0, 0x80).
+        crate::list::ensure_state(&list, depth, DEPTH_WRITE);
+        let material = 5.0 * f32::from_bits(0x3780_0080);
+        let readback = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer; the location never releases it.
+            pResource: unsafe { std::mem::transmute_copy(&read) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT(61),
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let drawn = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&target) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: an open list; live views, root signature and pipeline.
+        unsafe {
+            l.OMSetRenderTargets(
+                1,
+                Some(std::ptr::from_ref(&rtv)),
+                false,
+                Some(std::ptr::from_ref(&dsv)),
+            );
+            l.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            l.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 64.0,
+                Height: 64.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            l.RSSetScissorRects(&[RECT {
+                right: 64,
+                bottom: 64,
+                ..Default::default()
+            }]);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            l.SetGraphicsRootSignature(&draw_root);
+            l.SetPipelineState(&draw);
+            for (z, color, reference) in [(material, 1.0f32, 0x25), (1.0, 0.5, 0x80)] {
+                l.SetGraphicsRoot32BitConstants(0, 2, [z, color].as_ptr().cast(), 0);
+                l.OMSetStencilRef(reference);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+            l.ResourceBarrier(&[crate::host::transition(
+                &target,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyTextureRegion(&readback, 0, 0, 0, &drawn, None);
+            l.Close().unwrap();
+        }
+        host.execute(&[&list]);
+        crate::pipelined::wait_all();
+        // SAFETY: the mapped bytes the list wrote, waited for.
+        let rows = unsafe { std::slice::from_raw_parts(back, 64 * 256) };
+        for row in rows.chunks(256) {
+            assert!(
+                row[..32].iter().all(|&b| b == 255),
+                "the compute's: {:?}",
+                &row[..64]
+            );
+            assert!(
+                row[32..64].iter().all(|&b| b.abs_diff(128) <= 1),
+                "the clear's: {:?}",
+                &row[..64]
+            );
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Render targets the host has no texture or no view for keep their

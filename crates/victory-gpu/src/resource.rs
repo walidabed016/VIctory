@@ -782,10 +782,10 @@ struct Resource {
     /// yet.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
-    /// The resource unordered access views use, if made (0: could not be;
-    /// see [`unordered_twin`]).
+    /// The resources unordered access views use, by plane, if made (0:
+    /// could not be; see [`unordered_twin`]).
     #[cfg(windows)]
-    twin: std::sync::OnceLock<usize>,
+    twin: [std::sync::OnceLock<usize>; 2],
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -924,9 +924,10 @@ fn host_texture(
 /// resource. Its twin has the same description without depth use, over
 /// the same memory, made on first use; draws and dispatches that write
 /// through such a view copy the depth texture into the twin before and
-/// back after ([`crate::draw`]).
+/// back after ([`crate::draw`]). A depth-stencil texture has a twin a
+/// plane, for views of that `plane` ([`crate::planes`]).
 #[cfg(windows)]
-pub(crate) fn unordered_twin(this: This) -> Option<This> {
+pub(crate) fn unordered_twin(this: This, plane: u32) -> Option<This> {
     const DEPTH_UNORDERED: u32 = 0x2 | 0x4;
     if this.is_null() {
         return None;
@@ -936,9 +937,12 @@ pub(crate) fn unordered_twin(this: This) -> Option<This> {
         return None;
     }
     r.host.as_ref()?;
-    let twin = *r.twin.get_or_init(|| {
+    let stencil = crate::planes::stencil_twins();
+    let format = crate::planes::twin_format(r.desc.format, plane, stencil)?;
+    let twin = *r.twin[plane as usize].get_or_init(|| {
         let mut desc = r.desc;
         desc.flags &= !0x2;
+        desc.format = format;
         let mut out = std::ptr::null();
         let backing = Backing::Address(r.data());
         let (null, iid) = (std::ptr::null(), &RESOURCE_IIDS[0]);
@@ -1069,7 +1073,7 @@ fn hand_out_resource(
             })
         }),
         #[cfg(windows)]
-        twin: std::sync::OnceLock::new(),
+        twin: Default::default(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1156,10 +1160,12 @@ impl Drop for Resource {
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         #[cfg(windows)]
-        if let Some(&twin) = self.twin.get()
-            && twin != 0
-        {
-            object::release_boxed::<Resource>(twin as This);
+        for twin in &self.twin {
+            if let Some(&twin) = twin.get()
+                && twin != 0
+            {
+                object::release_boxed::<Resource>(twin as This);
+            }
         }
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(

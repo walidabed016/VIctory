@@ -538,7 +538,8 @@ pub(crate) fn note_depth_unordered(view: &crate::descriptor::View) {
     if d.Flags.0 & ALLOW_DEPTH_STENCIL == 0 {
         return;
     }
-    let twin = crate::resource::unordered_twin(resource).is_some();
+    let plane = crate::planes::plane(words.as_ref());
+    let twin = crate::resource::unordered_twin(resource, plane).is_some();
     let pipeline = crate::descriptor::host::BINDING.get();
     let program = crate::pipeline::host_pipeline(pipeline as crate::object::This)
         .map(|p| crate::host::named(&p.name).to_string())

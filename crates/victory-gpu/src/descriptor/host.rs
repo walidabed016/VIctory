@@ -1130,6 +1130,12 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// Whether [`make`] makes the host descriptor for `view` at `at` (tests).
+#[cfg(test)]
+pub(crate) fn made(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    make(view, at).is_some()
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1196,7 +1202,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let resource = crate::resource::unordered_twin(resource).unwrap_or(resource);
+            let plane = crate::planes::plane(desc.as_ref());
+            let twin = crate::resource::unordered_twin(resource, plane);
+            let resource = twin.unwrap_or(resource);
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
@@ -1205,7 +1213,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            let mut desc = desc.as_ref().map(uav_desc);
+            // A plane's twin has that plane alone.
+            let words = desc.map(|mut w| {
+                if twin.is_some() && plane != 0 {
+                    w[3] = 0;
+                }
+                w
+            });
+            let mut desc = words.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }

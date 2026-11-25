@@ -42,6 +42,8 @@ mod pipelined;
 #[cfg(feature = "diagnostics")]
 mod pipelining;
 #[cfg(windows)]
+mod planes;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
