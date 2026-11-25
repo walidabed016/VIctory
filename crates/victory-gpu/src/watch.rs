@@ -446,9 +446,9 @@ const BLOCK: usize = PAGE;
 /// Title memory by 4 MiB region, up to 1 TiB: the number of the latest
 /// change to what a guarded asking finds there ([`changed`]). A copy that
 /// took a range wholly guarded and clean holds it until one of its regions
-/// changes, which it tells in a few loads ([`last_change`]) instead of
+/// changes, which it tells in a few loads ([`region_change`]) instead of
 /// asking.
-const REGION: usize = 4 << 20;
+pub(crate) const REGION: usize = 4 << 20;
 static CHANGES: [AtomicU64; 1 << 18] = [const { AtomicU64::new(0) }; 1 << 18];
 static CHANGE: AtomicU64 = AtomicU64::new(0);
 
@@ -470,18 +470,12 @@ pub(crate) fn changes() -> u64 {
     CHANGE.load(Ordering::SeqCst)
 }
 
-/// The number of the latest change to title memory `[start, end)`; `None`
-/// past the memory tracked.
-pub(crate) fn last_change(start: usize, end: usize) -> Option<u64> {
-    let (a, b) = (start / REGION, end.div_ceil(REGION));
-    let regions = CHANGES.get(a..b)?;
-    Some(
-        regions
-            .iter()
-            .map(|r| r.load(Ordering::SeqCst))
-            .max()
-            .unwrap_or(0),
-    )
+/// The number of the latest change to title memory region `region`
+/// ([`REGION`] bytes); past the memory tracked, newer than any.
+pub(crate) fn region_change(region: usize) -> u64 {
+    CHANGES
+        .get(region)
+        .map_or(u64::MAX, |r| r.load(Ordering::SeqCst))
 }
 
 struct Guards {
