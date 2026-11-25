@@ -300,6 +300,17 @@ pub fn f64_sums() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_F64_SUMS").is_none())
 }
 
+/// Whether a whole-wave section the console compiler ends in the block two
+/// uniform branches' sections join in (their last lane read and the restore
+/// of EXEC shared) translates, what it writes there made on each way in;
+/// refused otherwise. On unless `VICTORY_NO_SHARED_RESTORES` is set. The
+/// value is part of the translation, so the shader cache must key on it
+/// (`victory-gpu`'s does).
+pub fn shared_restores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_SHARED_RESTORES").is_none())
+}
+
 /// Whether a structured buffer's descriptor the code only reads the record
 /// count of (no access names it) is a raw view of the binding the container
 /// declares there (Belobug 02564c5); refused otherwise. On unless

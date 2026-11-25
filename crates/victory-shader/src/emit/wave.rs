@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::ir::{EXEC, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 
 /// An associative operation and its identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +134,11 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// A section the block leaves for its one successor, which restores
+    /// EXEC: that block and the restore's index there (`end` is then the
+    /// block's own end, or its `s_branch`); the shapes cover what that
+    /// block writes before the restore, coming from this one.
+    pub tail: Option<(usize, usize)>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -169,10 +174,53 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
+            // The console compiler shares a reduction's last steps and the
+            // restore between the sections of a uniform branch's two ways:
+            // the section goes on into the block they join in, as each way
+            // brings it.
+            if super::shared_restores()
+                && let Exit::Jump(d) = p.blocks[block].exit
+                && let Some(n) = p.blocks[d].preds.iter().position(|&q| q == block)
+                && let Some(phi) = p.blocks[d]
+                    .phis
+                    .iter()
+                    .find(|f| f.reg == Reg::S(saved_code(inst)) && f.args[n] == saved)
+                && let Some(restore) = p.blocks[d].insts.iter().position(|j| {
+                    j.write(Reg::S(EXEC)).is_some()
+                        && j.read(Reg::S(saved_code(inst))) == Some(phi.value)
+                })
+            {
+                let end = match insts.last() {
+                    Some(l) if l.name() == "s_branch" => insts.len() - 1,
+                    _ => insts.len(),
+                };
+                let joins: Vec<(Value, Value)> = p.blocks[d]
+                    .phis
+                    .iter()
+                    .map(|f| (f.value, f.args[n]))
+                    .collect();
+                let rest = (&p.blocks[d].insts[..restore], &joins[..]);
+                let shapes = simulate(&insts[(i + 1).min(end)..end], Some(rest), wave, saved);
+                out.insert(
+                    i,
+                    Section {
+                        end,
+                        shapes,
+                        tail: Some((d, restore)),
+                    },
+                );
+            }
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let shapes = simulate(&insts[i + 1..end], None, wave, saved);
+        out.insert(
+            i,
+            Section {
+                end,
+                shapes,
+                tail: None,
+            },
+        );
         i = end + 1;
     }
     out
@@ -303,7 +351,15 @@ fn f16_sum(a: Sym, b: Sym, dst: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// The shapes of what `insts` write, then (`tail`) what the instructions of
+/// the block the section goes on into write, its joins taking what this way
+/// brings them.
+fn simulate(
+    insts: &[Inst],
+    tail: Option<(&[Inst], &[(Value, Value)])>,
+    wave: u32,
+    saved: Value,
+) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -314,7 +370,18 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
-    for inst in insts {
+    let (rest, joins) = tail.unwrap_or_default();
+    for (k, inst) in insts.iter().chain(rest).enumerate() {
+        if k == insts.len() {
+            for &(phi, arg) in joins {
+                let l = vec.get(&arg).cloned();
+                vec.insert(phi, l.unwrap_or_else(|| vec![Sym::Own(arg); wave as usize]));
+                uni.insert(phi, uni.get(&arg).copied().unwrap_or(Sym::Uni(arg)));
+                if masked.contains(&arg) {
+                    masked.push(phi);
+                }
+            }
+        }
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what

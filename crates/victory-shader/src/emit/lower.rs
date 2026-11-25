@@ -314,6 +314,13 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Blocks where sections of their predecessors end: the restore's index.
+    tails: HashMap<usize, usize>,
+    /// What such a section writes in that block and code outside it reads,
+    /// by value and the predecessor it comes from.
+    tail_vals: HashMap<(Value, usize), Val>,
+    /// Their joins: the phi, its block and each predecessor's value.
+    tail_phis: Vec<(V, usize, Vec<(usize, V)>)>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -575,6 +582,9 @@ struct HalfIds {
     /// Pairs: the group-shared counter of its console wave's pair barrier.
     pair: Option<V>,
 }
+
+/// A value written in a whole-wave section the simulation found no shape of.
+const SECTION_STEP: Why = "a whole-wave section step the simulation does not follow";
 
 /// Why a value from the other half has no form: the halves do not meet.
 const APART: Why = "a cross-lane value where the two 32-lane halves do not meet";
@@ -1039,6 +1049,9 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            tails: HashMap::new(),
+            tail_vals: HashMap::new(),
+            tail_phis: Vec::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1256,18 +1269,55 @@ impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
         let p = self.x.p;
-        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
-            for (&start, sec) in &found {
-                for i in start + 1..sec.end {
-                    for &(_, w) in &p.blocks[b].insts[i].writes {
-                        inside.insert(w, (b, start, sec.end));
-                    }
-                }
-            }
             if !found.is_empty() {
                 self.sections.insert(b, found);
+            }
+        }
+        // Sections that end in their block's successor: every way into it
+        // must be one, ending at the same restore, before any section of its
+        // own; else none of them is a section.
+        let mut ends: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+        for (&b, found) in &self.sections {
+            for (&start, sec) in found {
+                if let Some((d, end)) = sec.tail {
+                    ends.entry(d).or_default().push((b, start, end));
+                }
+            }
+        }
+        for (d, from) in ends {
+            let mut preds = p.blocks[d].preds.clone();
+            preds.sort_unstable();
+            let mut ways: Vec<usize> = from.iter().map(|f| f.0).collect();
+            ways.sort_unstable();
+            let end = from[0].2;
+            let own = self
+                .sections
+                .get(&d)
+                .is_some_and(|s| s.keys().any(|&k| k < end));
+            if ways == preds && from.iter().all(|f| f.2 == end) && !own {
+                self.tails.insert(d, end);
+                continue;
+            }
+            for (b, start, _) in from {
+                if let Some(s) = self.sections.get_mut(&b) {
+                    s.remove(&start);
+                }
+            }
+        }
+        let mut inside: HashMap<Value, (usize, std::ops::Range<usize>)> = HashMap::new();
+        for (&b, found) in &self.sections {
+            for (&start, sec) in found {
+                let spans = std::iter::once((b, start + 1..sec.end))
+                    .chain(sec.tail.map(|(d, end)| (d, 0..end)));
+                for (sb, span) in spans {
+                    for i in span.clone() {
+                        for &(_, w) in &p.blocks[sb].insts[i].writes {
+                            inside.insert(w, (sb, span.clone()));
+                        }
+                    }
+                }
             }
         }
         if inside.is_empty() {
@@ -1285,8 +1335,8 @@ impl<'a> Lower<'a> {
                 let runs =
                     lockstep && matches!(inst.fields, Fields::Sop { .. }) && super::f64_sums();
                 for &(_, r) in &inst.reads {
-                    if let Some(&(sb, start, end)) = inside.get(&r)
-                        && (runs || !(sb == b && i > start && i < end))
+                    if let Some((sb, span)) = inside.get(&r)
+                        && (runs || !(*sb == b && span.contains(&i)))
                     {
                         self.section_out.insert(r);
                     }
@@ -1300,7 +1350,7 @@ impl<'a> Lower<'a> {
     /// lockstep, where lane masks are values, scalar instructions (those
     /// that make the section's masks from the saved EXEC) run as anywhere.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
-        const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
+        const UNKNOWN: Why = SECTION_STEP;
         let inst = &self.x.p.blocks[b].insts[i];
         if self.lockstep() && matches!(inst.fields, Fields::Sop { .. }) {
             return self.inst(b, i);
@@ -1321,6 +1371,65 @@ impl<'a> Lower<'a> {
             self.vals.insert(w, val);
         }
         Ok(())
+    }
+
+    /// A section that ends in its block's successor: what it writes there
+    /// that code outside it reads, made here, on the way in.
+    fn section_leaves(&mut self, b: usize, start: usize) {
+        let Some((d, end)) = self.sections[&b][&start].tail else {
+            return;
+        };
+        for inst in &self.x.p.blocks[d].insts[..end] {
+            for &(_, w) in &inst.writes {
+                if !self.section_out.contains(&w) {
+                    continue;
+                }
+                let shape = self.sections[&b][&start].shapes.get(&w).copied();
+                let val = match shape.ok_or(SECTION_STEP).and_then(|sh| self.shape(sh)) {
+                    Ok(x) => Val::I32(x),
+                    Err(why) => Val::Missing(why),
+                };
+                self.tail_vals.insert((w, b), val);
+            }
+        }
+    }
+
+    /// The start of a block where sections of its predecessors end: what
+    /// they write there before the restore joins what each way brings
+    /// ([`Lower::section_leaves`]); the restore's index.
+    fn tail_start(&mut self, b: usize) -> Result<usize, Stop> {
+        let Some(&end) = self.tails.get(&b) else {
+            return Ok(0);
+        };
+        let p = self.x.p;
+        for i in 0..end {
+            let inst = &p.blocks[b].insts[i];
+            if self.lockstep() && matches!(inst.fields, Fields::Sop { .. }) {
+                self.inst(b, i)?;
+                continue;
+            }
+            for &(_, w) in &inst.writes {
+                let mut incoming = Vec::new();
+                let mut why = None;
+                for &q in &p.blocks[b].preds {
+                    match self.tail_vals.get(&(w, q)) {
+                        Some(&Val::I32(x)) => incoming.push((q, x)),
+                        Some(&Val::Missing(m)) => why = Some(m),
+                        _ => why = why.or(Some(SECTION_STEP)),
+                    }
+                }
+                let val = match why {
+                    Some(why) => Val::Missing(why),
+                    None => {
+                        let v = self.s.m.phi(self.cur, self.s.t.i32);
+                        self.tail_phis.push((v, b, incoming));
+                        Val::I32(v)
+                    }
+                };
+                self.vals.insert(w, val);
+            }
+        }
+        Ok(end)
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -1707,7 +1816,7 @@ impl<'a> Lower<'a> {
             }
             self.last_pass_after(b)
                 .map_err(|w| unsupported(p.blocks[b].offset, w))?;
-            let mut i = 0;
+            let mut i = self.tail_start(b)?;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
                 for &(_, w) in &p.blocks[b].insts[i].writes {
@@ -1717,6 +1826,7 @@ impl<'a> Lower<'a> {
                     for j in i + 1..end {
                         self.section_inst(b, j, i)?;
                     }
+                    self.section_leaves(b, i);
                     i = end;
                     continue;
                 }
@@ -11021,6 +11131,16 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
+            self.s.m.set_phi(v, incoming);
+        }
+        for (v, b, incoming) in std::mem::take(&mut self.tail_phis) {
+            let incoming = incoming
+                .into_iter()
+                .filter_map(|(q, x)| {
+                    let qb = self.tail[q]?;
+                    Some((x, self.edges.get(&(q, b)).copied().unwrap_or(qb)))
+                })
+                .collect();
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {

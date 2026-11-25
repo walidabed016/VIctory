@@ -1458,3 +1458,82 @@ fn whole_wave_f64_sums_are_the_console_waves() {
         }
     }
 }
+
+/// A whole-wave float maximum or (`min`) minimum, by a branch on a uniform
+/// scalar, each in a section of a block of its own whose read of lane 0 and
+/// restore of EXEC the two share in the block they join in, as the console
+/// compiler expands them: lanes whose index has bit 0 or 3 set go in
+/// (`v_cmpx`, `s_cbranch_execz`), and there each stores the maximum or
+/// minimum over them of f ^ 42 as a float.
+fn shared_restore(threads: [u32; 3], min: bool) -> Vec<u32> {
+    let mut w = prologue(threads);
+    w.extend([vop2(0x1D, 11, inline(42), 3), vop1(0x006, 11, v(11))]);
+    w.extend(mov_k(5, DEAD));
+    w.extend([
+        vop2(0x16, 9, inline(6), 3),
+        vop2(0x1B, 13, inline(9), 3),
+        SAVE_EXEC,
+        vopc(0xD5, ZERO, 13),
+    ]);
+    let reduce = |op: u8, ident: u32| {
+        let mut r = vec![sop1(0x25, 20, ONES as u8)];
+        r.extend(mov_k(2, ident));
+        r.extend(vop3_3(0x101, 2, v(2), v(11), 20));
+        for sel in [
+            [1, 0, 3, 2, 5, 4, 7, 6],
+            [2, 2, 0, 0, 6, 6, 4, 4],
+            [4, 4, 4, 4, 0, 0, 0, 0],
+        ] {
+            r.extend(dpp8(op, 2, 2, 2, sel));
+        }
+        r.extend(dpp16(op, 2, 2, 2, 0x140));
+        r.extend(vop3_3(0x378, 3, v(2), ZERO, ZERO));
+        r.push(vop2(op, 2, v(3), 2));
+        r.extend(vop3(0x360, 15, v(2), inline(32)));
+        r.push(vop2(op, 2, 15, 2));
+        r
+    };
+    let (mut max, low) = (reduce(0x10, 0xFF80_0000), reduce(0x0F, 0x7F80_0000));
+    // s_branch past the minimum.
+    max.push(sopp(0x02, low.len() as i16));
+    // The console wave's index (0) AND 1: SCC clear, which s_cbranch_scc0
+    // takes to the minimum and s_cbranch_scc1 does not.
+    let mut region = vec![vop1(0x002, 28, v(9)), sop2(0x0E, 29, 28, inline(1) as u8)];
+    region.push(sopp(if min { SCC0 } else { 0x05 }, max.len() as i16));
+    region.extend(max);
+    region.extend(low);
+    region.extend(vop3(0x360, 26, v(2), ZERO));
+    region.extend([sop1(0x04, EXEC_LO, 20), vop1(0x001, 5, 26)]);
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    w.extend(store(5, 4, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn whole_wave_sections_sharing_their_restore_after_a_uniform_branch_are_the_console_waves() {
+    for threads in [[64, 1, 1], [32, 1, 1], [16, 4, 1]] {
+        for min in [false, true] {
+            let total: u32 = threads.iter().product();
+            let (shader, _, _) = build(&shared_restore(threads, min), threads, 0);
+            let inside = |f: u32| f & 9 != 0;
+            let all = (0..total).filter(|&g| inside(g)).map(|g| (g ^ 42) as f32);
+            let want = if min {
+                all.fold(f32::INFINITY, f32::min)
+            } else {
+                all.fold(f32::NEG_INFINITY, f32::max)
+            };
+            for (label, got) in run(&shader, total * SLOTS) {
+                for f in 0..total {
+                    let w = if inside(f) { want.to_bits() } else { DEAD };
+                    assert_eq!(
+                        slots(&got, f, 1),
+                        [w],
+                        "{label} {threads:?} {min}: thread {f}"
+                    );
+                }
+            }
+        }
+    }
+}
