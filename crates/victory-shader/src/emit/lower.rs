@@ -1342,8 +1342,12 @@ impl<'a> Lower<'a> {
         // OR over them is one the console's could give a subset of its
         // lanes (as a waterfall over the distinct values of a lane value
         // takes it), but a sum or prefix counts lanes per wave.
-        if self.mask_data == MaskData::None
-            && (prefix.is_some() || matches!(op, Op::AddU | Op::AddF | Op::Xor))
+        let mesh = self.mask_data == MaskData::None;
+        let ops = super::mesh_wave_ops();
+        if mesh
+            && (ops == super::MeshWaveOps::Off
+                || prefix.is_some()
+                || matches!(op, Op::AddU | Op::AddF | Op::Xor))
         {
             return Err("a wave reduction in a mesh shader");
         }
@@ -1352,6 +1356,9 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
+        if mesh && ops == super::MeshWaveOps::Lane {
+            return Ok(x);
+        }
         self.s.flags |= flags::WAVE_OPS;
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
@@ -4005,7 +4012,9 @@ impl<'a> Lower<'a> {
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
                     )
             }
-            MaskData::None => name == "s_bcnt1_i32_b64",
+            MaskData::None => {
+                name == "s_bcnt1_i32_b64" && super::mesh_wave_ops() != super::MeshWaveOps::Off
+            }
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")

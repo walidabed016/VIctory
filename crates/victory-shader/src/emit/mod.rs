@@ -269,6 +269,37 @@ pub fn unread_fields() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_UNREAD_FIELDS").is_none())
 }
 
+/// How mesh programs take the console's tests of whether a lane mask has a
+/// lane set and its wave minimums, maximums, ANDs and ORs
+/// (`VICTORY_MESH_WAVE_OPS`). The value is part of the translation, so the
+/// shader cache must key on it (`victory-gpu`'s does).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeshWaveOps {
+    /// `0` or `off`: refused, as before they were taken (the tree imposters'
+    /// MS_VS_OctaSLODWindFire and the other `*Fire` mesh programs drop).
+    Off,
+    /// Unset or any other value: over the host's waves.
+    Wave,
+    /// `lane`: a reduction is the lane's own value, so a waterfall over the
+    /// distinct values of a lane value walks each lane's values alone.
+    Lane,
+}
+
+/// `VICTORY_MESH_WAVE_OPS`'s setting.
+pub fn mesh_wave_ops() -> MeshWaveOps {
+    static OPS: std::sync::OnceLock<MeshWaveOps> = std::sync::OnceLock::new();
+    *OPS.get_or_init(|| parse_mesh_wave_ops(std::env::var("VICTORY_MESH_WAVE_OPS").ok().as_deref()))
+}
+
+/// `VICTORY_MESH_WAVE_OPS`'s value read. Pure, for testing.
+fn parse_mesh_wave_ops(value: Option<&str>) -> MeshWaveOps {
+    match value.map(str::trim) {
+        Some("0" | "off") => MeshWaveOps::Off,
+        Some("lane") => MeshWaveOps::Lane,
+        _ => MeshWaveOps::Wave,
+    }
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -662,6 +693,16 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_mesh_wave_ops_switch_parses_or_takes_host_waves() {
+        use super::{MeshWaveOps, parse_mesh_wave_ops};
+        assert_eq!(parse_mesh_wave_ops(None), MeshWaveOps::Wave);
+        assert_eq!(parse_mesh_wave_ops(Some("1")), MeshWaveOps::Wave);
+        assert_eq!(parse_mesh_wave_ops(Some(" 0 ")), MeshWaveOps::Off);
+        assert_eq!(parse_mesh_wave_ops(Some("off")), MeshWaveOps::Off);
+        assert_eq!(parse_mesh_wave_ops(Some("lane")), MeshWaveOps::Lane);
     }
 
     /// A heap index's slot is its offset plus each term's masked user-data
