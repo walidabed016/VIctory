@@ -104,9 +104,11 @@ struct Flight {
     lists: Vec<usize>,
     /// Title fences queues signalled after it: (fence, value).
     signals: Vec<(usize, u64)>,
-    /// Refreshes of title memory `[from, to)` it had left to copy back,
-    /// done once it is copied back ([`defer`]).
-    refreshes: Vec<(usize, usize, Refresh)>,
+    /// Steps of the preparation deferred to it ([`defer`]), in order: those
+    /// of title memory `[from, to)`, and whether they wait for its whole
+    /// completion (snapshots, fills) or only for the range's copy-back
+    /// (refreshes).
+    refreshes: Vec<(usize, usize, bool, Refresh)>,
 }
 
 /// Why the title waited.
@@ -164,10 +166,10 @@ struct State {
     done: u64,
     launched: u64,
     deferred: u64,
-    /// Refreshes deferred to copy-backs ([`defer`]).
-    refreshed: u64,
-    /// The newest submission refreshes were deferred to since the GPU was
-    /// last told to wait ([`gpu_wait`]).
+    /// Steps deferred to submissions in flight ([`defer`]), by [`Writer`].
+    refreshed: [u64; 5],
+    /// The newest submission steps were deferred to since the GPU was last
+    /// told to wait ([`gpu_wait`]).
     gpu_wait: Option<u64>,
     /// Per [`Why::index`]: waits and time waited.
     waits: [(u64, Duration); 10],
@@ -206,7 +208,7 @@ impl Pipeline {
                 done: 0,
                 launched: 0,
                 deferred: 0,
-                refreshed: 0,
+                refreshed: [0; 5],
                 gpu_wait: None,
                 waits: [(0, Duration::ZERO); 10],
             }),
@@ -378,25 +380,31 @@ impl Pipeline {
         (w.0, w.1) = (w.0 + 1, w.1 + started.elapsed());
     }
 
-    /// Defers `refresh` of `[from, to)` to the newest submission in
-    /// flight that has some of it left to copy back; whether there was one.
-    fn defer(&self, from: usize, to: usize, refresh: Refresh) -> bool {
+    /// Defers step `by` of `[from, to)` to the newest submission in flight
+    /// whose shaders write some of it: a refresh only while its copy-back
+    /// has some left, other steps until it completes. Whether there was one.
+    fn defer(&self, from: usize, to: usize, by: Writer, refresh: Refresh) -> bool {
         let mut guard = self.lock();
         let s = &mut *guard;
-        let left = |f: &&mut Flight| overlaps(f.left.as_ref().unwrap_or(&f.writes), from, to);
-        let Some(f) = s.flying.iter_mut().rev().find(left) else {
+        let whole = !matches!(by, Writer::Refresh);
+        let writes = |f: &&mut Flight| match whole {
+            true => overlaps(&f.writes, from, to),
+            false => overlaps(f.left.as_ref().unwrap_or(&f.writes), from, to),
+        };
+        let Some(f) = s.flying.iter_mut().rev().find(writes) else {
             return false;
         };
-        f.refreshes.push((from, to, refresh));
+        f.refreshes.push((from, to, whole, refresh));
         s.gpu_wait = s.gpu_wait.max(Some(f.seq));
-        s.refreshed += 1;
+        s.refreshed[by as usize] += 1;
         true
     }
 
-    /// Runs the refreshes deferred to the oldest submission in flight that
-    /// its copy-back has no more left to write (`all`: every one).
-    fn run_refreshes(&self, all: bool) {
-        let ready: Vec<(usize, usize, Refresh)> = {
+    /// Runs, in order, the steps deferred to the oldest submission in
+    /// flight that its copy-back has no more left to write, up to the first
+    /// that waits for more (the rest run as it retires).
+    fn run_refreshes(&self) {
+        let ready: Vec<(usize, usize, bool, Refresh)> = {
             let mut s = self.lock();
             let Some(Flight {
                 writes,
@@ -408,13 +416,13 @@ impl Pipeline {
                 return;
             };
             let left = left.as_ref().unwrap_or(writes);
-            let (ready, kept) = std::mem::take(refreshes)
-                .into_iter()
-                .partition(|&(from, to, _)| all || !overlaps(left, from, to));
-            *refreshes = kept;
-            ready
+            let ready = refreshes
+                .iter()
+                .take_while(|&&(from, to, whole, _)| !whole && !overlaps(left, from, to))
+                .count();
+            refreshes.drain(..ready).collect()
         };
-        for (_, _, refresh) in ready {
+        for (.., refresh) in ready {
             refresh();
         }
     }
@@ -429,7 +437,7 @@ impl Pipeline {
         f.left = Some(merged(left));
         drop(s);
         self.completed.notify_all();
-        self.run_refreshes(false);
+        self.run_refreshes();
     }
 
     /// Before preparing a submission of `lists`: none of them in flight
@@ -494,7 +502,6 @@ impl Pipeline {
                 let mut last = Instant::now();
                 for job in jobs {
                     job(last);
-                    self.run_refreshes(true);
                     self.retire();
                     last = Instant::now();
                 }
@@ -505,11 +512,21 @@ impl Pipeline {
         send
     }
 
-    /// The oldest submission completed: its fence signals, then whoever
-    /// waits for it. Signalled under the lock, so that a signal made at
+    /// The oldest submission completed: the steps deferred to it run, then
+    /// its fence signals, then whoever waits for it. Signalled under the lock, so that a signal made at
     /// once (nothing in flight) never comes before a deferred one.
     fn retire(&self) {
         let mut s = self.lock();
+        while let Some(f) = s.flying.front_mut()
+            && !f.refreshes.is_empty()
+        {
+            let refreshes = std::mem::take(&mut f.refreshes);
+            drop(s);
+            for (.., refresh) in refreshes {
+                refresh();
+            }
+            s = self.lock();
+        }
         let Some(f) = s.flying.pop_front() else {
             return;
         };
@@ -677,13 +694,61 @@ pub(crate) fn deferred_refreshes() -> bool {
     })
 }
 
-/// A refresh of title memory `[from, to)` ([`deferred_refreshes`]): when a
-/// submission in flight has some of it left to copy back, `refresh` runs on
-/// the completion thread once that is copied back, and the submission being
-/// prepared waits on the GPU for that submission ([`gpu_wait`]). Whether it
-/// was deferred; if not, nothing in flight has the range left to write.
-pub(crate) fn defer(from: usize, to: usize, refresh: impl FnOnce() + Send + 'static) -> bool {
-    on() && deferred_refreshes() && PIPELINE.defer(from, to, Box::new(refresh))
+/// Whether a snapshot of a host copy that a submission in flight writes
+/// waits for none of it: the completion thread takes it once that
+/// submission completed (after its copy-back, and after its disarming), and
+/// the next submission waits on the GPU for it ([`defer`]). In run 107 the
+/// submit thread waited 34.5 ms a frame for snapshots, 24.7 of them on
+/// their writer's copy-back. `VICTORY_NO_DEFERRED_SNAPSHOT` turns it off.
+pub(crate) fn deferred_snapshots() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DEFERRED_SNAPSHOT").is_none();
+        if !on {
+            tracing::info!(
+                "snapshots wait on the CPU for copy-backs (VICTORY_NO_DEFERRED_SNAPSHOT)"
+            );
+        }
+        on
+    })
+}
+
+/// As [`deferred_snapshots`], for fills of upload memory from title memory
+/// (7.2 ms a frame of waits in run 107). `VICTORY_NO_DEFERRED_FILL` turns
+/// it off.
+pub(crate) fn deferred_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DEFERRED_FILL").is_none();
+        if !on {
+            tracing::info!("fills wait on the CPU for copy-backs (VICTORY_NO_DEFERRED_FILL)");
+        }
+        on
+    })
+}
+
+/// Step `by` of the preparation, of title memory `[from, to)`: when a
+/// submission in flight writes it, `step` runs on the completion thread,
+/// in order with the other steps deferred to that submission, once its
+/// copy-back has written the range (a refresh, [`deferred_refreshes`]) or
+/// once it completed (a snapshot or a fill, [`deferred_snapshots`],
+/// [`deferred_fills`]), and the submission being prepared waits on the GPU
+/// for it ([`gpu_wait`]). Whether it was deferred; if not, nothing in
+/// flight writes the range (a refresh: has it left to copy back), or the
+/// step is not deferred.
+pub(crate) fn defer(
+    from: usize,
+    to: usize,
+    by: Writer,
+    step: impl FnOnce() + Send + 'static,
+) -> bool {
+    let deferred = match by {
+        Writer::Refresh => deferred_refreshes(),
+        Writer::Snapshot => deferred_snapshots(),
+        Writer::Fill => deferred_fills(),
+        Writer::TitleCopy | Writer::Texture => false,
+    };
+    on() && deferred && PIPELINE.defer(from, to, by, Box::new(step))
 }
 
 /// The newest submission whose copy-back refreshes were deferred to
@@ -825,7 +890,7 @@ pub(crate) fn log(frames: f64) {
     let (launched, deferred, refreshed, waits) = {
         let mut s = PIPELINE.lock();
         let counts = (s.launched, s.deferred, s.refreshed, s.waits);
-        (s.launched, s.deferred, s.refreshed, s.waits) = (0, 0, 0, [(0, Duration::ZERO); 10]);
+        (s.launched, s.deferred, s.refreshed, s.waits) = (0, 0, [0; 5], [(0, Duration::ZERO); 10]);
         counts
     };
     let f = frames.max(1.0);
@@ -843,15 +908,17 @@ pub(crate) fn log(frames: f64) {
         .iter()
         .fold((0.0, 0.0), |a, w| (a.0 + w.0, a.1 + w.1));
     tracing::info!(
-        "pipelined submissions per frame: {:.1}, {:.1} fence signals deferred, {:.1} refreshes \
-         deferred to copy-backs; title threads \
+        "pipelined submissions per frame: {:.1}, {:.1} fence signals deferred, {:.1} refreshes, \
+         {:.1} snapshots and {:.1} fills deferred to submissions in flight; title threads \
          waited (times, ms) for room {:.1} {:.1}, for their lists {:.1} {:.1}, for memory \
          shaders write {:.1} {:.1} (refreshes {:.1} {:.1}, snapshots {:.1} {:.1}, fills {:.1} \
          {:.1}, title copies {:.1} {:.1}, textures {:.1} {:.1}), for memory read {:.1} {:.1}, \
          for all {:.1} {:.1}, for fences {:.1} {:.1}",
         launched as f64 / f,
         deferred as f64 / f,
-        refreshed as f64 / f,
+        refreshed[Writer::Refresh as usize] as f64 / f,
+        refreshed[Writer::Snapshot as usize] as f64 / f,
+        refreshed[Writer::Fill as usize] as f64 / f,
         w[Why::Depth.index()].0,
         w[Why::Depth.index()].1,
         w[Why::List.index()].0,
@@ -1102,9 +1169,20 @@ mod tests {
         );
         let seq = p.lock().flying[0].seq;
         let (first, second) = (ran.clone(), ran);
-        assert!(p.defer(150, 160, Box::new(move || first.send("first").unwrap())));
-        assert!(p.defer(300, 350, Box::new(move || second.send("second").unwrap())));
-        assert!(!p.defer(500, 600, Box::new(|| {})));
+        let refresh = Writer::Refresh;
+        assert!(p.defer(
+            150,
+            160,
+            refresh,
+            Box::new(move || first.send("first").unwrap())
+        ));
+        assert!(p.defer(
+            300,
+            350,
+            refresh,
+            Box::new(move || second.send("second").unwrap())
+        ));
+        assert!(!p.defer(500, 600, refresh, Box::new(|| {})));
         assert_eq!(p.lock().gpu_wait.take(), Some(seq));
         let quiet = Duration::from_millis(50);
         assert!(
@@ -1117,9 +1195,54 @@ mod tests {
             runs.recv_timeout(quiet).is_err(),
             "ran before its copy-back"
         );
-        assert!(!p.defer(150, 160, Box::new(|| {})));
+        assert!(!p.defer(150, 160, refresh, Box::new(|| {})));
         go.send(()).unwrap();
         assert_eq!(runs.recv_timeout(Duration::from_secs(10)), Ok("second"));
+    }
+
+    /// A snapshot of memory a submission in flight writes runs once that
+    /// submission completes, also when its copy-back is done with the
+    /// range, and the refreshes deferred after it run after it.
+    #[test]
+    fn a_deferred_snapshot_runs_once_its_writer_completes() {
+        let p = pipeline();
+        let (part, parted) = mpsc::channel::<()>();
+        let (go, gate) = mpsc::channel::<()>();
+        let (ran, runs) = mpsc::channel::<&'static str>();
+        p.launch(
+            vec![(100, 200), (300, 400)],
+            Vec::new(),
+            vec![9],
+            Box::new(move |_| {
+                let _ = parted.recv();
+                p.copied_back_but(vec![(300, 400)]);
+                let _ = gate.recv();
+            }),
+        );
+        let (snapshot, refresh) = (ran.clone(), ran);
+        assert!(p.defer(
+            150,
+            160,
+            Writer::Snapshot,
+            Box::new(move || snapshot.send("snapshot").unwrap())
+        ));
+        assert!(p.defer(
+            170,
+            180,
+            Writer::Refresh,
+            Box::new(move || refresh.send("refresh").unwrap())
+        ));
+        part.send(()).unwrap();
+        assert!(
+            runs.recv_timeout(Duration::from_millis(50)).is_err(),
+            "ran before its writer completed"
+        );
+        assert!(!p.defer(150, 160, Writer::Refresh, Box::new(|| {})));
+        assert!(p.defer(150, 160, Writer::Fill, Box::new(|| {})));
+        go.send(()).unwrap();
+        let ten = Duration::from_secs(10);
+        assert_eq!(runs.recv_timeout(ten), Ok("snapshot"));
+        assert_eq!(runs.recv_timeout(ten), Ok("refresh"));
     }
 
     #[test]

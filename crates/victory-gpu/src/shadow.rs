@@ -822,7 +822,7 @@ impl Shadow {
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote
     /// ([`Shadow::snapshot`]), unless the compare tells it by word.
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    pub(crate) fn writing(self: &Arc<Self>, address: usize, len: usize) {
         if self.in_place {
             return;
         }
@@ -833,6 +833,21 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         if !self.told_by_words() {
+            self.snapshot_after(address, len, slot);
+        }
+    }
+
+    /// [`Shadow::snapshot`] once no submission in flight writes the range:
+    /// pipelined, deferred to the completion of the newest that does
+    /// (`crate::pipelined::deferred_snapshots`), or after waiting for it.
+    fn snapshot_after(self: &Arc<Self>, address: usize, len: usize, slot: usize) {
+        use crate::pipelined::Writer;
+        let s = self.clone();
+        let (from, to) = (address, address + len);
+        if !crate::pipelined::defer(from, to, Writer::Snapshot, move || {
+            s.snapshot(address, len, slot)
+        }) {
+            crate::pipelined::wait_writes(from, to, Writer::Snapshot);
             self.snapshot(address, len, slot);
         }
     }
@@ -1636,7 +1651,8 @@ impl Shadow {
                 self.pieces(from - start, to - start, true);
             }
             let copy = self.clone();
-            if crate::pipelined::defer(from, to, move || copy.take(from, to, slot)) {
+            let refresh = crate::pipelined::Writer::Refresh;
+            if crate::pipelined::defer(from, to, refresh, move || copy.take(from, to, slot)) {
                 return to - from;
             }
         } else {
@@ -3087,10 +3103,7 @@ pub(crate) fn snapshot_untold(back: &[Declared], compares: Option<&[Compare]>) {
             .map(|c| (c.title, c.title + c.bytes as usize))
             .collect();
         told.sort_unstable();
-        let untold = |from: usize, to: usize| {
-            crate::pipelined::wait_writes(from, to, crate::pipelined::Writer::Snapshot);
-            s.snapshot(from, to - from, slot);
-        };
+        let untold = |from: usize, to: usize| s.snapshot_after(from, to - from, slot);
         for &(address, len) in declared {
             let (mut at, end) = (address, address + len);
             for &(a, b) in &told {

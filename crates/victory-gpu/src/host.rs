@@ -833,8 +833,9 @@ impl Step {
     /// flight whose memory it touches: what their shaders write (copied
     /// back when they complete), and for a title copy, which the GPU would
     /// do after them, also what they read. Refreshes wait for the pages
-    /// they copy ([`crate::shadow::Shadow::update`]); host work writes the
-    /// list's own memory.
+    /// they copy ([`crate::shadow::Shadow::update`]), snapshots and fills
+    /// when they are taken, unless deferred (`crate::pipelined::defer`);
+    /// host work writes the list's own memory.
     fn wait_in_flight(&self) {
         use crate::pipelined::Writer;
         if !crate::pipelined::on() {
@@ -845,20 +846,13 @@ impl Step {
                 crate::pipelined::wait_writes(src, src + len, Writer::TitleCopy);
                 crate::pipelined::wait_reads(dst, dst + len);
             }
-            &Step::Fill(_, src, len) => crate::pipelined::wait_writes(src, src + len, Writer::Fill),
+
             Step::Run(_) => crate::pipelined::wait_all(),
-            &Step::GpuWrite(ref shadow, address, len) => {
-                // Its snapshot is taken now, on the CPU, unless the compare
-                // tells copy-back what shaders changed by word.
-                if !shadow.told_by_words() {
-                    crate::pipelined::wait_writes(address, address + len, Writer::Snapshot);
-                }
-            }
             Step::Texture(staging) => {
                 let (from, to) = staging.memory();
                 crate::pipelined::wait_writes(from, to, Writer::Texture);
             }
-            Step::Refresh(..) | Step::Host(_) => {}
+            Step::Fill(..) | Step::GpuWrite(..) | Step::Refresh(..) | Step::Host(_) => {}
         }
     }
 }
@@ -2502,7 +2496,12 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         crate::pipelining::touch(crate::pipelining::Touch::Fill, src, len);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    let fill = move || copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    let filling = crate::pipelined::Writer::Fill;
+                    if !crate::pipelined::defer(src, src + len, filling, fill) {
+                        crate::pipelined::wait_writes(src, src + len, filling);
+                        fill();
+                    }
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
