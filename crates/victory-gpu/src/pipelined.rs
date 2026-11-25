@@ -21,7 +21,7 @@ use crate::object::This;
 /// (snapshots, armed blocks, pending ranges, the twin compares' buffers)
 /// and leave copy-back's writes out of the title's. Until then, copying a
 /// submission back while the next is prepared would undo title writes.
-const READY: bool = false;
+const READY: bool = true;
 
 /// Submissions queued and not yet completed, at most: one copying back,
 /// one on the GPU, one queued behind it.
