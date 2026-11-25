@@ -120,7 +120,8 @@
 //!   access's first and last byte: what the host copies back) and for each
 //!   page with no copy an access reached, or for an address whose 256 MiB
 //!   region has no block, bit `level-1 index` (block 0's bits). Reads there
-//!   give 0, writes are dropped. In such a program (and one with root
+//!   give 0, writes are dropped. A lane its loop limit or budget stops sets
+//!   bit [`LOOP_HIT_BIT`]. In such a program (and one with root
 //!   parameters past its user SGPRs) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
@@ -208,6 +209,12 @@ pub use shader::{
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+
+/// The bit of the title-memory page bitmap a lane its loop limit or budget
+/// stops sets, in a program that marks the bitmap: block 0's bit for the
+/// top 256 MiB of the 40-bit space, which holds no title memory.
+// shortcut: a miss there would count as a stopped lane.
+pub const LOOP_HIT_BIT: u32 = 4095;
 
 /// Passes a lane takes in all over the loops of a program with a loop that
 /// can wait on memory, with [`loop_budget`] (and no more than
@@ -346,6 +353,27 @@ pub fn loop_budget_passes() -> u32 {
 pub fn subdword_stores() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SUBDWORD_STORES").is_some())
+}
+
+/// User data a translated program reads that the host gives rather than
+/// the title ([`UserData::root`] `RootType::Other` of it, past the
+/// console's user data): the x thread count of a dispatch given in
+/// threads, 0 for one given in groups ([`partial_groups`]). DexNom's
+/// number (bc3cd4b).
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+
+/// Whether the last group of a dispatch given in threads runs only the
+/// lanes its count holds, as on the console, in programs whose console wave
+/// runs in lockstep (EXEC a value, one console wave per group): EXEC on
+/// entry leaves out the lanes past [`USER_DISPATCH_THREADS_X`].
+/// XboxBvhBuilder's Box16Rehydration and Box32Rehydration write one header
+/// per lane EXEC holds (DexNom bc3cd4b masks them so); their last group
+/// ran all 64 lanes. Off unless `VICTORY_PARTIAL_GROUPS` is set. Part of
+/// the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn partial_groups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_GROUPS").is_some())
 }
 
 /// Whether a vector memory access whose address's two dwords are joined

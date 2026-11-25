@@ -348,8 +348,17 @@ struct Lower<'a> {
     budget: Option<(V, u32)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// With [`Lower::budget`]: whether a loop's limit or the budget kept
+    /// the lane from a pass it would take (a variable of its own, made at
+    /// the first loop exit that can), and the block the program ends in
+    /// once a lane gets there after that, which marks it in the page bitmap
+    /// ([`super::LOOP_HIT_BIT`]).
+    stopped: Option<(V, Option<usize>)>,
     /// Wave64 on 32-lane halves ([`super::halves`]).
     halves: Option<Halves>,
+    /// Lockstep: EXEC on entry leaves out lanes past the dispatch's thread
+    /// count ([`Lower::dispatch_lanes`]), so it is not every lane.
+    partial_exec: bool,
     /// Halves: why a mask read as data has no ballot where it is written.
     ballot_fail: HashMap<Value, Why>,
     /// Loops on one block whose scalars code after them reads as the last
@@ -1079,6 +1088,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            partial_exec: false,
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -1131,6 +1141,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             budget: None,
             abort: None,
+            stopped: None,
             halves,
             ballot_fail: HashMap::new(),
             last_pass_loops: HashSet::new(),
@@ -1960,6 +1971,42 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // Lanes a loop's limit or the budget stopped mark the page bitmap
+        // (`LOOP_HIT_BIT`, operation 2 is OR): those that leave through the
+        // abort block, and those that kept a pass from a loop, as the
+        // program ends.
+        let bitmap = self.s.memory_dirty;
+        let mark = |l: &mut Self, at: usize, bitmap: V| {
+            let (op, word) = (l.s.m.i32(2), l.s.m.i32(super::LOOP_HIT_BIT / 32 * 4));
+            let bit = l.s.m.i32(1 << (super::LOOP_HIT_BIT % 32));
+            let iu = l.s.m.undef(l.s.t.i32);
+            l.s.op(
+                at,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                l.s.t.i32,
+                78,
+                &[bitmap, op, word, iu, iu, bit],
+            );
+        };
+        if let (Some(abort), Some(bitmap)) = (self.abort, bitmap) {
+            mark(&mut self, abort, bitmap);
+        }
+        if let Some((flag, Some(end))) = self.stopped {
+            match bitmap {
+                Some(bitmap) => {
+                    let (marks, done) = (self.s.m.new_block(), self.s.m.new_block());
+                    let was = self.s.m.load(end, flag);
+                    let zero = self.s.m.i32(0);
+                    let hit = self.s.m.cmp(end, pred::NE, was, zero);
+                    self.s.m.terminate(end, Term::CondBr(hit, marks, done));
+                    mark(&mut self, marks, bitmap);
+                    self.s.m.terminate(marks, Term::Br(done));
+                    self.s.m.terminate(done, Term::Ret);
+                }
+                None => self.s.m.terminate(end, Term::Ret),
+            }
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2029,7 +2076,8 @@ impl<'a> Lower<'a> {
                     } else {
                         threads.saturating_sub(32).min(32)
                     };
-                    Val::I32(self.s.m.i32(((1u64 << lanes) - 1) as u32))
+                    let all = self.s.m.i32(((1u64 << lanes) - 1) as u32);
+                    Val::I32(self.dispatch_lanes(all, if n == EXEC { 0 } else { 32 }))
                 }
                 // Most programs only interpolate with them: loaded on first
                 // use as a value (`get`).
@@ -2374,6 +2422,76 @@ impl<'a> Lower<'a> {
                 dword,
             },
         );
+        self.user_word_at(index)
+    }
+
+    /// A user-data dword the host gives (`kind`, a `RootType::Other`),
+    /// after the console's user data, read in the entry block.
+    fn host_word(&mut self, kind: u32) -> V {
+        let index = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|rp| u32::from(rp.user_data) + rp.sgprs)
+            .max()
+            .unwrap_or(0);
+        self.user_reads.insert(
+            index,
+            UserData {
+                index,
+                slot: 0,
+                root: RootType::Other(kind),
+                dword: 0,
+            },
+        );
+        self.user_word_at(index)
+    }
+
+    /// Lockstep with [`super::partial_groups`]: of `all` (EXEC on entry for
+    /// lanes `from` on), the lanes whose console thread is inside the
+    /// dispatch's x thread count (all when the host gives 0: a dispatch in
+    /// groups); `all` itself in groups of several console waves, or of
+    /// more than one dimension.
+    fn dispatch_lanes(&mut self, all: V, from: u32) -> V {
+        let threads = self.s.threads.expect("compute");
+        let several = self
+            .halves
+            .as_ref()
+            .is_some_and(|h| h.serial.is_some() || h.pairs);
+        if !super::partial_groups() || several || threads[0] > 64 || threads[1] * threads[2] != 1 {
+            return all;
+        }
+        self.partial_exec = true;
+        let limit = self.host_word(super::USER_DISPATCH_THREADS_X);
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        let (zero, one, k32, ones) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(32),
+            self.s.m.i32(u32::MAX),
+        );
+        let (width, from) = (self.s.m.i32(threads[0]), self.s.m.i32(from));
+        let first = self.s.m.bin(e, Bin::Mul, group, width);
+        let left = self.s.m.bin(e, Bin::Sub, limit, first);
+        let left = self.s.m.bin(e, Bin::Sub, left, from);
+        let none = self.s.m.cmp(e, pred::SLE, left, zero);
+        let whole = self.s.m.cmp(e, pred::SGE, left, k32);
+        let low = self.s.m.bin(e, Bin::Shl, one, left);
+        let low = self.s.m.bin(e, Bin::Sub, low, one);
+        let mask = self.s.m.select(e, whole, ones, low);
+        let mask = self.s.m.select(e, none, zero, mask);
+        let groups = self.s.m.cmp(e, pred::EQ, limit, zero);
+        let mask = self.s.m.select(e, groups, ones, mask);
+        self.s.m.bin(e, Bin::And, mask, all)
+    }
+
+    /// User-data dword `index` as the host passes it, read in the entry
+    /// block.
+    fn user_word_at(&mut self, index: u32) -> V {
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -3218,7 +3336,7 @@ impl<'a> Lower<'a> {
             return Ok(None);
         };
         let input = |v: Value| self.x.p.inputs.iter().any(|i| i.1 == v);
-        if input(lo) && input(hi) {
+        if input(lo) && input(hi) && !self.partial_exec {
             return Ok(None);
         }
         self.pair_bit(lo, hi).map(Some)
@@ -3231,7 +3349,7 @@ impl<'a> Lower<'a> {
             return Ok(None);
         };
         let input = |v: Value| self.x.p.inputs.iter().any(|i| i.1 == v);
-        if input(lo) && input(hi) {
+        if input(lo) && input(hi) && !self.partial_exec {
             return Ok(None);
         }
         Ok(Some((self.i32_of(lo)?, self.i32_of(hi)?)))
@@ -11348,9 +11466,11 @@ impl<'a> Lower<'a> {
                 // AMD driver.)
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
+                    self.note_stopped(ok, cond);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
+                    self.note_stopped(cond, stop);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -11378,7 +11498,15 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                self.next_turn().map_or(Term::Ret, Term::Br)
+                match (self.next_turn(), self.stopped) {
+                    (Some(next), _) => Term::Br(next),
+                    (None, Some((flag, end))) => {
+                        let end = end.unwrap_or_else(|| self.s.m.new_block());
+                        self.stopped = Some((flag, Some(end)));
+                        Term::Br(end)
+                    }
+                    (None, None) => Term::Ret,
+                }
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -11469,6 +11597,30 @@ impl<'a> Lower<'a> {
         let all = self.s.m.cmp(c, p, n, most);
         let join = if p == pred::IULT { Bin::And } else { Bin::Or };
         self.s.m.bin(c, join, own, all)
+    }
+
+    /// With [`Lower::stopped`]: notes a pass a loop's limit or the budget
+    /// keeps the lane from: where `go` (the lane would go back) holds and
+    /// `kept` does not (both compares; no `xor` of them, see [`Lower::exit`]).
+    fn note_stopped(&mut self, kept: V, go: V) {
+        if self.budget.is_none() {
+            return;
+        }
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let flag = match self.stopped {
+            Some((flag, _)) => flag,
+            None => {
+                let flag = self.s.m.private_global("stopped", zero);
+                self.stopped = Some((flag, None));
+                flag
+            }
+        };
+        let c = self.cur;
+        let wanted = self.s.m.select(c, go, one, zero);
+        let hit = self.s.m.select(c, kept, zero, wanted);
+        let was = self.s.m.load(c, flag);
+        let now = self.s.m.bin(c, Bin::Or, was, hit);
+        self.s.m.store(c, flag, now);
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through (in turn,

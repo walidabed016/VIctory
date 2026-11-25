@@ -83,6 +83,9 @@ pub(crate) struct State {
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
+    /// The x thread count of the dispatch being bound, if given in threads
+    /// (`victory_shader::emit::USER_DISPATCH_THREADS_X`); else 0.
+    threads_x: u32,
 }
 
 impl Drop for State {
@@ -411,6 +414,9 @@ impl State {
     /// it: a table's byte offset in its heap, a constant's value, a root
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
+        if root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X) {
+            return self.threads_x;
+        }
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
             (Some(Root::View(address)), RootType::Descriptor) => (address >> (32 * dword)) as u32,
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
@@ -875,8 +881,10 @@ impl State {
     /// thread counts, not group counts (DexNom bc3cd4b); run as many groups
     /// as hold them. Taken as groups, they ran its refit up to 64 times over,
     /// lanes past its data climbing on atomics (runs 127, 128).
-    // shortcut: the last group's lanes past the count run (DexNom masks them
-    // in two box-rehydration kernels).
+    // With `VICTORY_PARTIAL_GROUPS` the translation leaves the last group's
+    // lanes past the count out of EXEC where the console wave runs in
+    // lockstep (DexNom masks Box16/Box32Rehydration's so).
+    // shortcut: in other programs those lanes run.
     pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         let size = (flags & 0x20 != 0 && crate::pipeline::is_builder(self.pipeline as This))
             .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
@@ -887,7 +895,9 @@ impl State {
             return self.dispatch(list, x, y, z);
         };
         once!(flags = format_args!("{flags:#x}"), "BVH builder dispatches given in threads run as groups of them (logged once)");
+        self.threads_x = x;
         self.dispatch(list, x.div_ceil(size[0]), y.div_ceil(size[1]), z.div_ceil(size[2]));
+        self.threads_x = 0;
     }
 
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
@@ -895,6 +905,10 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
+        if crate::pipeline::builder_off(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if crate::pipeline::hangs(self.pipeline as This) {
@@ -1614,6 +1628,7 @@ impl State {
             }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+                _ if crate::pipeline::builder_off(self.pipeline as This) => false,
                 Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },

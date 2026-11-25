@@ -70,6 +70,137 @@ fn loose_back() -> bool {
     })
 }
 
+/// Whether the page tables of all lists using a view heap share one run of
+/// its dynamic slots with views of the host copies
+/// (`VICTORY_SHARED_COPY_VIEWS=1`, DexNom b8ff22e's raw page views), instead
+/// of each table taking two slots per copy until its list is reset: with
+/// some 3,800 copies, run 150's tables took 7,612 slots each and the heap
+/// ran out, dropping the BVH builder's dispatches ("its bindings did not
+/// bind").
+fn shared_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_SHARED_COPY_VIEWS").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "page tables share one run of copy views per view heap (VICTORY_SHARED_COPY_VIEWS)"
+            );
+        }
+        on
+    })
+}
+
+/// Whether page tables' bitmaps of written pages are in VRAM the CPU maps
+/// (the GPU upload heap, `VICTORY_VRAM_BITMAP=1`) rather than in system
+/// memory, where each shader store's atomic mark costs a PCIe round trip
+/// (as the argument clamp's budget word did, VICT-9). The CPU reads each
+/// bitmap once after its submission.
+fn vram_bitmap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_VRAM_BITMAP").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "page tables' bitmaps of written pages are in VRAM (VICTORY_VRAM_BITMAP)"
+            );
+        }
+        on
+    })
+}
+
+/// A view heap's views of host copies for page tables
+/// (`VICTORY_SHARED_COPY_VIEWS`): a run of its dynamic slots, the null pair
+/// then a pair per piece of a copy (`build`). A piece keeps its pair while
+/// the run lasts, and a new piece takes the next free one, which no table
+/// names yet. A new run, twice the pieces, replaces a full one or one that
+/// is mostly copies gone; a replaced run's slots go back once no list
+/// whose table names it is left (its lease, held until the list is reset).
+#[derive(Default)]
+pub(crate) struct CopyViews(std::sync::Mutex<Views>);
+
+#[derive(Default)]
+struct Views {
+    /// The run: its lease, first slot and pairs.
+    run: Option<(Arc<()>, u32, u32)>,
+    /// Pair by piece (copy, offset); the copies, held so that their
+    /// addresses stay theirs.
+    pairs: std::collections::HashMap<(usize, u64), u32>,
+    held: Vec<Arc<Shadow>>,
+    /// Replaced runs not yet given back: lease, first slot, slots.
+    retired: Vec<(std::sync::Weak<()>, u32, u32)>,
+}
+
+impl CopyViews {
+    /// The heap slot of each piece's pair (copy, offset, bytes) in
+    /// `heap`'s run, made where missing, and the null pair's and the run's
+    /// lease; None if no run fits.
+    fn pairs(
+        &self,
+        heap: &crate::descriptor::host::HostHeap,
+        pieces: &[(Arc<Shadow>, u64, u64)],
+    ) -> Option<(u32, Vec<u32>, Arc<()>)> {
+        let mut v = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        v.retired.retain(|(lease, first, n)| {
+            let held = lease.strong_count() > 0;
+            if !held {
+                heap.release(*first, *n);
+            }
+            held
+        });
+        let key = |(s, offset, _): &(Arc<Shadow>, u64, u64)| (Arc::as_ptr(s) as usize, *offset);
+        let found = pieces
+            .iter()
+            .filter(|p| v.pairs.contains_key(&key(p)))
+            .count();
+        let (missing, gone) = (pieces.len() - found, v.pairs.len().saturating_sub(found));
+        let room = v.run.as_ref().map_or(0, |r| r.2 as usize - v.pairs.len());
+        if v.run.is_none() || missing > room || gone > pieces.len().max(1024) {
+            let live = pieces.len() as u32;
+            let want = (2 * live).max(1024).next_power_of_two();
+            let (first, pairs) = [want, live + 64]
+                .into_iter()
+                .filter(|&p| p >= live)
+                .find_map(|p| heap.dynamic(2 * (p + 1)).map(|f| (f, p)))?;
+            heap.raw_pair_at(first, None, 0, 0);
+            let previous = v.run.take().map(|(lease, f, n)| {
+                v.retired.push((Arc::downgrade(&lease), f, 2 * (n + 1)));
+                n
+            });
+            tracing::info!(
+                pairs,
+                pieces = live,
+                previous,
+                "title memory copy views: a new shared run"
+            );
+            v.run = Some((Arc::new(()), first, pairs));
+            v.pairs.clear();
+            v.held.clear();
+        }
+        let (lease, first, _) = v.run.clone()?;
+        let mut slots = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            let pair = match v.pairs.get(&key(piece)) {
+                Some(&pair) => pair,
+                None => {
+                    let (s, offset, len) = piece;
+                    let pair = v.pairs.len() as u32;
+                    heap.raw_pair_at(
+                        first + 2 + 2 * pair,
+                        Some(&s.buffer),
+                        *offset,
+                        len.next_multiple_of(4),
+                    );
+                    v.pairs.insert(key(piece), pair);
+                    v.held.push(s.clone());
+                    pair
+                }
+            };
+            slots.push(first + 2 + 2 * pair);
+        }
+        Some((first, slots, lease))
+    }
+}
+
 /// A list's page table.
 pub(crate) struct Map {
     /// The page table's host GPU address (the root SRV).
@@ -107,13 +238,16 @@ impl Map {
 }
 
 /// Since the last frame line: draws and dispatches with shaders using title
-/// memory (by pipeline), page tables made, pages copied back (and of them,
+/// memory (by pipeline), page tables made, submissions of them in which a
+/// lane its loop limit or budget stopped marked the bitmap
+/// (`victory_shader::emit::LOOP_HIT_BIT`), pages copied back (and of them,
 /// those whose earlier bytes were not known), pages and 256 MiB regions
 /// missed (no copy), and the first missed addresses.
 #[derive(Default)]
 struct Stats {
     uses: std::collections::BTreeMap<String, u64>,
     tables: u64,
+    stopped: u64,
     written: u64,
     unknown: u64,
     kept: u64,
@@ -137,7 +271,8 @@ pub(crate) fn note_use(pipeline: &str) {
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.kept + s.missed_pages + s.missed_regions == 0 {
+    if s.uses.is_empty() && s.written + s.kept + s.missed_pages + s.missed_regions + s.stopped == 0
+    {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
@@ -145,12 +280,14 @@ pub(crate) fn log_frame() {
     let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
-        "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
+        "title memory this frame: {} draws/dispatches ({}), {} page tables ({} runs with \
+         lanes stopped at their loop limit or budget), {} pages \
          copied back ({} left in the copy: not known before), {} of loose memory kept on \
          the host, missed {} pages and {} 256 MiB regions with no copy (first: {})",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
+        s.stopped,
         s.written,
         s.unknown,
         s.kept,
@@ -173,7 +310,21 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// bytes), whose view pairs start at heap index `first + 2` (copy k at
 /// `first + 2 + 2k`; `first` is the null pair): the table's dwords, the
 /// level-1 index of each block, and the copy each entry names.
+#[cfg(test)]
 fn table(copies: &[(u64, u64)], first: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
+    let pairs: Vec<u32> = (0..copies.len() as u32)
+        .map(|k| first + 2 + 2 * k)
+        .collect();
+    table_of(copies, &pairs, first)
+}
+
+/// As [`table`], with copy k's view pair at heap index `pairs[k]` and the
+/// null pair at `null`.
+fn table_of(
+    copies: &[(u64, u64)],
+    pairs: &[u32],
+    null: u32,
+) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
     let mut level1 = vec![0u32; LEVEL1];
@@ -204,8 +355,8 @@ fn table(copies: &[(u64, u64)], first: u32) -> (Vec<u32>, Vec<usize>, Vec<Option
     let mut dwords = level1;
     for o in &owner {
         let entry = match *o {
-            Some((k, _)) => [first + 2 + 2 * k as u32, copies[k].0 as u32],
-            None => [first, 0],
+            Some((k, _)) => [pairs[k], copies[k].0 as u32],
+            None => [null, 0],
         };
         dwords.extend(entry);
     }
@@ -213,7 +364,8 @@ fn table(copies: &[(u64, u64)], first: u32) -> (Vec<u32>, Vec<usize>, Vec<Option
 }
 
 /// The page table of `list` in view heap `heap` (a host heap): views of
-/// every host copy in dynamic slots, which `slots` gets to give back;
+/// every host copy in dynamic slots, which `slots` gets to give back (or
+/// in the heap's shared run, [`CopyViews`]);
 /// `before` the list's earlier table, whose byte-for-byte ranges it keeps.
 pub(crate) fn build(
     list: &HostList,
@@ -238,7 +390,37 @@ pub(crate) fn build(
         .map(|&(k, offset, len)| (copies[k].range().0 + offset, len))
         .collect();
     let n = 2 * (pieces.len() as u32 + 1);
-    let Some(first) = heap.dynamic(n) else {
+    let views = if shared_views() {
+        let viewed: Vec<(Arc<Shadow>, u64, u64)> = pieces
+            .iter()
+            .map(|&(k, offset, len)| (copies[k].clone(), offset, len))
+            .collect();
+        heap.copy_views
+            .pairs(heap, &viewed)
+            .map(|(null, pairs, lease)| (null, pairs, Some(lease)))
+    } else {
+        heap.dynamic(n).map(|first| {
+            slots.extend([first, n]);
+            heap.raw_pair_at(first, None, 0, 0);
+            for (p, &(k, offset, len)) in pieces.iter().enumerate() {
+                let len = len.next_multiple_of(4);
+                heap.raw_pair_at(
+                    first + 2 + 2 * p as u32,
+                    Some(&copies[k].buffer),
+                    offset,
+                    len,
+                );
+            }
+            (
+                first,
+                (0..pieces.len() as u32)
+                    .map(|p| first + 2 + 2 * p)
+                    .collect(),
+                None,
+            )
+        })
+    };
+    let Some((first, pairs, lease)) = views else {
         static FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let times = FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if times.is_power_of_two() {
@@ -251,18 +433,17 @@ pub(crate) fn build(
         }
         return None;
     };
-    slots.extend([first, n]);
-    heap.raw_pair_at(first, None, 0, 0);
-    for (p, &(k, offset, len)) in pieces.iter().enumerate() {
-        let len = len.next_multiple_of(4);
-        heap.raw_pair_at(first + 2 + 2 * p as u32, Some(&copies[k].buffer), offset, len);
-    }
-    let (dwords, blocks, owner) = table(&ranges, first);
+    let (dwords, blocks, owner) = table_of(&ranges, &pairs, first);
     let (table, at) = list.scratch(dwords.len() as u64 * 4)?;
     // SAFETY: list upload memory of that size.
     unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), at.cast::<u32>(), dwords.len()) };
     let bits = owner.len();
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
+    let host = crate::host::host()?;
+    let size = (bits / 8).next_multiple_of(256) as u64;
+    let (bitmap, data) = match vram_bitmap() {
+        true => host.vram_shared_buffer(size)?,
+        false => host.shared_buffer(size)?,
+    };
     crate::host::name(&bitmap, || "title memory written pages".into());
     let words = bits / 32;
     // SAFETY: our mapped buffer of at least `words` dwords.
@@ -293,16 +474,31 @@ pub(crate) fn build(
     let precise = before.map(|m| m.precise.clone()).unwrap_or_default();
     let byte_for_byte = precise.clone();
     list.defer_after(move |slot| {
+        // The shared run's views stay until the list is reset.
+        let _ = &lease;
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        let mapped = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        // Read whole (VRAM the CPU reads slowly word by word); the marked
+        // words cleared for the list's next run.
+        let mut marks = mapped.to_vec();
+        for (word, &mark) in mapped.iter_mut().zip(&marks) {
+            if mark != 0 {
+                *word = 0;
+            }
+        }
         let (mut written, mut unknown, mut kept, mut pages, mut regions, mut missed) =
             (0, 0, 0, 0, 0, Vec::new());
+        let mut stopped = 0;
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
+                if entry == victory_shader::emit::LOOP_HIT_BIT as usize {
+                    stopped = 1;
+                    continue;
+                }
                 let (block, page) = (entry / BLOCK, entry % BLOCK);
                 // Block 0's bits are 256 MiB regions with no block.
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
@@ -337,7 +533,20 @@ pub(crate) fn build(
                 }
             }
         }
+        if stopped != 0 {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let times = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if times.is_power_of_two() {
+                tracing::warn!(
+                    times,
+                    budget = victory_shader::emit::loop_budget_passes(),
+                    limit = victory_shader::emit::loop_limit(),
+                    "a page table's shaders had lanes stopped at their loop limit or budget"
+                );
+            }
+        }
         stats(|s| {
+            s.stopped += stopped;
             s.written += written;
             s.unknown += unknown;
             s.kept += kept;
@@ -397,5 +606,59 @@ mod tests {
         assert_eq!(owner[entry(0x42_0000)], Some(1));
         assert_eq!(owner[entry(0xd_1234_0000)], Some(2));
         assert_eq!(blocks.len(), 3, "null, low 256 MiB, the high buffer's");
+    }
+
+    /// Page tables of a heap share one run of copy views: a piece keeps
+    /// its pair, a new one takes the next, a full run is replaced and goes
+    /// back once its lists are done with it.
+    #[test]
+    fn page_tables_share_a_run_of_copy_views() {
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = vec![0u8; 4 << 16];
+        let base = (memory.as_ptr() as u64).next_multiple_of(1 << 16);
+        let copies: Vec<Arc<Shadow>> = (0..2)
+            .map(|i| {
+                let start = base + i * 0x1_0000;
+                crate::shadow::register(start as usize, start, 0x1_0000);
+                crate::shadow::find(start, 16).expect("a copy")
+            })
+            .collect();
+        let views = CopyViews::default();
+        // Pieces of 16 bytes inside the 64 KiB copies: a view past its
+        // buffer removes the device.
+        let piece = |k: usize, offset: u64| (copies[k].clone(), offset, 0x10);
+        let (null, a, first) = views.pairs(&heap, &[piece(0, 0), piece(1, 0)]).unwrap();
+        assert_eq!(a, [null + 2, null + 4]);
+        let (again, b, second) = views
+            .pairs(&heap, &[piece(1, 0), piece(0, 0x100), piece(0, 0)])
+            .unwrap();
+        assert_eq!((again, b), (null, vec![null + 4, null + 6, null + 2]));
+        assert!(Arc::ptr_eq(&first, &second), "the same run");
+        // More pieces than the run holds: a new run, the old one kept
+        // while a list holds it.
+        let many: Vec<_> = (0..1100)
+            .map(|i| piece(i % 2, (i / 2) as u64 * 0x10))
+            .collect();
+        let (null2, c, third) = views.pairs(&heap, &many).unwrap();
+        assert_ne!(null2, null);
+        assert_eq!(c[1], null2 + 4);
+        assert_eq!(views.0.lock().unwrap().retired.len(), 1);
+        drop((first, second));
+        let (_, d, fourth) = views.pairs(&heap, &many).unwrap();
+        assert_eq!(d, c);
+        assert!(views.0.lock().unwrap().retired.is_empty(), "given back");
+        // Mostly pieces gone: a new run too.
+        let (null3, _, fifth) = views.pairs(&heap, &many[..3]).unwrap();
+        assert_ne!(null3, null2);
+        drop((third, fourth));
+        views.pairs(&heap, &many[..3]).unwrap();
+        assert!(views.0.lock().unwrap().retired.is_empty(), "given back");
+        drop(fifth);
+        for i in 0..2 {
+            let start = base + i * 0x1_0000;
+            crate::shadow::unregister(start as usize, start);
+        }
     }
 }

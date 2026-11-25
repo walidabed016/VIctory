@@ -54,6 +54,9 @@ pub(crate) struct HostHeap {
     /// address as data, `crate::memory`): the buffer, its mapping and host
     /// address, made on first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
+    /// Views of host copies that page tables share
+    /// (`VICTORY_SHARED_COPY_VIEWS`).
+    pub(crate) copy_views: crate::memory::CopyViews,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -179,6 +182,7 @@ impl HostHeap {
             strides,
             unread: Mutex::default(),
             addresses: std::sync::OnceLock::new(),
+            copy_views: Default::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no

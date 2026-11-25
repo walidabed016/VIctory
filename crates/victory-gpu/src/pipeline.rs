@@ -500,13 +500,42 @@ fn wait_builder() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_BUILDER").is_some())
 }
 
+/// `VICTORY_BUILDER_ALL_OR_NONE`: once a BVH builder dispatch is dropped,
+/// every later one is too, for the rest of the run, as DexNom's builder
+/// does (b8ff22e, `builder_off`: "its stages run all or none"): its
+/// structures keep what they hold instead of passes working on a broken
+/// tree. Off unless set.
+#[cfg(windows)]
+fn all_or_none() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUILDER_ALL_OR_NONE").is_some())
+}
+
+/// A BVH builder dispatch was dropped ([`all_or_none`]).
+#[cfg(windows)]
+static BUILDER_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `this` holds a BVH builder program that no longer runs
+/// ([`all_or_none`]).
+#[cfg(windows)]
+pub(crate) fn builder_off(this: This) -> bool {
+    all_or_none() && BUILDER_OFF.load(std::sync::atomic::Ordering::Relaxed) && is_builder(this)
+}
+
 /// Warns, once per pipeline, of a BVH builder dispatch dropped and why: the
-/// builder's passes after it then work on a broken tree.
+/// builder's passes after it then work on a broken tree (or, with
+/// [`all_or_none`], none runs from then on).
 #[cfg(windows)]
 pub(crate) fn builder_dropped(this: This, why: &str) {
     static TOLD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     if !is_builder(this) {
         return;
+    }
+    if all_or_none() && !BUILDER_OFF.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            frame = crate::frame::current(),
+            "the BVH builder is off for the rest of the run: its dispatches run all or none (VICTORY_BUILDER_ALL_OR_NONE)"
+        );
     }
     let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
     if told.contains(&(this as usize)) {

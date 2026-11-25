@@ -307,3 +307,182 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A lane its loop limit stops marks the bitmap's [`super::LOOP_HIT_BIT`]
+/// (with the page it stored to), so the host can count such runs: where
+/// it leaves the program (a loop with no exit), and with the loop budget
+/// where a loop's exit is taken for it, as it ends.
+#[test]
+fn lanes_stopped_at_their_loop_limit_are_marked() {
+    let value = 0xCAFE_F00D;
+    let page = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
+    let hit = super::LOOP_HIT_BIT as usize;
+    // s30 += 1 until it wraps to 0 (2^32 passes); the same with no exit.
+    let (exits, endless) = (
+        [0x801E_811E, 0xBF07_801E, 0xBF85_FFFD],
+        [0x801E_811E, 0xBF82_FFFE],
+    );
+    let marked = if super::loop_budget() {
+        vec![hit, page]
+    } else {
+        vec![page]
+    };
+    for (label, out, bits) in stopped_lanes(&exits, value) {
+        assert_eq!(out, [value, value], "{label}: the loop left at its limit");
+        assert_eq!(bits, marked, "{label}: bits");
+    }
+    for (label, out, bits) in stopped_lanes(&endless, value) {
+        assert_eq!(out, [0, value], "{label}: the program left at the limit");
+        assert_eq!(bits, [hit, page], "{label}: bits");
+    }
+}
+
+/// Runs a program that stores `value` at [`TITLE`] and in its result
+/// UAV's second dword, runs `looped`, and stores `value` in the first:
+/// per device, that UAV and the bitmap's bits set.
+fn stopped_lanes(looped: &[u32], value: u32) -> Vec<(&'static str, Vec<u32>, Vec<usize>)> {
+    let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.push(v_mov_b32(1, ZERO));
+    w.push(v_mov_b32(4, 2)); // v4 = s2
+    w.extend(global(28, 0, 1, 4, 0, 0)); // global_store_dword v1, v4, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    w.extend(buffer_store_dword(4, 8, 4));
+    w.push(s_mov_b32(30, 0x80));
+    w.extend(looped);
+    w.push(S_WAITCNT_ALL);
+    w.extend(buffer_store_dword(4, 8, 0));
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    assert!(l.memory && l.memory_writes && !l.view_addresses);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        view_strides: l.view_strides,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let memory = vec![0u32; 64];
+    let mut ran = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            let constants = [TITLE as u32, (TITLE >> 32) as u32, value, 0];
+            if u.root == RootType::Constants {
+                ud[u.index as usize] = constants[u.dword as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: page_table(1, 3),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(2),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[1][0], value, "{label}: the store");
+        let marked: Vec<usize> = (0..out[2].len() * 32)
+            .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
+            .collect();
+        ran.push((label, out[0].clone(), marked));
+    }
+    assert!(
+        !ran.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    ran
+}

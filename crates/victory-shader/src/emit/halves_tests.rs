@@ -187,6 +187,12 @@ fn lower64(words: &[u32], threads: [u32; 3], lds: u32) -> lower::Lowered {
 /// Runs `shader` (one group) on the hardware GPU, which must take it, and
 /// on WARP if it takes it; returns, per one that ran, the UAV's dwords.
 fn run(shader: &HostShader, dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    run_threads(shader, dwords, 0)
+}
+
+/// [`run`], for a dispatch of `threads_x` threads in x (0: in groups;
+/// `super::USER_DISPATCH_THREADS_X`).
+fn run_threads(shader: &HostShader, dwords: u32, threads_x: u32) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -206,6 +212,10 @@ fn run(shader: &HostShader, dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
         };
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
+            if u.root == RootType::Other(super::USER_DISPATCH_THREADS_X) {
+                ud[u.index as usize] = threads_x;
+                continue;
+            }
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
@@ -905,6 +915,52 @@ fn the_first_lane_of_no_lanes_is_lane_0() {
     for (label, got) in run(&shader, 64 * SLOTS) {
         for f in 0..64u32 {
             assert_eq!(slots(&got, f, 2), [256, f], "{label}: thread {f}");
+        }
+    }
+}
+
+#[test]
+fn the_last_group_of_a_dispatch_in_threads_runs_only_its_lanes_in_lockstep() {
+    // Each thread stores the count of lanes in EXEC (`s_bcnt1`), lane 5's
+    // index where lanes 40-63 read it (`v_readlane` under EXEC, which keeps
+    // the wave in lockstep) and 7. Given 50 threads, the group's lanes
+    // 50-63 are not the console's: they run nothing.
+    let threads = [64, 1, 1];
+    let mut w = prologue(threads);
+    w.extend([sop1(0x10, 20, EXEC_LO), vop1(0x001, 5, 20)]);
+    w.extend(mov_k(9, DEAD));
+    w.extend(mov_k(10, 7));
+    w.extend([SAVE_EXEC, vopc(0xD3, inline(40), 3)]);
+    let mut region = vop3(0x360, 15, v(3), inline(5)).to_vec();
+    region.push(vop1(0x001, 9, 15));
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    w.extend(store(5, 4, 0));
+    w.extend(store(9, 4, 4));
+    w.extend(store(10, 4, 8));
+    w.push(S_ENDPGM);
+    let (shader, waves, _) = build(&w, threads, 0);
+    assert_eq!(waves, Waves::Lockstep);
+    let host_word = shader
+        .user_data
+        .iter()
+        .any(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X));
+    assert_eq!(host_word, super::partial_groups());
+    for (count, given) in [(64, 0), (64, 64), (50, 50), (64, 200)] {
+        let count = if super::partial_groups() { count } else { 64 };
+        for (label, got) in run_threads(&shader, 64 * SLOTS, given) {
+            for f in 0..64u32 {
+                let want = match f {
+                    _ if f >= count => [0, 0, 0],
+                    40.. => [count, 5, 7],
+                    _ => [count, DEAD, 7],
+                };
+                assert_eq!(
+                    slots(&got, f, 3),
+                    want,
+                    "{label}, {given} threads: thread {f}"
+                );
+            }
         }
     }
 }

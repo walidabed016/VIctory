@@ -75,6 +75,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::loop_budget()),
             u8::from(victory_shader::emit::subdword_stores()),
             u8::from(victory_shader::emit::split_joins()),
+            u8::from(victory_shader::emit::partial_groups()),
         ];
         let mesh = victory_shader::emit::mesh_wave_ops();
         if mesh != victory_shader::emit::MeshWaveOps::Lane {
