@@ -361,6 +361,8 @@ struct Guards {
     saved: BTreeMap<usize, Vec<u8>>,
     /// Write-watched title memory guarded instead ([`title_memory_watched`]).
     pools: Blocks,
+    /// Title memory a host heap holds in place ([`title_memory_held`]).
+    held: Blocks,
     /// The physical pages the runtime's views show.
     shown: Option<Shown>,
     /// Blocks the runtime is unmapping ([`title_memory_unmapping`]): a copy
@@ -375,6 +377,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     armed: Blocks(BTreeMap::new()),
     saved: BTreeMap::new(),
     pools: Blocks(BTreeMap::new()),
+    held: Blocks(BTreeMap::new()),
     shown: None,
     unmapping: Vec::new(),
 });
@@ -602,9 +605,16 @@ fn reguard(start: usize, end: usize, pool: bool) -> (Vec<usize>, Vec<(usize, usi
 /// report it written again, so each refresh of the world's sparse tiled
 /// heaps copied ~300 MB of unmapped pages a frame, 4 KiB at a time. Of a
 /// `pool`, only a block wholly not committed is (the runtime tells when it
-/// commits pool memory).
+/// commits pool memory). Blocks a host heap holds are left as the kernel
+/// would leave them, neither guarded nor clean, without asking it.
 fn protect(g: &mut Guards, from: usize, to: usize, pool: bool) {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
+    if !g.held.within(from, to).is_empty() {
+        for (a, b) in g.held.gaps(from, to) {
+            protect(g, a, b, pool);
+        }
+        return;
+    }
     let set = read_only;
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert(from, to);
@@ -1089,6 +1099,23 @@ pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
         g.pools.insert(from, to);
     } else {
         g.pools.remove(from, to);
+    }
+}
+
+/// Title memory `[at, at + len)` is held (or no longer) by a host heap
+/// opened on it, which the title's buffer is used in place through: the
+/// kernel refuses to make it read-only while the heap is open
+/// (`ERROR_INVALID_PARAMETER`), so it is not guarded; of pools, the
+/// kernel's write watch answers for it. Each refused block used to be
+/// asked about with `VirtualQuery` at every asking, ~0.2 ms each: ~3 s of a
+/// world frame with a 90 MiB buffer in place.
+pub(crate) fn title_memory_held(at: usize, len: usize, held: bool) {
+    let mut g = guards();
+    let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if held {
+        g.held.insert(from, to);
+    } else {
+        g.held.remove(from, to);
     }
 }
 

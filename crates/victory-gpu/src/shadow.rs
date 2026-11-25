@@ -254,6 +254,14 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        if self.in_place {
+            crate::watch::title_memory_held(self.start as usize, self.len as usize, false);
+        }
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -1346,6 +1354,7 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
         crate::host::name(&buffer, || {
             format!("title memory in place {start:#x}+{len:#x}")
         });
+        crate::watch::title_memory_held(start, len, true);
         let twin = (twins_on() && twin_compare_on() && in_place_twins_on())
             .then(|| vram_buffer(len as u64))
             .flatten();
