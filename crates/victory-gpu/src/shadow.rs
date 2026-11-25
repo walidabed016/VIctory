@@ -252,7 +252,8 @@ fn merge_words(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Merged {
 /// slices start) instead of by what the copy held: those words' bytes are
 /// the GPU's, and the copy takes the title's others. By word, as the
 /// compare tells: a byte the title wrote meanwhile into a word the GPU
-/// changed is lost.
+/// changed is lost. 16 bytes at a time where the slices hold 32 whole
+/// words ([`lane_merges`]).
 fn merge_bits(
     title: &mut [u8],
     host: &mut [u8],
@@ -260,9 +261,40 @@ fn merge_bits(
     first: usize,
     skip: usize,
 ) -> Merged {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_andnot_si128, _mm_castsi128_ps, _mm_cmpeq_epi32,
+        _mm_loadu_si128, _mm_movemask_ps, _mm_or_si128, _mm_storeu_si128,
+    };
+    /// By four bits of the compare's, the words they mark, as lanes.
+    const LANES: [[u32; 4]; 16] = {
+        let mut lanes = [[0; 4]; 16];
+        let mut g = 0;
+        while g < 16 {
+            let mut w = 0;
+            while w < 4 {
+                if g >> w & 1 != 0 {
+                    lanes[g][w] = u32::MAX;
+                }
+                w += 1;
+            }
+            g += 1;
+        }
+        lanes
+    };
     assert!(host.len() == title.len() && skip < 4);
+    let by_lanes = lane_merges();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut taken: Option<(usize, usize)> = None;
+    let mut word = |a: usize, b: usize, gpu: bool| {
+        if !gpu {
+            taken = Some((taken.map_or(a, |s| s.0), b));
+            return;
+        }
+        match runs.last_mut() {
+            Some(run) if run.1 == a => run.1 = b,
+            _ => runs.push((a, b)),
+        }
+    };
     let len = title.len();
     let words = (len + skip).div_ceil(4);
     let edge = |w: usize| (4 * w).saturating_sub(skip).min(len);
@@ -276,25 +308,70 @@ fn merge_bits(
         if mask == 0 && title[from..to] == host[from..to] {
             continue;
         }
+        if by_lanes && to - from == 128 {
+            for lane in 0..8 {
+                let (at, g) = (from + 16 * lane, (mask >> (4 * lane) & 0xf) as usize);
+                // SAFETY: SSE2 is part of x86_64; 16 bytes at `at` in both
+                // slices, as long as each other.
+                let differ = unsafe {
+                    let t = _mm_loadu_si128(title.as_ptr().add(at).cast::<__m128i>());
+                    let h = _mm_loadu_si128(host.as_ptr().add(at).cast::<__m128i>());
+                    let differ = !_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(t, h))) & 0xf;
+                    if differ != 0 {
+                        let gpu = _mm_loadu_si128(LANES[g].as_ptr().cast::<__m128i>());
+                        let merged = _mm_or_si128(_mm_and_si128(gpu, h), _mm_andnot_si128(gpu, t));
+                        _mm_storeu_si128(title.as_mut_ptr().add(at).cast::<__m128i>(), merged);
+                        _mm_storeu_si128(host.as_mut_ptr().add(at).cast::<__m128i>(), merged);
+                    }
+                    differ
+                };
+                let (gpu, titles) = (differ as usize & g, differ as usize & !g);
+                if titles != 0 {
+                    let (a, b) = (
+                        titles.trailing_zeros(),
+                        usize::BITS - titles.leading_zeros(),
+                    );
+                    word(at + 4 * a as usize, at + 4 * b as usize, false);
+                }
+                for w in (0..4).filter(|w| gpu >> w & 1 != 0) {
+                    word(at + 4 * w, at + 4 * w + 4, true);
+                }
+            }
+            continue;
+        }
         for w in 0..held {
             let (a, b) = (edge(32 * k + w), edge(32 * k + w + 1));
             let (t, h) = (&mut title[a..b], &mut host[a..b]);
             if t == h {
                 continue;
             }
-            if mask >> w & 1 != 0 {
+            let gpu = mask >> w & 1 != 0;
+            if gpu {
                 t.copy_from_slice(h);
-                match runs.last_mut() {
-                    Some(run) if run.1 == a => run.1 = b,
-                    _ => runs.push((a, b)),
-                }
             } else {
                 h.copy_from_slice(t);
-                taken = Some((taken.map_or(a, |s| s.0), b));
             }
+            word(a, b, gpu);
         }
     }
     (runs, taken)
+}
+
+/// Whether [`merge_bits`] compares and merges four words at a time where
+/// the slices hold 32 whole words: word by word, with a slice compare and a
+/// copy per word, it took most of copy-back's samples in run 100.
+/// `VICTORY_NO_SIMD_MERGE` turns it off.
+fn lane_merges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_SIMD_MERGE").is_none();
+        if !on {
+            tracing::info!(
+                "copy-back merges by the compare's bits word by word (VICTORY_NO_SIMD_MERGE)"
+            );
+        }
+        on
+    })
 }
 
 /// The 32 bits of `bits` from bit `at` (clear past its end).
@@ -4308,6 +4385,80 @@ pub(crate) mod tests {
             let (mut t2, mut h2) = (title, host);
             let lanes = merge_words(&mut t1, &mut h1, &old);
             let words = by_words(&mut t2, &mut h2, &old);
+            assert_eq!(lanes, words, "round {round}");
+            assert_eq!((t1, h1), (t2, h2), "round {round}");
+        }
+    }
+
+    #[test]
+    fn merging_bits_by_lanes_matches_merging_them_by_words() {
+        fn by_words(
+            title: &mut [u8],
+            host: &mut [u8],
+            bits: &[u32],
+            first: usize,
+            skip: usize,
+        ) -> Merged {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut taken: Option<(usize, usize)> = None;
+            let len = title.len();
+            let edge = |w: usize| (4 * w).saturating_sub(skip).min(len);
+            for w in 0..(len + skip).div_ceil(4) {
+                let (a, b) = (edge(w), edge(w + 1));
+                let (t, h) = (&mut title[a..b], &mut host[a..b]);
+                if t == h {
+                    continue;
+                }
+                if bits_at(bits, first + w) & 1 != 0 {
+                    t.copy_from_slice(h);
+                    match runs.last_mut() {
+                        Some(run) if run.1 == a => run.1 = b,
+                        _ => runs.push((a, b)),
+                    }
+                } else {
+                    h.copy_from_slice(t);
+                    taken = Some((taken.map_or(a, |s| s.0), b));
+                }
+            }
+            (runs, taken)
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let odds = [0, 1, 2, 7, 64];
+        for round in 0..20_000 {
+            let n = [0, 3, 127, 128, 129, 300, 512, 1021][round % 8];
+            let skip = round / 8 % 4;
+            // How often a word's bit is set, the host copy differs, the
+            // title holds the host copy's word.
+            let (set, differs, holds) = (
+                odds[round / 32 % 5],
+                odds[round / 160 % 5],
+                odds[round / 800 % 5],
+            );
+            let mut one_in = |k: u64| k != 0 && next() % k == 0;
+            let first = round % 37;
+            let bits: Vec<u32> = (0..(first + n / 4 + 2).div_ceil(32))
+                .map(|_| (0..32).fold(0, |m, b| m | u32::from(one_in(set)) << b))
+                .collect();
+            let title: Vec<u8> = (0..n).map(|i| (i * 31 + round) as u8).collect();
+            let host: Vec<u8> = title
+                .iter()
+                .map(|&t| if one_in(differs) { t ^ 0x5a } else { t })
+                .collect();
+            let title: Vec<u8> = title
+                .iter()
+                .zip(&host)
+                .map(|(&t, &h)| if one_in(holds) { h } else { t })
+                .collect();
+            let (mut t1, mut h1) = (title.clone(), host.clone());
+            let (mut t2, mut h2) = (title, host);
+            let lanes = merge_bits(&mut t1, &mut h1, &bits, first, skip);
+            let words = by_words(&mut t2, &mut h2, &bits, first, skip);
             assert_eq!(lanes, words, "round {round}");
             assert_eq!((t1, h1), (t2, h2), "round {round}");
         }
