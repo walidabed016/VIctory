@@ -792,6 +792,15 @@ pub(crate) struct Rect {
     bottom: i32,
 }
 
+/// Whether the frame being built is one `VICTORY_CAPTURE_FRAMES` (or a
+/// world capture) lists, to trace its clears and blend factors at debug
+/// level (diagnostics builds).
+#[cfg(feature = "diagnostics")]
+fn listed() -> bool {
+    tracing::enabled!(tracing::Level::DEBUG)
+        && crate::capture::listed(crate::queue::presented() + 1)
+}
+
 extern "system" fn clear_rtv(
     this: This,
     handle: u64,
@@ -803,12 +812,23 @@ extern "system" fn clear_rtv(
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
+            #[cfg(feature = "diagnostics")]
+            if listed() {
+                tracing::debug!(
+                    handle = format_args!("{handle:#x}"),
+                    "clear rtv dropped: no list or view"
+                );
+            }
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            #[cfg(feature = "diagnostics")]
+            if listed() {
+                tracing::debug!(resource = ?record.resource, "clear rtv dropped: no host texture");
+            }
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
@@ -832,6 +852,19 @@ extern "system" fn clear_rtv(
                 )]);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
+        }
+        #[cfg(feature = "diagnostics")]
+        if listed() {
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            tracing::debug!(
+                resource = ?record.resource,
+                "clear rtv {}x{} f{} {color:?} rects {}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                rects.map_or(0, <[_]>::len)
+            );
         }
     }
     #[cfg(not(windows))]
@@ -866,6 +899,10 @@ extern "system" fn clear_dsv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        #[cfg(feature = "diagnostics")]
+        if listed() {
+            tracing::debug!(resource = ?record.resource, "clear dsv flags {flags} depth {depth} stencil {stencil}");
+        }
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
@@ -1064,7 +1101,12 @@ mod state {
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         if let Some(list) = host_list(this) {
             // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
+            let factor = unsafe { factor.as_ref() };
+            #[cfg(feature = "diagnostics")]
+            if super::listed() {
+                tracing::debug!("blend factor {factor:?}");
+            }
+            crate::draw::blend_factor(list, factor);
         }
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
