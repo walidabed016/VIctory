@@ -759,7 +759,9 @@ impl State {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                         let len = shadow.left(*address).min(1 << 20);
                         shadow.refresh(list, *address, len);
-                        shadow.gpu_writes(list, *address, len);
+                        if !crate::memory::quarantine() {
+                            shadow.gpu_writes(list, *address, len);
+                        }
                         map.precise(*address, len);
                     }
                 }

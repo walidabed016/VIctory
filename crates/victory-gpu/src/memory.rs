@@ -90,6 +90,24 @@ fn shared_views() -> bool {
     })
 }
 
+/// Whether what page tables' shaders write stays in the host copies, none
+/// of it going back into title memory (`VICTORY_TABLE_QUARANTINE=1`, as
+/// DexNom's VICTORY_BVH_QUARANTINE): a test, not a way to run. If the
+/// title's crashes after its first BVH build stop with it, they come from
+/// those writes reaching title memory.
+pub(crate) fn quarantine() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_TABLE_QUARANTINE").is_ok_and(|v| v == "1");
+        if on {
+            tracing::warn!(
+                "what page tables' shaders write stays on the host: the title never sees it (VICTORY_TABLE_QUARANTINE)"
+            );
+        }
+        on
+    })
+}
+
 /// Whether page tables' bitmaps of written pages are in VRAM the CPU maps
 /// (the GPU upload heap, `VICTORY_VRAM_BITMAP=1`) rather than in system
 /// memory, where each shader store's atomic mark costs a PCIe round trip
@@ -282,8 +300,8 @@ pub(crate) fn log_frame() {
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables ({} runs with \
          lanes stopped at their loop limit or budget), {} pages \
-         copied back ({} left in the copy: not known before), {} of loose memory kept on \
-         the host, missed {} pages and {} 256 MiB regions with no copy (first: {})",
+         copied back ({} left in the copy: not known before), {} kept on the host (loose \
+         memory, or VICTORY_TABLE_QUARANTINE), missed {} pages and {} 256 MiB regions with no copy (first: {})",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -510,6 +528,7 @@ pub(crate) fn build(
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) if copies[pieces[*k].0].is_loose() && !loose_back() => kept += 1,
+                    Some(Some(_)) if quarantine() => kept += 1,
                     Some(Some(k)) => {
                         WRITTEN
                             .lock()
