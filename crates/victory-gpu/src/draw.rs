@@ -871,6 +871,25 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// `DispatchX(x, y, z, flags)`: with flag 0x20 the BVH builder gives
+    /// thread counts, not group counts (DexNom bc3cd4b); run as many groups
+    /// as hold them. Taken as groups, they ran its refit up to 64 times over,
+    /// lanes past its data climbing on atomics (runs 127, 128).
+    // shortcut: the last group's lanes past the count run (DexNom masks them
+    // in two box-rehydration kernels).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let size = (flags & 0x20 != 0 && crate::pipeline::is_builder(self.pipeline as This))
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
+            .flatten()
+            .and_then(|p| p.stages.first())
+            .and_then(|s| s.translated().compute_threads);
+        let Some(size) = size else {
+            return self.dispatch(list, x, y, z);
+        };
+        once!(flags = format_args!("{flags:#x}"), "BVH builder dispatches given in threads run as groups of them (logged once)");
+        self.dispatch(list, x.div_ceil(size[0]), y.div_ceil(size[1]), z.div_ceil(size[2]));
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {

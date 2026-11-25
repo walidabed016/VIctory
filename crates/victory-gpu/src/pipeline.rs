@@ -135,6 +135,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    /// A compute program's group size.
+    pub(crate) compute_threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the program intersects rays (`image_bvh*_intersect_ray`),
     /// against the title's acceleration structures in title memory.
@@ -220,6 +222,7 @@ impl Shader {
                     memory_writes: false,
                     view_addresses: false,
                 },
+                compute_threads: None,
                 used: Vec::new(),
                 rays: false,
             })),
@@ -251,8 +254,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                 .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
         })
     });
+    let compute_threads = native.as_ref().and_then(|p| match p.io {
+        victory_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+        _ => None,
+    });
     Ok(Translated {
         host,
+        compute_threads,
         used: native.map(|p| p.used).unwrap_or_default(),
         rays,
     })
@@ -451,24 +459,35 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// Programs that hang the host GPU however their loops are bounded: their
-/// dispatches are dropped unless `VICTORY_RUN_HANGING=1`.
-/// XboxBvhBuilder.dll@0x53fd0's BVH refit climbs parent links that never
-/// reach the root (runs 127 and 128, 1 warp and then 125 spinning).
+/// Programs that have hung the host GPU: their
+/// dispatches are dropped with `VICTORY_DROP_HANGING=1`.
+/// XboxBvhBuilder.dll@0x53fd0's BVH refit climbed parent links that never
+/// reached the root (runs 127 and 128, 1 warp and then 125 spinning) while
+/// its thread counts ran as group counts ([`crate::draw::State::dispatch_x`]).
 #[cfg(windows)]
 const HANGING: &[&str] = &["5552dac6a2b7a1fd"];
 
 /// Whether `this` holds a program of [`HANGING`] that is not to run.
 #[cfg(windows)]
 pub(crate) fn hangs(this: This) -> bool {
-    static RUN: OnceLock<bool> = OnceLock::new();
-    let run =
-        *RUN.get_or_init(|| std::env::var_os("VICTORY_RUN_HANGING").is_some_and(|v| v == "1"));
-    !run && !this.is_null()
+    static DROP: OnceLock<bool> = OnceLock::new();
+    let drop =
+        *DROP.get_or_init(|| std::env::var_os("VICTORY_DROP_HANGING").is_some_and(|v| v == "1"));
+    drop && !this.is_null()
         && pipeline(this)
             .shaders
             .iter()
             .any(|shader| HANGING.contains(&shader.hash.as_str()))
+}
+
+/// Whether `this` holds one of XboxBvhBuilder.dll's programs.
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this)
+            .shaders
+            .iter()
+            .any(|shader| BVH_BUILDERS.contains(&shader.hash.as_str()))
 }
 
 /// Host pipelines queued and not made yet.
