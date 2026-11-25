@@ -471,7 +471,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            let later = !for_draw && view.placed_texture();
+            let later = !for_draw && view.placed_texture() && !bindless_textures();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -484,6 +484,13 @@ impl HostHeap {
             if kept.is_some() && !for_draw && view.is_buffer() {
                 let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
                 unread.insert(index);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(texture) = kept.as_ref().and_then(|k| k.resource.as_ref())
+                && !for_draw
+                && view.placed_texture()
+            {
+                note_bindless(texture, true);
             }
             let record = kept
                 .as_ref()
@@ -509,6 +516,77 @@ impl HostHeap {
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
+    }
+}
+
+/// Whether the views of textures the title placed in its own memory are
+/// made when the title writes them, and their textures brought up to date
+/// for the first stage that may read their slots, as buffer views are
+/// (`VICTORY_BINDLESS_TEXTURES=1`). Otherwise they wait for a draw to name
+/// their slot, which never comes for the material textures Grand Theft
+/// Auto VI's world shaders reach through slots they load from memory.
+pub(crate) fn bindless_textures() -> bool {
+    #[cfg(test)]
+    if BINDLESS_TEXTURES.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_BINDLESS_TEXTURES").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "placed textures made when the title writes their views (VICTORY_BINDLESS_TEXTURES)"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`bindless_textures`] on this thread (tests).
+    static BINDLESS_TEXTURES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Placed textures reached through views made when the title wrote them
+/// ([`bindless_textures`]), since the last frame-rate line: views made,
+/// bytes of the textures they reached first, views brought up to date for
+/// a stage, their textures' bytes; then textures and bytes so far
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static BINDLESS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Counts a view of placed texture `texture` made when the title wrote it
+/// (`made`), or brought up to date for a stage ([`BINDLESS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_bindless(texture: &ID3D12Resource, made: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    static SEEN: Mutex<std::collections::BTreeSet<usize>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    let bytes = || {
+        // SAFETY: a live resource's description.
+        host().map_or(
+            0,
+            |h| unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes,
+        )
+    };
+    if !made {
+        BINDLESS[2].fetch_add(1, Relaxed);
+        BINDLESS[3].fetch_add(bytes(), Relaxed);
+        return;
+    }
+    BINDLESS[0].fetch_add(1, Relaxed);
+    if SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(texture.as_raw() as usize)
+    {
+        let bytes = bytes();
+        BINDLESS[1].fetch_add(bytes, Relaxed);
+        BINDLESS[4].fetch_add(1, Relaxed);
+        BINDLESS[5].fetch_add(bytes, Relaxed);
     }
 }
 
@@ -1611,6 +1689,98 @@ mod tests {
         texture[12] = 0;
         assert!(placed_texture(&View::Placed(true, texture, words)).is_none());
         assert!(placed_texture(&View::Placed(false, texture, words)).is_some());
+    }
+
+    /// With `VICTORY_BINDLESS_TEXTURES=1`, the view of a texture the title
+    /// placed in its own memory is made when the title writes it, instead
+    /// of left null until a draw names its slot, and its slot is unread, so
+    /// the first stage that may read it brings the texture up to date: a
+    /// shader reaching it through an index loaded from memory samples the
+    /// title's texture.
+    #[test]
+    fn placed_texture_views_are_made_when_written_with_bindless_textures() {
+        const COPY_SOURCE: u32 = 0x800;
+        let _serial = crate::watch::serial();
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = Box::leak(vec![0u8; 0x3_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        // SAFETY: inside the leaked memory.
+        unsafe { (address as *mut u8).write_bytes(0x5a, 64 * 64 * 4) };
+        // A 64x64 R8G8B8A8_UNORM texture the title fills, and a shader view
+        // of every mip of it.
+        let texture = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 0, 0];
+        let mut words = [0u32; 16];
+        words[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, u32::MAX]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        let view = View::Placed(false, texture, words);
+        let slot = Box::leak(Box::new([0u64; 4]));
+        let handle = slot.as_ptr() as u64;
+        crate::descriptor::record(handle, view.clone());
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert!(heap.take_unread().is_empty(), "left for a draw");
+        BINDLESS_TEXTURES.set(true);
+        let mirrored = heap.mirror(0, handle, false);
+        BINDLESS_TEXTURES.set(false);
+        assert!(mirrored.is_some());
+        assert_eq!(
+            heap.take_unread(),
+            [0],
+            "for the first stage that may read it"
+        );
+        // What that stage does for the texture: brings it up to date.
+        let Some(View::Shader(resource, _)) = placed_texture(&view) else {
+            panic!("no host texture");
+        };
+        let resource = resource as crate::object::This;
+        let (read, back) = host.shared_buffer(64 * 256).unwrap();
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, resource);
+        crate::list::ensure_state(&list, resource, COPY_SOURCE);
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer; the location never releases it.
+            pResource: unsafe { std::mem::transmute_copy(&read) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe {
+                std::mem::transmute_copy(crate::resource::host_resource(resource).unwrap())
+            },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: an open list; live resources; a whole subresource.
+        unsafe {
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.Close().unwrap();
+        }
+        host.execute(&[&list]);
+        crate::pipelined::wait_all();
+        // SAFETY: the mapped bytes the list wrote, waited for.
+        let rows = unsafe { std::slice::from_raw_parts(back, 64 * 256) };
+        assert!(rows.iter().all(|&b| b == 0x5a), "the title's texels");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Render targets and unordered textures in the 16-bit formats the

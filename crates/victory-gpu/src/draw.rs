@@ -815,6 +815,13 @@ impl State {
                     _ => ResourceType::Srv,
                 };
                 readable(list, kind, &view);
+                #[cfg(feature = "diagnostics")]
+                if let Some(View::Shader(r, _) | View::Unordered(r, ..)) =
+                    crate::descriptor::host::placed_texture(&view)
+                    && let Some(texture) = crate::resource::host_resource(r as This)
+                {
+                    crate::descriptor::host::note_bindless(texture, false);
+                }
             }
         }
         for h in &shader.heap_indices {
