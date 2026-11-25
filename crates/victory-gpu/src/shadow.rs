@@ -191,6 +191,26 @@ fn copy_back_threads() -> usize {
     })
 }
 
+/// Diagnostics, an experiment that breaks what reads title memory shaders
+/// wrote: `VICTORY_SKIP_COPY_BACK=bits` (ranges the compare tells by word),
+/// `was` (the others) or `all` are never written back.
+#[cfg(feature = "diagnostics")]
+fn skipped_copy_backs() -> Option<&'static str> {
+    static SKIP: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let skip = match std::env::var("VICTORY_SKIP_COPY_BACK").ok()?.as_str() {
+            "bits" => "bits",
+            "was" => "was",
+            _ => "all",
+        };
+        tracing::warn!(
+            skip,
+            "copy-back skipped: an experiment (VICTORY_SKIP_COPY_BACK)"
+        );
+        Some(skip)
+    })
+}
+
 /// Runs `f` on each of `items` on copy-back's threads
 /// ([`copy_back_threads`]), the caller among them: the results in order. Its
 /// own threads, started once, so that the preparation's splits never queue
@@ -1301,6 +1321,14 @@ impl Shadow {
                 };
                 ranges.push((from, to, how));
             }
+        }
+        // Diagnostics: an experiment, what copy-back is needed for.
+        #[cfg(feature = "diagnostics")]
+        if let Some(skip) = skipped_copy_backs() {
+            ranges.retain(|(_, _, how)| match how {
+                How::Bits { .. } => skip == "was",
+                How::Was(_) => skip == "bits",
+            });
         }
         let written = match copy_back_threads() {
             1 => ranges
