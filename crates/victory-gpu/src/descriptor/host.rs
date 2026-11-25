@@ -427,6 +427,15 @@ impl HostHeap {
         };
     }
 
+    /// The shader-visible handle of slot `index`.
+    pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -1260,6 +1269,12 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 #[cfg(test)]
 pub(crate) fn made(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     make(view, at).is_some()
+}
+
+/// Makes the host descriptor for `view` at `at` (in any host view heap):
+/// the host resource it views, if it can.
+pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    make(view, at).and_then(|k| k.resource)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it

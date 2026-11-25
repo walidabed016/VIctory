@@ -126,7 +126,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -1075,6 +1075,40 @@ mod state {
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
+    /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
+    /// values, rectangle count, rectangles)`.
+    pub(super) extern "system" fn clear_unordered_uint(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        count: u32,
+        rects: *const RECT,
+    ) {
+        clear_unordered(this, cpu, values, false, items(rects, count));
+    }
+    /// `ClearUnorderedAccessViewFloat`, the same with four floats.
+    pub(super) extern "system" fn clear_unordered_float(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        count: u32,
+        rects: *const RECT,
+    ) {
+        clear_unordered(this, cpu, values, true, items(rects, count));
+    }
+    fn clear_unordered(this: This, cpu: u64, values: *const [u32; 4], float: bool, rects: &[RECT]) {
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        with_state(this, |list, s| {
+            s.clear_unordered(list, cpu, values, float, rects);
+        });
+    }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
@@ -1227,6 +1261,8 @@ mod state {
     pub(super) use super::draw as dispatch_mesh;
     pub(super) use super::draw as dispatch_mesh_x;
     pub(super) use super::ignored_state as blend_factor;
+    pub(super) use super::ignored_state as clear_unordered_float;
+    pub(super) use super::ignored_state as clear_unordered_uint;
     pub(super) use super::ignored_state as compute_constant;
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
@@ -1458,13 +1494,16 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
-    (30, resolve_queries as *const ()),        // 0xf0
-    (78, dispatch_x as *const ()),             // 0x270
-    (98, state::dispatch_mesh_x as *const ()), // 0x310
-    (99, driver_hint as *const ()),            // 0x318
+const MORE_METHODS: [(usize, *const ()); 12] = [
+    (53, state::clear_unordered_uint as *const ()), // 0x1a8
+    (54, state::clear_unordered_float as *const ()), // 0x1b0
+    (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
+    (28, query_mark as *const ()),                  // 0xe0 BeginQuery
+    (29, query_mark as *const ()),                  // 0xe8 EndQuery
+    (30, resolve_queries as *const ()),             // 0xf0
+    (78, dispatch_x as *const ()),                  // 0x270
+    (98, state::dispatch_mesh_x as *const ()),      // 0x310
+    (99, driver_hint as *const ()),                 // 0x318
     // Pipeline syncs at the top and bottom of the pipe, 0x408 and 0x410.
     (129, sync as *const ()),
     (130, sync as *const ()),
@@ -1569,6 +1608,20 @@ mod tests {
         // A footprint off the host's 512-byte placement is refused.
         dst.footprint.offset = 0x100;
         assert!(copy(&host.new_list().unwrap(), &dst).is_err());
+    }
+
+    /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
+    /// the methods newer lists insert: the AMD upscaler calls them there.
+    #[test]
+    fn unordered_access_clears_have_the_same_slots_in_both_layouts() {
+        for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
+            assert_eq!(table.0[0x1a8 / 8], state::clear_unordered_uint as *const ());
+            assert_eq!(
+                table.0[0x1b0 / 8],
+                state::clear_unordered_float as *const ()
+            );
+            assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+        }
     }
 
     #[test]

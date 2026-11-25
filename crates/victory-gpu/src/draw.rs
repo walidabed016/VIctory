@@ -275,6 +275,14 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Others recorded into the host list (`crate::external`): its heaps,
+    /// root signatures and pipeline are set again before the next draw or
+    /// dispatch.
+    pub(crate) fn host_state_lost(&mut self) {
+        // No title heaps (0) differ from what the host list has, too.
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
@@ -527,20 +535,7 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.bind_heaps(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -662,6 +657,74 @@ impl State {
         if twins_back(list) {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
+        }
+    }
+
+    /// Gives the host list the title's heaps if it has others.
+    fn bind_heaps(&mut self, list: &HostList) {
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+    }
+
+    /// `ClearUnorderedAccessViewUint` or `...Float` (`float`): the view the
+    /// title made at `cpu` (its CPU handle; the GPU one names the same view
+    /// in the bound heap) cleared to `values` on the host, through a
+    /// dynamic slot of the bound view heap that the list holds until reset.
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        cpu: u64,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
+        let Some(view) = crate::descriptor::view(cpu) else {
+            once!("an unordered access clear of a slot without a view");
+            return;
+        };
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+            once!("an unordered access clear without a bound view heap");
+            return;
+        };
+        let Some(visible) = heap.host() else { return };
+        let Some(slot) = visible.dynamic(1) else {
+            return;
+        };
+        self.dynamic
+            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        visible.make_at(slot, &view);
+        let at = host.cpu_view();
+        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+            once!("an unordered access clear of a view the host cannot make");
+            return;
+        };
+        readable(list, ResourceType::Uav, &view);
+        self.bind_heaps(list);
+        list.keep(&resource);
+        let gpu = visible.gpu(slot);
+        // SAFETY: an open list; both slots view the live resource.
+        unsafe {
+            if float {
+                let values = values.map(f32::from_bits);
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+            }
         }
     }
 

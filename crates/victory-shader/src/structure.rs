@@ -22,7 +22,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
-use crate::resource::{Moved, restored};
+use crate::resource::{Moved, lane_of, restored};
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -377,6 +377,9 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// `v_readlane_b32` results of a constant lane: the SGPR value that
+    /// `v_writelane_b32` spilled to that lane, the same along every path.
+    pub restored: HashMap<Value, Value>,
 }
 
 impl Structured {
@@ -437,6 +440,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::restored`].
+    restored: Map<Value, Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -484,7 +489,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        Ok(Lanes {
+        let mut l = Lanes {
             p,
             order,
             index,
@@ -500,7 +505,62 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
-        })
+            restored: Map::default(),
+        };
+        for inst in blocks.iter().flat_map(|b| &b.insts) {
+            if let Fields::Valu(v) = &inst.fields
+                && inst.name() == "v_readlane_b32"
+                && let [Operand::Vector { reg, .. }, lane] = v.src[..]
+                && let Some(lane) = lane_of(lane)
+                && let Some(spill) = inst.read(Reg::V(reg))
+                && let Ok(Some(s)) = l.spilled(spill, lane, &mut Vec::new())
+                && let Some(&(_, r)) = inst.writes.first()
+            {
+                l.restored.insert(r, s);
+            }
+        }
+        Ok(l)
+    }
+
+    /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
+    /// an SGPR there: `Ok(None)` for a phi in `seen` (being resolved).
+    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.spilled(a, lane, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if lane_of(*at).ok_or(())? != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
     }
 
     fn reset(&mut self) {
@@ -721,6 +781,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            restored: self.restored.into_iter().collect(),
             bools: self.b,
             exits,
             guards,
@@ -1088,8 +1149,8 @@ impl<'a> Lanes<'a> {
                         && code != NULL
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
-                        let lazy = self.phis.contains_key(&k.0)
-                            || self.phis.contains_key(&k.1)
+                        let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                        let lazy = phi && !self.joins_loaded(k)
                             || self.restored(k).is_some()
                             || self.moved(k).is_some();
                         takes_mask |= self.masks.contains_key(&k) || lazy && self.mask(k).1;
@@ -1177,6 +1238,21 @@ impl<'a> Lanes<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Whether a join takes a value loaded from memory on some edge: data
+    /// that the other paths leave a stale lane mask in place of (a register
+    /// reused after a branch), so operations on it are no mask operations.
+    fn joins_loaded(&self, k: Key) -> bool {
+        [k.0, k.1].iter().any(|v| {
+            self.phis.get(v).is_some_and(|&(b, i)| {
+                self.p.blocks[b].phis[i].args.iter().any(|a| {
+                    self.defs.get(a).is_some_and(|&(db, di)| {
+                        matches!(self.p.blocks[db].insts[di].fields, Fields::Smem { .. })
+                    })
+                })
+            })
+        })
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
@@ -1334,6 +1410,74 @@ mod tests {
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
         assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn a_mask_spilled_to_a_vgpr_lane_comes_back_as_itself() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xD761_0001,
+                0x0001_0600, // v_writelane_b32 v1, s0, 3
+                0xD760_0005,
+                0x0001_0701, // v_readlane_b32 s5, v1, 3
+                0xBE86_3C05, // s_and_saveexec_b32 s6, s5
+                0xBF88_0001, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(0)).unwrap();
+        let restored = insts[3].write(Reg::S(5)).unwrap();
+        assert_eq!(s.restored.get(&restored), Some(&saved));
+        // Skipped exactly where the compare fails, as without the spill.
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        let cmp = insts[0].write(Reg::S(VCC)).unwrap();
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+        );
+    }
+
+    #[test]
+    fn data_loaded_where_a_mask_was_is_no_mask() {
+        // s1 holds a mask on one path and a loaded value on the other; the
+        // bit test after the join is data (wave32: `_b32` operations would
+        // otherwise read as mask operations).
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE81_036A, // s_mov_b32 s1, vcc_lo
+                0xBF06_8004, // s_cmp_eq_u32 s4, 0
+                0xBF85_0002, // s_cbranch_scc1 -> join
+                0xF400_0041,
+                0xFA00_0000, // s_load_dword s1, s[2:3], 0
+                0x8702_FF01,
+                0x0010_0000, // join: s_and_b32 s2, s1, 0x100000
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let join = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "s_and_b32"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[join] else {
+            panic!("{:?}", s.exits)
+        };
+        let scc = p.blocks[join].insts[1].write(Reg::Scc).unwrap();
+        assert_eq!(s.bools.support(when), vec![Atom::Uniform(scc)]);
     }
 
     #[test]

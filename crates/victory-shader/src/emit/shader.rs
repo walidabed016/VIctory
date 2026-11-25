@@ -48,6 +48,7 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -102,6 +103,10 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
+    /// Immediate samplers uniform control flow chooses between: handles
+    /// `a` and `b` and when `a` is taken. An operation on `a` runs on both,
+    /// and the result is chosen.
+    pub sampler_choices: Vec<(V, V, V)>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -166,6 +171,7 @@ impl Shader {
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
+            sampler_choices: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             view_strides: None,
@@ -213,7 +219,28 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
-        self.m.call(block, f, all)
+        let choice = self
+            .sampler_choices
+            .iter()
+            .copied()
+            .find(|&(a, _, _)| args.contains(&a));
+        let r = self.m.call(block, f, all.clone());
+        let Some((a, b, cond)) = choice else {
+            return r;
+        };
+        for x in &mut all {
+            if *x == a {
+                *x = b;
+            }
+        }
+        let other = self.m.call(block, f, all);
+        if ret == self.t.res_ret {
+            // Drivers miscompile a select of the result structure (AMD
+            // read zeros): its fields are chosen where they are read.
+            self.m.chosen.insert(r, (cond, other));
+            return r;
+        }
+        self.m.select(block, cond, r, other)
     }
 
     /// The handle of the user-data constant buffer, made in the entry block.
@@ -686,6 +713,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

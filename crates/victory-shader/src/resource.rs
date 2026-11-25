@@ -236,8 +236,15 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
-                // Intersections read no descriptor (see [`BVH`]).
-                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
+                Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
+                    if let Some(source) = t.bvh_descriptor(inst, rsrc).map_err(fail)? {
+                        out.descriptors.push(Descriptor {
+                            site,
+                            role: Role::Resource,
+                            source,
+                        });
+                    }
+                }
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -381,6 +388,39 @@ struct Tracer<'a> {
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
+
+/// Whether some lane can satisfy all of `known`. The search gives up (yes)
+/// on many large conditions, as the reach of blocks deep in a program is,
+/// before it gets to the branch conditions of the path, so those few small
+/// ones are tried alone first: if they cannot hold together, neither can
+/// all.
+fn meet(lanes: &Structured, known: &Known) -> bool {
+    let small: Known = known
+        .iter()
+        .copied()
+        .filter(|&(b, _)| few_atoms(&lanes.bools, b))
+        .collect();
+    (small.len() == known.len() || lanes.bools.meet(&small)) && lanes.bools.meet(known)
+}
+
+/// Whether `b` is a small condition: at most 4 atoms within 32 nodes.
+fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
+    let (mut atoms, mut stack, mut nodes) = (Vec::new(), vec![b], 0);
+    while let Some(x) = stack.pop() {
+        let Some((atom, lo, hi)) = bools.node(x) else {
+            continue;
+        };
+        nodes += 1;
+        if !atoms.contains(&atom) {
+            atoms.push(atom);
+        }
+        if nodes > 32 || atoms.len() > 4 {
+            return false;
+        }
+        stack.extend([lo, hi]);
+    }
+    true
+}
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
@@ -1254,10 +1294,17 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let words = (0..dwords)
+        let mut words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
+        // A byte access through a buffer descriptor made raw reads what the
+        // descriptor's view does with a raw host view.
+        if !inst.name().contains("format")
+            && let Some(raw) = self.made_raw(&words)
+        {
+            words = raw.to_vec();
+        }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.classify(&words, &mut Vec::new(), &mut known)
@@ -1509,6 +1556,76 @@ impl<'a> Tracer<'a> {
         Some((inst.read(Reg::Scc)?, set, clear))
     }
 
+    /// The descriptor of `image_bvh*_intersect_ray`: no view, but the BVH's
+    /// address over 256 (dword 0 and the low byte of dword 1) and flags (see
+    /// `emit`'s BVH lowering). Only the flags it emulates pass: box sorting,
+    /// no box growth, no node bound, triangles returning barycentrics. The
+    /// address is a [`Source::Built`] around a root parameter's when the code
+    /// shifted one into place (`s_lshr_b64 ..., 8`), else `None`: the nodes
+    /// are then at a raw GPU address.
+    fn bvh_descriptor(&self, inst: &Inst, op: &Operand) -> Result<Option<Source>, &'static str> {
+        const WHY: &str = "a BVH descriptor with other flags";
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return Err("a descriptor not in SGPRs");
+        };
+        let word = |k| {
+            inst.read(Reg::S(code + k))
+                .map(|v| self.origin(v))
+                .ok_or("a descriptor not in SGPRs")
+        };
+        let (Term::Const(w2), Term::Const(w3)) = (word(2)?, word(3)?) else {
+            return Err(WHY);
+        };
+        // Dword 1 holds address bits 32-39 under the flags: a constant, or
+        // the high half of the shift with the flags set.
+        let (high, flags) = match word(1)? {
+            Term::Const(c) => (None, c & !0xFF),
+            Term::Value(v) => match self.set_bits(v) {
+                Some((Term::Value(x), bits)) => (Some(x), bits),
+                _ => return Err(WHY),
+            },
+        };
+        // Bit 123 (dword 3 bit 27) is a page-size hint.
+        if flags != 0x8000_0000 || w2 != u32::MAX || w3 & !(1 << 27) != 0x8100_03FF {
+            return Err(WHY);
+        }
+        let shifted = match word(0)? {
+            Term::Value(lo) => self
+                .def(lo)
+                .filter(|s| s.name() == "s_lshr_b64" && s.writes.first().map(|w| w.1) == Some(lo)),
+            Term::Const(_) => None,
+        };
+        let Some(shift) = shifted else {
+            return if high.is_none() { Ok(None) } else { Err(WHY) };
+        };
+        let Fields::Sop { src, .. } = &shift.fields else {
+            return Err(WHY);
+        };
+        let pair = match (src.first(), src.get(1).and_then(|s| self.term(shift, s))) {
+            (Some(&Operand::Scalar { code, .. }), Some(Term::Const(8))) if code != NULL => {
+                let half = |k| shift.read(Reg::S(code + k)).map(|v| self.origin(v));
+                half(0).zip(half(1))
+            }
+            _ => None,
+        };
+        let (Some((lo, hi)), true) = (pair, high == shift.writes.get(1).map(|w| w.1)) else {
+            return Err(WHY);
+        };
+        let at = Sum {
+            base: None,
+            offset: 0,
+            dynamic: None,
+        };
+        match self.address(lo, hi, at) {
+            Ok(address) => Ok(Some(Source::Built {
+                address,
+                bits: flags,
+                words: [w2, w3],
+            })),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// `v` as some other dword with constant bits set.
     fn set_bits(&self, v: Value) -> Option<(Term, u32)> {
         if let Some((_, [x, Term::Const(bits)] | [Term::Const(bits), x])) =
@@ -1531,6 +1648,45 @@ impl<'a> Tracer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The words of a buffer descriptor that `words` makes raw, as the
+    /// FidelityFX upscaler's compiler does before byte accesses: the stride
+    /// (dword 1 bits 16-29) cleared, the record count times max(stride, 1),
+    /// out-of-bounds checking by bytes (dword 3 bits 28-29 set). The bounds
+    /// are then the view's size in bytes either way.
+    fn made_raw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `x op c` with `c` either side.
+        let with = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let d1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let Term::Value(m3) = with(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = with(m3, "s_and_b32", 0xCFFF_FFFF)?;
+        let [a, b] = self.sop2(w2, &["s_mul_i32"])?.1;
+        let max = |t: Term| match t {
+            Term::Value(s) => with(s, "s_max_u32", 1),
+            Term::Const(_) => None,
+        };
+        let (d2, field) = match (max(a), max(b)) {
+            (_, Some(f)) => (a, f),
+            (Some(f), None) => (b, f),
+            (None, None) => return None,
+        };
+        let Term::Value(field) = field else {
+            return None;
+        };
+        // s_bfe_u32: offset 16, width 14.
+        let (_, [x, Term::Const(0x000E_0010)]) = self.sop2(field, &["s_bfe_u32"])? else {
+            return None;
+        };
+        (x == d1).then_some([w0, d1, d2, d3])
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -1646,7 +1802,7 @@ impl<'a> Tracer<'a> {
         };
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
-        if lanes.bools.meet(&skips) {
+        if meet(lanes, &skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
@@ -1909,7 +2065,7 @@ impl<'a> Tracer<'a> {
             {
                 known.push((when, taken == block));
             }
-            let arg = if lanes.bools.meet(known) {
+            let arg = if meet(lanes, known) {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -2061,7 +2217,7 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        let meet = |conditions: &[(Bool, bool)]| self::meet(lanes, &conditions.to_vec());
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2261,7 +2417,7 @@ fn spilled<'p>(
 }
 
 /// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -2277,6 +2433,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
+    // immediate sampler's word.
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+        return Some(Moved::Const(((1u32 << w) - 1) << at));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2289,6 +2451,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // shortcut: a literal below 2^31, whose high dword is 0 whether the
+        // hardware extends it with zeros or with its sign.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
@@ -2597,6 +2764,75 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
+    }
+
+    /// The FidelityFX upscaler's byte accesses make a loaded buffer
+    /// descriptor raw first (stride cleared, records times stride, bounds
+    /// in bytes): the access reads the loaded descriptor. Any other change
+    /// still fails.
+    #[test]
+    fn a_descriptor_made_raw_is_the_loaded_one() {
+        let words = |mask: u32| -> Vec<u8> {
+            [
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x938C_FF09,
+                0x000E_0010, // s_bfe_u32 s12, s9, 0x000e0010
+                0x848C_810C, // s_max_u32 s12, s12, 1
+                0x8709_FF09,
+                mask, // s_and_b32 s9, s9, mask
+                0x870B_FF0B,
+                0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+                0x930A_0C0A, // s_mul_i32 s10, s10, s12
+                0x880B_FF0B,
+                0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect()
+        };
+        let run = |mask| {
+            let p = crate::ir::build(&words(mask), false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        assert!(run(0xC000_FFFF).is_ok());
+        assert_eq!(
+            run(0xC000_FFFE).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x3c,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    /// Immediate sampler words the upscaler's compiler makes with a bit
+    /// mask and a 64-bit move of a literal.
+    #[test]
+    fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
+        let code: Vec<u8> = [
+            0xB010_3092, // s_movk_i32 s16, 0x3092
+            0x9211_8C8C, // s_bfm_b32 s17, 12, 12
+            0xBE92_04FF,
+            0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let block = &p.blocks[0];
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
+        assert_eq!(value(2, 0), Term::Const(0x1850_0000));
+        assert_eq!(value(2, 1), Term::Const(0));
     }
 
     #[test]

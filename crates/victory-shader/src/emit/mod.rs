@@ -24,7 +24,9 @@
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host.
+//!   a heap sampler it uses must be a comparison sampler on the host. One
+//!   of two immediate samplers chosen by uniform control flow takes two
+//!   entries; the sampling runs with both and the result is chosen.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
@@ -87,8 +89,12 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. Global loads
+//!   from a root SRV read it raw. 64-bit texture atomics (two dwords per
+//!   value; added 2026-11-24) are SM 6.6's on typed heap resources: the
+//!   host's view must be `R32G32_UINT` (low dword in R) and the device must
+//!   report 64-bit atomics on typed resources (options 9) and on descriptor
+//!   heap resources (options 11), else the pipeline is refused.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -136,6 +142,8 @@ mod shader;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod typed_tests;
+#[cfg(all(test, windows))]
+mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -434,6 +442,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()

@@ -992,6 +992,9 @@ pub enum View<'a> {
     /// An RGBA32F texture SRV with levels (width, height, levels, texels of
     /// level 0, then 1...).
     Mips(u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F square texture SRV (size, levels) whose texels in level
+    /// `n` are all `n`.
+    Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// A raw buffer UAV holding these dwords.
@@ -1244,6 +1247,53 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
+                        keep.push(tex);
+                    }
+                    View::Levels(w, levels) => {
+                        let mut desc = texture(w, w, D3D12_RESOURCE_FLAG_NONE);
+                        desc.MipLevels = levels as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for level in 0..levels {
+                            let n = (w >> level).max(1);
+                            let pitch = (n as usize * 16).next_multiple_of(256);
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * n as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            let row = vec![[level as f32; 4]; n as usize];
+                            for y in 0..n as usize {
+                                std::ptr::copy_nonoverlapping(
+                                    row.as_ptr().cast::<u8>(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    row.len() * 16,
+                                );
+                            }
+                            upload.Unmap(0, None);
+                            let mut at_level = subresource(&tex);
+                            at_level.Anonymous.SubresourceIndex = level;
+                            list.CopyTextureRegion(
+                                &at_level,
+                                0,
+                                0,
+                                0,
+                                &footprint(&upload, n, n),
+                                None,
+                            );
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
                     View::RawUav(_)

@@ -69,6 +69,14 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
+it with the PC build on your GPU instead of the console build, get the
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
+`Kits/FidelityFX/signedbin` folder, which holds
+`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
+upscaler for your GPU (the log says so), the title's own DLLs run.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.

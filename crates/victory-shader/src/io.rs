@@ -187,8 +187,11 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// Compute and pixel: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs);
+    /// pixel: the user SGPRs, at least the 8 ABI slots and up to the last
+    /// root parameter's, then the primitive mask and the ordered-section
+    /// (POPS) collision id, as every pixel program of the title reads them).
     pub initialized_sgprs: Option<u8>,
 }
 
@@ -297,6 +300,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { .. } => {
+                let user = native
+                    .layout
+                    .iter()
+                    .map(|r| u32::from(r.user_data) + r.sgprs)
+                    .max();
+                Some(user.unwrap_or(0).clamp(8, 104) as u8 + 2)
+            }
             _ => None,
         },
         ..Io::default()

@@ -532,6 +532,27 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store2(8 * n, uint2(uint(q >> 7) ^ z, uint(w >> (n & 15))));
         }"#,
     ),
+    // Shared memory of 16-bit values: halves of dwords read zero- or
+    // sign-extended or into a register's high half, and written beside
+    // other lanes' halves of the same dword.
+    (
+        "16-bit shared memory",
+        r#"groupshared uint16_t sh[64];
+        groupshared int16_t si[64];
+        groupshared half hh[64];
+        CS {
+            uint n = d.y * 16 + d.x;
+            uint x = raw.Load(4 * (i & 31));
+            sh[i] = uint16_t(x >> 3);
+            si[63 - i] = int16_t(x);
+            hh[i ^ 5] = half(float(x & 255) * k.x);
+            GroupMemoryBarrierWithGroupSync();
+            uint a = sh[(i + 7) & 63];
+            int b = si[(i * 5) & 63];
+            half2 h = half2(hh[(i + 1) & 63], hh[(i + 2) & 63]) * half(k.y);
+            outb.Store4(16 * n, uint4(a, asuint(b), asuint(float(h.x)), asuint(float(h.y))));
+        }"#,
+    ),
 ];
 
 const MS_COMMON: &str = r#"
@@ -625,6 +646,31 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
             uint cc = i / 2 % 8 + i / 16 * 9;
             tris[i] = i & 1 ? uint3(cc + 1, cc + 10, cc + 9) : uint3(cc, cc + 1, cc + 9);
+        }"#,
+    ),
+    // Wave operations the console compiler expands: a loop serving each
+    // distinct value once (`WaveActiveMin`) and a uniformity test (a mask's
+    // bit count). Each lane's result is its own value's on any wave.
+    (
+        "wave minimum and uniformity",
+        1,
+        r#"MS_ATTR [numthreads(128, 1, 1)]
+        void ms(uint i : SV_GroupIndex, out vertices V verts[128], out indices uint3 tris[128]) {
+            SetMeshOutputCounts(128, 128);
+            uint key = (i * 7 + uint(k.w)) % 5;
+            float acc = 0;
+            [loop] for (;;) {
+                uint m = WaveActiveMin(key);
+                if (m == key) { acc = m * k.x + 0.25; break; }
+            }
+            uint idx = (i >> 4) & 1;
+            float u = WaveActiveAllEqual(idx) ? k.y * WaveReadLaneFirst(idx) : k.y * idx;
+            float2 p = float2(i % 9, i / 9) / 8.0;
+            verts[i].pos = float4(p * 2 - 1, 0.5, 1);
+            verts[i].col = float4(acc, u, p.y, 1);
+            verts[i].uv = float2(i, k.y);
+            uint c = i / 2 % 8 + i / 16 * 9;
+            tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
     // Vertices and indices written by other threads than their lanes: the
