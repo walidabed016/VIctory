@@ -2603,9 +2603,10 @@ pub(crate) struct Compare {
     /// Where the compare notes the range's blocks in [`NOTES`]: the GPU
     /// address and index of the first one's word.
     notes: Option<(u64, usize)>,
-    /// The bit of the range's first word in [`CHANGED`]; none where
-    /// copy-back is not told by word.
-    words: Option<usize>,
+    /// Where the compare marks the range's words in [`CHANGED`]: the GPU
+    /// address of the slot's bitmap and the bit of the range's first word;
+    /// none where copy-back is not told by word or the slot has no bitmap.
+    words: Option<(u64, usize)>,
 }
 
 /// Where the compare notes the 64 KiB blocks of title memory it found a
@@ -2814,7 +2815,7 @@ pub(crate) fn snapshot_twins(
             notes: notes.map(|gpu| (gpu + 4 * word as u64, word)),
             words: told
                 .filter(|_| back[of].0.told_by_words())
-                .map(|_| at as usize / 4),
+                .map(|gpu| (gpu, at as usize / 4)),
         });
         at += bytes.next_multiple_of(256);
         word += blocks(title, bytes);
@@ -2949,7 +2950,7 @@ impl Told {
 pub(crate) fn told(compares: Option<&[Compare]>, copies: usize, slot: usize) -> Told {
     let mut ranges = vec![Vec::new(); copies];
     for c in compares.into_iter().flatten() {
-        if let Some(bit) = c.words {
+        if let Some((_, bit)) = c.words {
             ranges[c.of].push((c.title, c.bytes as usize, bit));
         }
     }
@@ -3031,39 +3032,32 @@ pub(crate) fn compare_twins(
         list.SetComputeRootSignature(root);
         list.SetPipelineState(pipeline);
     }
-    let changed = CHANGED[slot].lock().unwrap_or_else(|e| e.into_inner());
-    let bits = changed.as_ref().map(|c| c.gpu);
     let mut bytes = 0;
     for c in compares {
         let groups = c.bytes.div_ceil(1024).min(65535) as u32;
         let first = (c.title % PAGE) as u32;
-        let words = c.words.filter(|_| bits.is_some());
         let constants = [
             c.bytes as u32,
             groups,
             first,
             c.notes.is_some().into(),
-            words.unwrap_or(0) as u32,
-            words.is_some().into(),
+            c.words.map_or(0, |w| w.1) as u32,
+            c.words.is_some().into(),
         ];
         // SAFETY: an open list; the addresses hold the range, the twin's and
         // the kept bytes in VRAM, its blocks' notes and its words' bits
-        // (unused without).
+        // (the host copy's, unused, without).
         unsafe {
             list.SetComputeRootShaderResourceView(0, c.twin);
             list.SetComputeRootShaderResourceView(1, c.kept);
             list.SetComputeRootUnorderedAccessView(2, c.host);
             list.SetComputeRootUnorderedAccessView(3, c.notes.map_or(c.host, |n| n.0));
             list.SetComputeRoot32BitConstants(4, 6, constants.as_ptr().cast(), 0);
-            list.SetComputeRootUnorderedAccessView(
-                5,
-                bits.filter(|_| words.is_some()).unwrap_or(c.host),
-            );
+            list.SetComputeRootUnorderedAccessView(5, c.words.map_or(c.host, |w| w.0));
             list.Dispatch(groups, 1, 1);
         }
         bytes += c.bytes;
     }
-    drop(changed);
     // The notes come down for copy-back.
     if compares.iter().any(|c| c.notes.is_some())
         && let Some(n) = NOTES[slot]
@@ -3092,7 +3086,11 @@ pub(crate) fn compare_twins(
 /// in its first) the KiB has a changed word in, once per KiB and block.
 /// With `wording` it marks each changed word's bit in `words` (`wordbase`:
 /// the bit of the range's first word, a multiple of 64), storing the KiB's
-/// eight bitmap words, those not zero (copy-back clears them).
+/// eight bitmap words, those not zero (copy-back clears them). fxc's `&&`
+/// evaluates both sides, so every lane reads `seen` and `bits` in the
+/// conditions on them: at its index masked into them, since a lane past
+/// them would read past the group's memory, which faults where the driver
+/// reports shader errors.
 const COMPARE: &str = r#"
 #define RS "SRV(t0), SRV(t1), UAV(u0), UAV(u1), RootConstants(num32BitConstants=6, b0), UAV(u2)"
 cbuffer Range : register(b0) {
@@ -3125,9 +3123,9 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
             }
         }
         GroupMemoryBarrierWithGroupSync();
-        if (noting != 0 && lane < 2 && seen[lane] != 0) notes.Store((block + lane) * 4, 1);
-        if (wording != 0 && lane < 8 && bits[lane] != 0)
-            words.Store(((wordbase + (base >> 2)) >> 5) * 4 + lane * 4, bits[lane]);
+        if (noting != 0 && lane < 2 && seen[lane & 1] != 0) notes.Store((block + lane) * 4, 1);
+        if (wording != 0 && lane < 8 && bits[lane & 7] != 0)
+            words.Store(((wordbase + (base >> 2)) >> 5) * 4 + lane * 4, bits[lane & 7]);
     }
 }
 "#;
@@ -5411,6 +5409,89 @@ pub(crate) mod tests {
         release(at);
     }
 
+    /// Of one compare list, a range told by word marks the bits of the words
+    /// shaders changed, and a range with no bitmap (its copy or window not
+    /// told by word, or its slot given no memory for one) stores its changed
+    /// words and no bits: none in the bitmap, none through the host copy
+    /// bound in its place. Each range's first KiB changes whole, so every
+    /// lane of a group passes the compare's conditions on its bits.
+    #[test]
+    fn a_range_with_no_bitmap_stores_no_bits() {
+        let _serial = crate::watch::serial();
+        if !gpu() || compare_pipeline().is_none() {
+            return;
+        }
+        let host = host().unwrap();
+        const LEN: usize = 64 << 10;
+        let (twin, kept) = (
+            vram_buffer(2 * LEN as u64).unwrap(),
+            vram_buffer(2 * LEN as u64).unwrap(),
+        );
+        let (out, got) = host.shared_buffer(2 * LEN as u64).unwrap();
+        let (bitmap, marks) = host.shared_buffer(LEN as u64).unwrap();
+        let (source, data) = host.shared_buffer(2 * LEN as u64).unwrap();
+        let changed = |i: usize| i % (LEN / 4) < 256 || i.is_multiple_of(61);
+        let fill = |to: &ID3D12Resource, f: &dyn Fn(usize) -> u32| {
+            for i in 0..2 * LEN / 4 {
+                // SAFETY: inside the mapped buffer.
+                unsafe { data.cast::<u32>().add(i).write(f(i)) };
+            }
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list; live buffers holding the range.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(to, 0, &source, 0, 2 * LEN as u64)
+            };
+            list.close();
+            host.execute(&[&list]);
+            crate::pipelined::wait_all();
+        };
+        fill(&kept, &|i| i as u32);
+        fill(&twin, &|i| if changed(i) { !(i as u32) } else { i as u32 });
+        // SAFETY: the mapped buffers.
+        unsafe {
+            std::ptr::write_bytes(got, 0, 2 * LEN);
+            std::ptr::write_bytes(marks, 0, LEN);
+        }
+        // SAFETY: live buffers.
+        let gpu = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let range = |at: usize, words| Compare {
+            twin: gpu(&twin) + at as u64,
+            kept: gpu(&kept) + at as u64,
+            host: gpu(&out) + at as u64,
+            bytes: LEN as u64,
+            title: at,
+            of: 0,
+            notes: None,
+            words,
+        };
+        let compares = [range(0, Some((gpu(&bitmap), 0))), range(LEN, None)];
+        let list = host.new_list().unwrap();
+        assert_eq!(compare_twins(&list.list, &compares, 0), 2 * LEN as u64);
+        list.close();
+        host.execute(&[&list]);
+        crate::pipelined::wait_all();
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        // SAFETY: the mapped buffers, which the finished compare wrote.
+        let (words, bits) = unsafe {
+            (
+                std::slice::from_raw_parts(got.cast::<u32>(), 2 * LEN / 4),
+                std::slice::from_raw_parts(marks.cast::<u32>(), LEN / 4),
+            )
+        };
+        for (i, &word) in words.iter().enumerate() {
+            assert_eq!(word, if changed(i) { !(i as u32) } else { 0 }, "word {i}");
+        }
+        for i in 0..LEN / 4 {
+            assert_eq!(bits_at(bits, i) & 1 != 0, changed(i), "word {i}'s bit");
+        }
+        assert!(
+            bits[LEN / 128..].iter().all(|&b| b == 0),
+            "bits past the range told by word"
+        );
+    }
+
     /// The title releases a copy whose twin has yet to take what copy-back
     /// gave its host copy: the next submission's upload keeps both buffers
     /// until it has run (they went with the copy's last reference, and the
@@ -5717,7 +5798,7 @@ pub(crate) mod tests {
                         (gpu, 0)
                     }),
                     words: wording
-                        .then(|| super::changed(LEN / 128, 0).map(|_| 0))
+                        .then(|| super::changed(LEN / 128, 0).map(|gpu| (gpu, 0)))
                         .flatten(),
                 };
                 let took = best(&|l| _ = compare_twins(l, std::slice::from_ref(&c), 0));
