@@ -521,10 +521,14 @@ static DEPTH_UAVS: std::sync::Mutex<std::collections::BTreeSet<(String, usize, b
 /// writes in a listed frame, and whether the texture has an unordered twin
 /// (without one, the host view goes to the depth texture itself).
 #[cfg(feature = "diagnostics")]
-pub(crate) fn note_depth_unordered(resource: crate::object::This) {
+pub(crate) fn note_depth_unordered(view: &crate::descriptor::View) {
+    let crate::descriptor::View::Unordered(resource, _, words) = *view else {
+        return;
+    };
     if !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
+    let resource = resource as crate::object::This;
     const ALLOW_DEPTH_STENCIL: i32 = 0x2;
     let Some(texture) = crate::resource::host_resource(resource) else {
         return;
@@ -540,8 +544,12 @@ pub(crate) fn note_depth_unordered(resource: crate::object::This) {
         .map(|p| crate::host::named(&p.name).to_string())
         .unwrap_or_default();
     let description = format!(
-        "{}x{} f{} flags {:#x}",
-        d.Width, d.Height, d.Format.0, d.Flags.0
+        "{}x{} f{} flags {:#x}, view {:?}",
+        d.Width,
+        d.Height,
+        d.Format.0,
+        d.Flags.0,
+        words.map(|w| [w[0], w[1], w[2], w[3]])
     );
     DEPTH_UAVS
         .lock()

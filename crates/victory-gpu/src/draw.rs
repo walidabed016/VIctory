@@ -1433,9 +1433,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
-            let mut resource = *resource as This;
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_depth_unordered(resource);
+            crate::capture::note_depth_unordered(view);
+            let mut resource = *resource as This;
             crate::resource::alias::gpu_wrote(list, resource);
             // A depth texture's twin starts as the texture is.
             if let Some(twin) = crate::resource::unordered_twin(resource)
