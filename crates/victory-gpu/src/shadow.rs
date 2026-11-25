@@ -863,7 +863,9 @@ impl Shadow {
             // title's bytes in turn. Only the words the GPU changed go back:
             // the title writes the piece while we compare it, and writing it
             // whole put the bytes we read back over those writes.
-            let (mut runs, mut taken): (Vec<(usize, usize)>, bool) = (Vec::new(), false);
+            // The GPU's runs, and the span of the words the copy takes.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut taken: Option<(usize, usize)> = None;
             let words = title
                 .chunks_mut(4)
                 .zip(host.chunks_mut(4))
@@ -876,9 +878,11 @@ impl Shadow {
                         gpu = true;
                     }
                 }
-                taken |= *h != *t;
-                h.copy_from_slice(t);
                 let (a, b) = (4 * k, 4 * k + t.len());
+                if *h != *t {
+                    taken = Some((taken.map_or(a, |s| s.0), b));
+                }
+                h.copy_from_slice(t);
                 match runs.last_mut() {
                     Some(run) if gpu && run.1 == a => run.1 = b,
                     _ if gpu => runs.push((a, b)),
@@ -921,11 +925,13 @@ impl Shadow {
                 );
             }
             synced.push(i);
-            if taken && self.twin.is_some() {
+            if let Some((a, b)) = taken
+                && self.twin.is_some()
+            {
                 self.dirty
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push((start + at, start + at + n));
+                    .push((start + at + a, start + at + b));
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -1723,6 +1729,7 @@ impl Mirror {
             cold.sort_unstable();
             for (_, w) in cold.into_iter().take(over) {
                 if let Some((heap, slot, _)) = self.twinned.remove(&w) {
+                    crate::host::TWINS[6].fetch_add(1, Ordering::Relaxed);
                     self.vram_free.push((heap, slot));
                     for k in self.twin_slabs(w) {
                         self.retile.push((k, w, None));
@@ -1962,10 +1969,14 @@ pub(crate) fn upload_twins(list: &ID3D12GraphicsCommandList) -> u64 {
             _ => runs.push((k, a, b)),
         }
     }
+    let mut whole = 0;
     for (k, a, b) in runs {
         let (Some(&(vh, vs, _)), Some(&(h, s))) = (m.twinned.get(&k), m.windows.get(&k)) else {
             continue;
         };
+        if fresh.contains(&k) {
+            whole += (b - a) as u64;
+        }
         // SAFETY: an open list; the pool buffers hold both windows' slots.
         unsafe {
             list.CopyBufferRegion(
@@ -1978,6 +1989,7 @@ pub(crate) fn upload_twins(list: &ID3D12GraphicsCommandList) -> u64 {
         };
         bytes += (b - a) as u64;
     }
+    crate::host::TWINS[5].fetch_add(whole, Ordering::Relaxed);
     bytes
 }
 
