@@ -796,8 +796,17 @@ pub(crate) fn arm(
     end: usize,
     copied: impl Fn(usize) -> u64,
 ) -> (u64, Vec<(usize, usize)>) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::cost(
+        crate::copystat::Op::ArmWait,
+        started,
+        start,
+        (end - start) as u64,
+    );
     let (first, last) = (start.div_ceil(BLOCK), end / BLOCK);
     let mut armed = Vec::new();
     for (a, b) in g.clean.within(first, last.max(first)) {
@@ -851,6 +860,13 @@ pub(crate) fn arm(
     if at < end.div_ceil(BLOCK) {
         loose.push((at, end.div_ceil(BLOCK)));
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::cost(
+        crate::copystat::Op::Arm,
+        started,
+        start,
+        (end - start) as u64,
+    );
     (j.asked, loose)
 }
 

@@ -225,8 +225,13 @@ pub(crate) enum Op {
     /// Bytes of copies shaders wrote left to the title: nothing told what
     /// they held before.
     Missed,
+    /// Armings of title memory for a submission (bytes: the ranges), the
+    /// waits for the journal and the guards included.
+    Arm,
+    /// Of those, the waits for the journal and the guards.
+    ArmWait,
 }
-const OPS: usize = 14;
+const OPS: usize = 16;
 const OP_NAMES: [&str; OPS] = [
     "asks",
     "asks finding writes",
@@ -242,6 +247,8 @@ const OP_NAMES: [&str; OPS] = [
     "writes back",
     "saves on write",
     "left to the title",
+    "arms",
+    "arm waits",
 ];
 
 /// Calls, microseconds and bytes per caller and operation, since the last
