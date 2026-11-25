@@ -25,8 +25,8 @@
 //! the title reads what shaders wrote, with nothing to refresh, watch or
 //! copy back. The world's big buffers, copied, cost ~1 s per frame
 //! (dozens of overlapping 174 MB ranges per submission).
-//! `VICTORY_COPY_TITLE_MEMORY=1` turns this off. With VRAM twins, those of
-//! at least [`IN_PLACE_TWIN_MIN`] bytes get one ([`in_place_twins_on`]).
+//! `VICTORY_COPY_TITLE_MEMORY=1` turns this off. With VRAM twins, each
+//! gets one ([`in_place_twins_on`]).
 //!
 //! Title memory outside buffers (loose memory) has one host copy, the
 //! mirror ([`mirror`]): reserved buffers ("slabs") of [`SLAB`] bytes of
@@ -1344,10 +1344,7 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
         crate::host::name(&buffer, || {
             format!("title memory in place {start:#x}+{len:#x}")
         });
-        let twin = (twins_on()
-            && twin_compare_on()
-            && in_place_twins_on()
-            && len as u64 >= IN_PLACE_TWIN_MIN)
+        let twin = (twins_on() && twin_compare_on() && in_place_twins_on())
             .then(|| vram_buffer(len as u64))
             .flatten();
         if let Some(twin) = &twin {
@@ -1465,22 +1462,22 @@ fn written_at(address: u64) -> Option<Arc<Shadow>> {
 /// each heap opened locks its pages.
 pub(crate) const IN_PLACE_MIN: u64 = 1 << 20;
 
-/// The smallest title buffer used in place that gets a VRAM twin
-/// ([`in_place_twins_on`]): run 79's hair strands write two, of 90 and 24
-/// MiB. Smaller ones stay without, so the title's writes into those it
-/// rewrites each frame cost no guard faults or uploads.
-const IN_PLACE_TWIN_MIN: u64 = 16 << 20;
-
-/// Whether title buffers used in place of at least [`IN_PLACE_TWIN_MIN`]
-/// bytes get VRAM twins: shaders reach title memory in place at system
-/// memory's speed (run 79's hair strands: ~90 ms of GPU a frame, most of
-/// it their stores). The twin takes the pages the title writes before each
-/// submission ([`Shadow::update`]), and after it the compare stores the
-/// words shaders changed into title memory itself ([`compare_twins`]), so
-/// copy-back has nothing to write. Only with the compare: copied down whole
-/// ([`download_twins`]), the twin's ranges put back over title memory what
-/// the title wrote there while the submission ran, as they still do in a
-/// submission whose ranges pass [`KEEP_MAX`] or the VRAM the host gives.
+/// Whether title buffers used in place get VRAM twins: shaders reach title
+/// memory in place at system memory's speed (run 79: the hair strands'
+/// ~90 ms of GPU a frame, most of it their stores; the light clusters'
+/// bits, ~17 ms with their clear and the light proxies' atomic ORs;
+/// hair_resolve's reads, 7 ms). Buffers shaders only read get one too,
+/// since the first use cannot tell. The twin takes the pages the title
+/// writes before each submission ([`Shadow::update`]), and after it the
+/// compare stores the words shaders changed into title memory itself
+/// ([`compare_twins`]), so copy-back has nothing to write. Like a copy, a
+/// twin holds only what refreshes took: ranges no draw is known to read
+/// (heap slots only shaders index) keep what was last taken, where title
+/// memory in place showed the title's latest. Only with the compare:
+/// copied down whole ([`download_twins`]), the twin's ranges put back over
+/// title memory what the title wrote there while the submission ran, as
+/// they still do in a submission whose ranges pass [`KEEP_MAX`] or the VRAM
+/// the host gives.
 /// `VICTORY_NO_IN_PLACE_TWINS` turns it off.
 fn in_place_twins_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
