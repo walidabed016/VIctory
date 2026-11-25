@@ -88,6 +88,7 @@ fn lowered(words: &[u32], more: &[UsedResource]) -> Result<lower::Lowered, crate
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        psv: None,
     })
 }
 

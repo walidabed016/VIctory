@@ -81,6 +81,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The container's `PSV0` part, where it has one.
+    pub psv: Option<&'a [u8]>,
 }
 
 enum Stop {
@@ -5099,11 +5101,34 @@ impl<'a> Lower<'a> {
         let size_only = count == 8
             && super::size_only_textures()
             && used.is_none_or(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav));
+        // A buffer the code only counts the records of: an exact statically
+        // addressed four-dword binding of a structured buffer the container
+        // declares, never the nearest earlier entry or a dynamically indexed
+        // range.
+        let counted = used.filter(|b| {
+            found.is_none()
+                && count == 4
+                && super::counted_buffers()
+                && self.scalar.get(&site).is_some_and(|a| {
+                    a.dynamic.is_none() && b.table_offset_dwords.checked_mul(4) == Some(a.offset)
+                })
+                && b.dwords == 4
+                && matches!(b.kind, ResourceType::Srv | ResourceType::Uav)
+                && (4..=2048).contains(&b.stride)
+                && b.stride.is_multiple_of(4)
+                && self.x.psv.is_some_and(|part| {
+                    super::declares_structured_buffer(
+                        part,
+                        b.lower_bound,
+                        b.kind == ResourceType::Uav,
+                    )
+                })
+        });
         let bases = &self.x.res.bvh_bases;
         let bvh = inst.writes.iter().any(|w| bases.contains(&w.1));
         let ui = match found {
             Some((at, _)) => Some(&self.x.p.blocks[at.0].insts[at.1]),
-            None if size_only && !bvh => None,
+            None if (size_only || counted.is_some()) && !bvh => None,
             None => {
                 const DATA: Why = "a descriptor read only as data";
                 if !bvh {
@@ -5130,6 +5155,11 @@ impl<'a> Lower<'a> {
         // stride or the view's own, past the host raw view's lead.
         let mut records = None;
         let (props, image) = match ui.map(|i| &i.fields) {
+            // Its count is of the host raw view's records past the lead.
+            None if counted.is_some() => {
+                records = Some(counted.map(|b| b.stride));
+                ((11 | u, 0), None)
+            }
             None => ((2 | u, 0x409), Some(2)),
             Some(Fields::Image { dim, .. }) => {
                 let kind = match dim {
@@ -11073,6 +11103,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            psv: None,
         })
         .map(|_| ())
     }
@@ -11123,6 +11154,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            psv: None,
         })
     }
 
@@ -11226,6 +11258,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            psv: None,
         }).unwrap();
 
         let container =
@@ -11653,6 +11686,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            psv: None,
         })
         .map(|_| ())
     }
@@ -11833,6 +11867,7 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                psv: None,
             })
             .unwrap();
         }
@@ -11895,6 +11930,7 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                psv: None,
             })
             .unwrap();
         }

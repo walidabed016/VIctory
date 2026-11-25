@@ -300,6 +300,16 @@ pub fn f64_sums() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_F64_SUMS").is_none())
 }
 
+/// Whether a structured buffer's descriptor the code only reads the record
+/// count of (no access names it) is a raw view of the binding the container
+/// declares there (Belobug 02564c5); refused otherwise. On unless
+/// `VICTORY_NO_COUNTED_BUFFERS` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn counted_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_COUNTED_BUFFERS").is_none())
+}
+
 /// Whether a join's value with no DXIL form on an edge (a stale lane mask)
 /// may stand where every read of it a lane from that edge could reach lies
 /// behind a flag that edge clears, when a later loop takes the value back
@@ -590,6 +600,7 @@ pub fn emit_with_waves(
         outputs,
         prims,
         mesh_stride,
+        psv: c.part(FourCC::PSV0).map(|p| p.data),
     })?;
     let shader = HostShader {
         stage: native.stage,
@@ -631,6 +642,40 @@ fn default_interp(e: &container::SigElement) -> u8 {
         (0, _) => 1,
         _ => 0,
     }
+}
+
+/// Whether `PSV0` part `part` declares a structured buffer (without a
+/// counter) at `register` of the UAVs (`uav`) or SRVs, and nothing else
+/// there of that class in any space: the native binding map gives a
+/// register but no space.
+fn declares_structured_buffer(part: &[u8], register: u32, uav: bool) -> bool {
+    use crate::dxbc::u32_at;
+    let entries = || {
+        let info = u32_at(part, 0).ok()? as usize;
+        let header = part.get(4..)?.get(info..)?;
+        let count = u32_at(header, 0).ok()? as usize;
+        let stride = u32_at(header, 4).ok()? as usize;
+        if stride < 16 {
+            return None;
+        }
+        let table = header.get(8..)?.get(..count.checked_mul(stride)?)?;
+        Some(table.chunks_exact(stride))
+    };
+    let Some(entries) = entries() else {
+        return false;
+    };
+    let (class, structured) = if uav { (6..=9, 8) } else { (3..=5, 5) };
+    let mut found = false;
+    for e in entries {
+        let word = |k: usize| u32_at(e, 4 * k).unwrap_or(u32::MAX);
+        if class.contains(&word(0)) && (word(2)..=word(3)).contains(&register) {
+            if word(0) != structured {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

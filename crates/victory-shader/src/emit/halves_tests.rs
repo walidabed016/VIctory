@@ -176,6 +176,7 @@ fn lower64(words: &[u32], threads: [u32; 3], lds: u32) -> lower::Lowered {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        psv: None,
     })
     .expect("lower")
 }

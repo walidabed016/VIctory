@@ -79,6 +79,7 @@ fn lower_cs(words: &[u32], buffers: bool) -> (HostShader, u32, bool) {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        psv: None,
     })
     .expect("lower");
     let (nonuniform_handles, wave_ops) = (lowered.nonuniform_handles, lowered.wave_ops);

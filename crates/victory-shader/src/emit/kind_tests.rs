@@ -67,6 +67,7 @@ fn build(words: &[u32]) -> (HostShader, HeapIndices) {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        psv: None,
     })
     .expect("lower");
     assert!(lowered.view_strides, "the slot's kind is read at run time");

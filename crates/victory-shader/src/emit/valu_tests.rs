@@ -151,6 +151,7 @@ fn build_cs(body: &[u32], lds_granules: u32, threads: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        psv: None,
     })
     .expect("lower");
 

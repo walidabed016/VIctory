@@ -26,6 +26,11 @@ fn build(words: &[u32]) -> HostShader {
 
 /// [`build`] with `more` used-resource entries in the table.
 fn build_with(words: &[u32], more: &[UsedResource]) -> HostShader {
+    build_declared(words, more, None)
+}
+
+/// [`build_with`] with the container's `PSV0` part `psv`.
+fn build_declared(words: &[u32], more: &[UsedResource], psv: Option<&[u8]>) -> HostShader {
     let param = |root, user_data: u8| RootParam {
         root,
         table_offset_dwords: 0,
@@ -72,6 +77,7 @@ fn build_with(words: &[u32], more: &[UsedResource]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        psv,
     })
     .expect("lower");
     let shader = HostShader {
@@ -397,6 +403,91 @@ fn a_structured_views_record_count_read_from_its_descriptor_counts_its_records()
                     "{label} {stride}+{lead}: got {:?}, want {want:?}",
                     uavs[0]
                 ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Each lane stores dword 2 of the descriptor of the structured buffer at
+/// table entry 1, which no access names: its record count, as code that
+/// tests whether the buffer has any (`GetDimensions`) reads it.
+const RECORD_COUNT: &[u32] = &[
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0xF408_0203,
+    0xFA00_0020, // s_load_dwordx4 s[8:11], s[6:7], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_020A, // v_mov_b32 v1, s10
+    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+    0xE070_1000,
+    0x8003_0103, // buffer_store_dword v1, v3, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `PSV0` of a compute program of [`LANES`] threads declaring `bindings`
+/// (PSV kind, register).
+fn declared(bindings: &[(u32, u32)]) -> Vec<u8> {
+    let bindings: Vec<super::container::Binding> = bindings
+        .iter()
+        .map(|&(kind, register)| super::container::Binding {
+            kind,
+            space: 0,
+            register,
+            dxil_kind: if kind == 5 { 12 } else { 10 },
+        })
+        .collect();
+    super::container::psv(&super::container::Psv {
+        stage: 5,
+        flag: false,
+        inputs: &[],
+        outputs: &[],
+        prims: &[],
+        mesh: None,
+        geometry: None,
+        dependencies: None,
+        bindings: &bindings,
+        threads: [LANES, 1, 1],
+        wave_size: None,
+    })
+}
+
+#[test]
+fn a_structured_buffer_only_counted_counts_its_records() {
+    const RECORDS: u32 = 5;
+    // Only a structured buffer alone at its register is one.
+    assert!(!super::declares_structured_buffer(
+        &declared(&[(5, 0), (3, 0)]),
+        0,
+        false
+    ));
+    for (kind, register, uav) in [(5, 1, false), (5, 0, true)] {
+        let psv = declared(&[(kind, register)]);
+        assert!(!super::declares_structured_buffer(&psv, 0, uav));
+    }
+    let psv = declared(&[(5, 0)]);
+    let mut failed = Vec::new();
+    for [stride, lead] in [[12, 0], [16, 0], [64, 12]] {
+        let shader = build_declared(RECORD_COUNT, &[structured(stride)], Some(&psv));
+        let data: Vec<u32> = (0..(lead + RECORDS * stride) / 4)
+            .map(|i| 1000 + i)
+            .collect();
+        let views = [
+            View::RawUav(LANES),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ];
+        let records = [
+            [4, 0, view_kind::RAW_UAV],
+            [stride, lead, view_kind::RAW_SRV],
+        ];
+        for (label, uavs) in run(&shader, &views, &records) {
+            if uavs[0] != vec![RECORDS; LANES as usize] {
+                failed.push(format!("{label} {stride}+{lead}: got {:?}", uavs[0]));
             }
         }
     }
