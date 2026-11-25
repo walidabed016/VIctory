@@ -245,6 +245,12 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    #[cfg(windows)]
+    if crate::pipelined::on()
+        && let Some(host) = host_list(this)
+    {
+        crate::pipelined::wait_list(std::ptr::from_ref(host) as usize);
+    }
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -262,7 +268,12 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
+    // Every submission of the list has run (submissions are waited for;
+    // pipelined, waited for here).
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        crate::pipelined::wait_list(std::ptr::from_ref(host) as usize);
+    }
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();

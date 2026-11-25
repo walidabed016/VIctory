@@ -38,6 +38,7 @@ mod indirect;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+mod pipelined;
 #[cfg(feature = "diagnostics")]
 mod pipelining;
 #[cfg(windows)]

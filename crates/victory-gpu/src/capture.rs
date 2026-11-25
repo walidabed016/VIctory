@@ -371,6 +371,7 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
+    crate::pipelined::wait_all();
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();

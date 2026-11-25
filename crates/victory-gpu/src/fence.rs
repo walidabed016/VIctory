@@ -82,7 +82,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
@@ -109,6 +109,10 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        drop(waiters);
+        if crate::pipelined::wait_signal(this, value) {
+            return S_OK;
+        }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");

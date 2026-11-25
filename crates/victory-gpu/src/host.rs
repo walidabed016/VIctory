@@ -453,7 +453,7 @@ pub(crate) fn dred_on() -> bool {
 /// `VICTORY_D3D12_DRED` on). Lists are submitted as without timing; only
 /// the copies into and out of VRAM twins are waited for on their own.
 #[cfg(feature = "diagnostics")]
-fn timing() -> bool {
+pub(crate) fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
@@ -775,6 +775,89 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+impl Step {
+    /// Pipelined (WAL-17): before the step, waits for the submissions in
+    /// flight whose memory it touches: what their shaders write (copied
+    /// back when they complete), and for a title copy, which the GPU would
+    /// do after them, also what they read. Refreshes wait in
+    /// [`Batch::flush`]; host work writes the list's own memory.
+    fn wait_in_flight(&self) {
+        if !crate::pipelined::on() {
+            return;
+        }
+        match self {
+            &Step::Copy(dst, src, len) => {
+                crate::pipelined::wait_writes(src, src + len);
+                crate::pipelined::wait_reads(dst, dst + len);
+            }
+            &Step::Fill(_, src, len) => crate::pipelined::wait_writes(src, src + len),
+            Step::Run(_) => crate::pipelined::wait_all(),
+            &Step::GpuWrite(_, address, len) => {
+                // Its snapshot is taken now, on the CPU.
+                crate::pipelined::wait_writes(address, address + len);
+            }
+            Step::Texture(staging) => {
+                let (from, to) = staging.memory();
+                crate::pipelined::wait_writes(from, to);
+            }
+            Step::Refresh(..) | Step::Host(_) => {}
+        }
+    }
+}
+
+/// What a submission's completion needs ([`Host::complete`]).
+struct Done {
+    /// Resources heap slots stopped viewing before the submission.
+    retired: Vec<ID3D12Resource>,
+    /// When its preparation ended.
+    prepared: std::time::Instant,
+    /// The ranges its shaders write, per host copy.
+    back: Vec<crate::shadow::Declared>,
+    /// The twin compares that tell which blocks they left alone.
+    compares: Option<Vec<crate::shadow::Compare>>,
+}
+
+/// Pipelined (WAL-17): a submission the completion thread waits for and
+/// completes.
+struct Pending {
+    runs: Vec<*const HostList>,
+    /// The value it signals on the host fence (none if the signal failed).
+    value: Option<u64>,
+    done: Done,
+}
+
+// SAFETY: D3D12 objects are free-threaded and host copies are shared
+// between threads anyway; the host lists are not reset, let go of or
+// submitted again until the submission completes (`pipelined::wait_list`,
+// `pipelined::room`).
+unsafe impl Send for Pending {}
+
+impl Pending {
+    /// On the completion thread, after the one before it completed
+    /// (`last`).
+    fn complete(self, last: std::time::Instant) {
+        let Some(host) = host() else {
+            return;
+        };
+        if let Some(value) = self.value {
+            // SAFETY: the fence is ours; without an event the call returns
+            // once the fence reaches the value.
+            let waited = unsafe { host.fence.SetEventOnCompletion(value, HANDLE::default()) };
+            if let Err(e) = waited {
+                tracing::warn!(error = %e, "host submission not waited for");
+            }
+        }
+        let runs: Vec<&HostList> = self
+            .runs
+            .iter()
+            // SAFETY: live until the submission completes (as above).
+            .map(|&l| unsafe { &*l })
+            .collect();
+        let since = self.done.prepared.max(last);
+        host.complete(&runs, self.done, since);
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -1013,8 +1096,12 @@ impl Host {
 
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
-        // and the ranges shaders write are per host copy, not per submission.
+        // and the ranges shaders write are per host copy, not per submission
+        // (pipelined, one prepared at a time: `crate::pipelined`).
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Pipelined (WAL-17): room for one more in flight and none of these
+        // lists still in flight; the slot picks the twin copies' lists.
+        let slot = crate::pipelined::room(runs.iter().map(|l| std::ptr::from_ref(*l) as usize));
         let retired = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|e| e.into_inner()));
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1035,6 +1122,7 @@ impl Host {
         // Loose-memory windows copied for the first time get their tiles.
         crate::shadow::map_windows(&self.queue);
         let prepared = std::time::Instant::now();
+        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         // The ranges shaders write, each once per submission, however many
         // dispatches declared it (the world's passes declare the same big
         // ranges dozens of times). One list's lock at a time: a submission
@@ -1076,11 +1164,11 @@ impl Host {
                 }
             }
             let (mut up, mut compared, mut down) = (0, 0, 0);
-            twins_before.extend(self.twin_list(0, |l| {
+            twins_before.extend(self.twin_list(3 * slot, |l| {
                 up = crate::shadow::upload_twins(l);
                 up
             }));
-            let kept = self.twin_list(1, |l| {
+            let kept = self.twin_list(3 * slot + 1, |l| {
                 compares = crate::shadow::snapshot_twins(l, &back);
                 compares.as_ref().map_or(0, |c| c.len() as u64)
             });
@@ -1088,7 +1176,7 @@ impl Host {
                 compares = compares.filter(|c| c.is_empty());
             }
             twins_before.extend(kept);
-            twins_after = self.twin_list(2, |l| match &compares {
+            twins_after = self.twin_list(3 * slot + 2, |l| match &compares {
                 Some(c) => {
                     compared = crate::shadow::compare_twins(l, c);
                     compared
@@ -1136,6 +1224,16 @@ impl Host {
             // SAFETY: a closed list, run after the submission's.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         }
+        let done = Done {
+            retired,
+            prepared,
+            back,
+            compares,
+        };
+        if crate::pipelined::on() {
+            self.launch(runs, *submitted, done);
+            return;
+        }
         // SAFETY: the fence and event are ours.
         unsafe {
             let waited = self
@@ -1171,11 +1269,63 @@ impl Host {
                 }
             }
         }
+        let since = done.prepared;
+        self.complete(runs, done, since);
+    }
+
+    /// Pipelined (WAL-17): signals the submission's `value` and leaves the
+    /// wait for it and [`Host::complete`] to the completion thread.
+    fn launch(&self, runs: &[&HostList], value: u64, done: Done) {
+        // SAFETY: the fence is ours.
+        let signalled = unsafe { self.queue.Signal(&self.fence, value) };
+        if let Err(e) = &signalled {
+            tracing::warn!(error = %e, "host submission not waited for");
+        }
+        let writes = done
+            .back
+            .iter()
+            .flat_map(|(_, declared)| declared.iter().map(|&(a, n)| (a, a + n)))
+            .collect();
+        let mut reads = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(_, a, n) | Step::GpuWrite(_, a, n) => reads.push((*a, a + n)),
+                    Step::Texture(staging) => reads.push(staging.memory()),
+                    _ => {}
+                }
+            }
+        }
+        let runs: Vec<*const HostList> = runs.iter().map(|l| std::ptr::from_ref(*l)).collect();
+        let lists = runs.iter().map(|&l| l as usize).collect();
+        let pending = Pending {
+            runs,
+            value: signalled.is_ok().then_some(value),
+            done,
+        };
+        crate::pipelined::launch(
+            writes,
+            reads,
+            lists,
+            Box::new(move |last| pending.complete(last)),
+        );
+    }
+
+    /// After a submission ran (since `since`, when the GPU could start
+    /// it): lets go of what was retired before it, warns of a slow one,
+    /// checks for a removed device, copies back what its shaders wrote and
+    /// does its lists' bottom-of-pipe writes.
+    fn complete(&self, runs: &[&HostList], done: Done, since: std::time::Instant) {
+        let Done {
+            retired,
+            back,
+            compares,
+            ..
+        } = done;
         // Retired before this submission: no submission still runs that
         // read them.
         drop(retired);
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        let gpu = since.elapsed();
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -1562,8 +1712,9 @@ impl HostList {
     }
 
     /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// for; pipelined, waited for here).
     pub(crate) fn reset(&self) {
+        crate::pipelined::wait_list(std::ptr::from_ref(self) as usize);
         *self.deferred() = Deferred::default();
         self.clamps().reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1959,6 +2110,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            step.wait_in_flight();
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -2126,6 +2278,7 @@ impl Batch {
             let asking = crate::watch::asking();
             let mut copied = 0;
             for (a, b) in self.stale(&shadow, from, to) {
+                crate::pipelined::wait_writes(a, b);
                 let n = shadow.update(a, b - a);
                 #[cfg(feature = "diagnostics")]
                 if n > 0 {
@@ -2458,6 +2611,7 @@ impl Meter {
                 crate::shadow::log_roots(span);
                 log_gpu_times(span);
                 crate::pipelining::log(span);
+                crate::pipelined::log(span);
                 log_gpu_memory();
                 let uploaded = crate::texture::UPLOADED
                     .each_ref()
@@ -2606,6 +2760,11 @@ impl Host {
             ]);
             p.copy.close();
             self.execute(&[&p.copy]);
+            // Read back below: pipelined, the copy may still be queued.
+            #[cfg(feature = "diagnostics")]
+            if capture.is_some() || probe.is_some() {
+                crate::pipelined::wait_all();
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);

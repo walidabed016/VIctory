@@ -163,6 +163,9 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(feature = "diagnostics")]
     crate::fence::queue_signal(fence);
+    if crate::pipelined::signal_after(fence, value) {
+        return S_OK;
+    }
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
@@ -376,6 +379,9 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    // Pipelined: the runtime remaps memory submissions in flight copy back
+    // into.
+    crate::pipelined::wait_all();
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
