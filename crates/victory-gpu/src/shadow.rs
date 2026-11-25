@@ -3094,8 +3094,8 @@ fn lux_in(watched: &std::collections::BTreeSet<u64>, from: u64, to: u64) -> Vec<
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn title_words(shadow: &Shadow, address: u64) -> Option<[f32; 4]> {
-    // SAFETY: title memory inside the buffer the copy is of.
     (shadow.left(address) >= 16).then(|| {
+        // SAFETY: title memory inside the buffer the copy is of.
         unsafe { std::ptr::read_unaligned(address as *const [u32; 4]) }.map(f32::from_bits)
     })
 }
@@ -3172,6 +3172,7 @@ pub(crate) fn probe_lux(write: bool, address: u64, len: u64, shadow: &Shadow, ow
 /// it, the copy's locks are held, so the copy is not read).
 #[cfg(feature = "diagnostics")]
 fn lux_copy_back(shadow: &Shadow, merged: &[(usize, usize)], when: &str) {
+    lux_reads_done();
     if !LUX_ON.load(Ordering::Relaxed) {
         return;
     }
@@ -3204,6 +3205,279 @@ fn lux_copy_back(shadow: &Shadow, merged: &[(usize, usize)], when: &str) {
                 "lux probe: a copy-back covers a lux view"
             );
         }
+    }
+}
+
+/// Bytes of a lux program's view read back as the GPU reads it, at most.
+#[cfg(feature = "diagnostics")]
+const LUX_READ: usize = 4096;
+
+/// Views of lux programs read back at most: per program and capture frame,
+/// and in all.
+#[cfg(feature = "diagnostics")]
+const LUX_READS: (usize, usize) = (12, 1000);
+
+/// A lux program's view read back as the GPU reads it at its draw or
+/// dispatch (diagnostics, WAL-10): title memory's words when the list was
+/// submitted, the read-back slab's slot the list copied the view's bytes
+/// into, and a word set once the list has run.
+#[cfg(feature = "diagnostics")]
+struct LuxRead {
+    frame: u64,
+    program: String,
+    constant: bool,
+    address: u64,
+    len: usize,
+    path: &'static str,
+    bound: u64,
+    title: Arc<Mutex<Vec<u32>>>,
+    slot: usize,
+    ran: Box<std::sync::atomic::AtomicU64>,
+    _source: ID3D12Resource,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct LuxReads {
+    /// The read-back slab ([`LUX_READ`] bytes per slot) and its mapping.
+    slab: Option<(ID3D12Resource, usize)>,
+    reads: Vec<LuxRead>,
+    taken: usize,
+    per_program: std::collections::HashMap<(u64, String), usize>,
+}
+
+#[cfg(feature = "diagnostics")]
+static LUX_READS_STATE: Mutex<Option<LuxReads>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+static LUX_READS_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Diagnostics (WAL-10): on capture frames, has the GPU copy the bytes a
+/// lux program's view reads into a read-back slab where its draw or
+/// dispatch reads them, from the memory the view is made on (`own`: the
+/// length [`crate::descriptor::host::own_copy_of`] gave its own host copy;
+/// else the copy's twin, the copy, or title memory in place), and keeps
+/// title memory's words at submission, for [`lux_reads_done`] to log.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn lux_read(
+    list: &HostList,
+    constant: bool,
+    address: u64,
+    len: u64,
+    shadow: &Shadow,
+    own: Option<u64>,
+) {
+    let frame = crate::queue::presented() + 1;
+    if !crate::capture::listed(frame) {
+        return;
+    }
+    let program = crate::pipeline::host_pipeline(
+        crate::descriptor::host::BINDING.get() as crate::object::This
+    )
+    .map_or("none", |p| p.name.as_str());
+    if !LUX_PROGRAMS.iter().any(|h| program.contains(h)) {
+        return;
+    }
+    let (source, offset, bound, path) = match own {
+        Some(key) => {
+            let Some((buffer, offset, gpu)) = crate::descriptor::host::own_place(address, key)
+            else {
+                return;
+            };
+            (buffer, offset, gpu, "own")
+        }
+        None if shadow.mirror() => return,
+        None => (
+            shadow.resource().clone(),
+            shadow.offset(address),
+            shadow.gpu(address),
+            match (shadow.twin.is_some(), shadow.in_place) {
+                (true, _) => "twin",
+                (false, true) => "in_place",
+                (false, false) => "copy",
+            },
+        ),
+    };
+    let n = (len.min(shadow.left(address)) as usize).min(LUX_READ) & !3;
+    if n == 0 {
+        return;
+    }
+    let mut state = LUX_READS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let s = state.get_or_insert_with(LuxReads::default);
+    if s.taken == LUX_READS.1 {
+        return;
+    }
+    let count = s
+        .per_program
+        .entry((frame, program.to_owned()))
+        .or_default();
+    if *count == LUX_READS.0 {
+        return;
+    }
+    if s.slab.is_none() {
+        s.slab = host()
+            .and_then(|h| h.shared_buffer((LUX_READ * LUX_READS.1) as u64))
+            .map(|(buffer, data)| (buffer, data as usize));
+    }
+    let Some((slab, _)) = &s.slab else {
+        return;
+    };
+    *count += 1;
+    let slot = s.taken;
+    s.taken += 1;
+    let title = Arc::new(Mutex::new(Vec::new()));
+    let keep = title.clone();
+    list.defer_host(move || {
+        // SAFETY: title memory inside the buffer the copy is of.
+        let words = (0..n / 4)
+            .map(|k| unsafe { ((address + 4 * k as u64) as *const u32).read_unaligned() })
+            .collect();
+        *keep.lock().unwrap_or_else(|e| e.into_inner()) = words;
+    });
+    // SAFETY: an open list; the slot lies in the slab, the bytes in the
+    // view's memory.
+    unsafe {
+        list.list
+            .CopyBufferRegion(slab, (slot * LUX_READ) as u64, &source, offset, n as u64)
+    };
+    let ran = Box::new(std::sync::atomic::AtomicU64::new(0));
+    list.defer_write(ran.as_ptr().cast(), crate::queue::Written::Value(1), 8);
+    s.reads.push(LuxRead {
+        frame,
+        program: program.to_owned(),
+        constant,
+        address,
+        len: n,
+        path,
+        bound,
+        title,
+        slot,
+        ran,
+        _source: source,
+    });
+    LUX_READS_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// What the GPU read through a lux program's view, against title memory at
+/// submission (diagnostics): words of each that are not zero, words that
+/// differ, the first differences (byte offset, title's word, GPU's word)
+/// and the first four words of each as floats.
+#[cfg(feature = "diagnostics")]
+type LuxCompare = (
+    usize,
+    usize,
+    usize,
+    Vec<(usize, u32, u32)>,
+    [f32; 4],
+    [f32; 4],
+);
+
+#[cfg(feature = "diagnostics")]
+fn lux_compare(title: &[u32], gpu: &[u32]) -> LuxCompare {
+    let nonzero = |w: &[u32]| w.iter().filter(|&&w| w != 0).count();
+    let differ: Vec<(usize, u32, u32)> = title
+        .iter()
+        .zip(gpu)
+        .enumerate()
+        .filter(|(_, (t, g))| t != g)
+        .map(|(k, (&t, &g))| (4 * k, t, g))
+        .collect();
+    let head =
+        |w: &[u32]| std::array::from_fn(|k| w.get(k).map_or(f32::NAN, |&w| f32::from_bits(w)));
+    (
+        nonzero(title),
+        nonzero(gpu),
+        differ.len(),
+        differ.into_iter().take(8).collect(),
+        head(title),
+        head(gpu),
+    )
+}
+
+/// Diagnostics (WAL-10): logs the lux programs' views read back by lists
+/// that have run ([`lux_read`]).
+#[cfg(feature = "diagnostics")]
+fn lux_reads_done() {
+    if !LUX_READS_PENDING.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut state = LUX_READS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(s) = state.as_mut() else {
+        return;
+    };
+    let Some(data) = s.slab.as_ref().map(|s| s.1) else {
+        return;
+    };
+    let (done, waiting): (Vec<LuxRead>, Vec<LuxRead>) = std::mem::take(&mut s.reads)
+        .into_iter()
+        .partition(|r| r.ran.load(Ordering::Acquire) != 0);
+    s.reads = waiting;
+    LUX_READS_PENDING.store(!s.reads.is_empty(), Ordering::Relaxed);
+    for r in done {
+        // SAFETY: the slot's bytes, which the list that has run copied.
+        let gpu = unsafe {
+            std::slice::from_raw_parts((data + r.slot * LUX_READ) as *const u32, r.len / 4)
+        };
+        let title = r.title.lock().unwrap_or_else(|e| e.into_inner());
+        let (title_nonzero, gpu_nonzero, differ, first, title_head, gpu_head) =
+            lux_compare(&title, gpu);
+        let first: Vec<String> = first
+            .iter()
+            .map(|(at, t, g)| format!("+{at:#x}: {t:#010x}/{g:#010x}"))
+            .collect();
+        tracing::info!(
+            frame = r.frame,
+            program = r.program,
+            constant = r.constant,
+            address = format_args!("{:#x}", r.address),
+            bytes = r.len,
+            path = r.path,
+            bound = format_args!("{:#x}", r.bound),
+            submitted = !title.is_empty(),
+            title_nonzero,
+            gpu_nonzero,
+            differ,
+            ?first,
+            ?title_head,
+            ?gpu_head,
+            "lux probe: what the GPU read"
+        );
+    }
+}
+
+/// Diagnostics (WAL-10): on capture frames, logs each constant view a lux
+/// program has made: its title address and size and where the host view
+/// is made (`own`: on its own host copy).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn lux_constant_made(address: u64, size: u32, location: u64, own: bool) {
+    let frame = crate::queue::presented() + 1;
+    if !crate::capture::listed(frame) {
+        return;
+    }
+    let program = crate::pipeline::host_pipeline(
+        crate::descriptor::host::BINDING.get() as crate::object::This
+    )
+    .map_or("none", |p| p.name.as_str());
+    if !LUX_PROGRAMS.iter().any(|h| program.contains(h)) {
+        return;
+    }
+    let mut lux = LUX.lock().unwrap_or_else(|e| e.into_inner());
+    let lux = lux.get_or_insert_with(Lux::default);
+    if lux.lines < LUX_LINES
+        && lux
+            .logged
+            .insert((frame, format!("made {program}"), address, u64::from(size)))
+    {
+        lux.lines += 1;
+        tracing::info!(
+            frame,
+            program,
+            address = format_args!("{address:#x}"),
+            size,
+            location = format_args!("{location:#x}"),
+            own,
+            "lux probe: a constant view is made"
+        );
     }
 }
 
@@ -3948,6 +4222,26 @@ pub(crate) mod tests {
         assert_eq!(lux_in(&watched, 0x1000, 0x1010), [0x1000]);
         assert_eq!(lux_in(&watched, 0x0f00, 0x2001), [0x1000, 0x1010, 0x2000]);
         assert!(lux_in(&watched, 0x1011, 0x2000).is_empty());
+    }
+
+    /// The lux probe tells what the GPU read through a view from what title
+    /// memory held: words not zero in each, the words that differ by byte
+    /// offset, and the first four of each (diagnostics, WAL-10).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn lux_reads_name_the_words_the_gpu_read_differently() {
+        let one = 1.0f32.to_bits();
+        let title = [one, 0, 7, 9, 3];
+        let gpu = [one, 0, 0, 9, 0];
+        let (title_nonzero, gpu_nonzero, differ, first, title_head, gpu_head) =
+            lux_compare(&title, &gpu);
+        assert_eq!((title_nonzero, gpu_nonzero, differ), (4, 2, 2));
+        assert_eq!(first, [(8, 7, 0), (16, 3, 0)]);
+        assert_eq!(title_head[0], 1.0);
+        assert_eq!(gpu_head[2].to_bits(), 0);
+        let (.., short) = lux_compare(&[], &[one]);
+        assert_eq!(short[0], 1.0);
+        assert!(short[1].is_nan());
     }
 
     #[test]

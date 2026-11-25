@@ -1376,6 +1376,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         #[cfg(feature = "diagnostics")]
         if kind != ResourceType::Uav {
             shadow.note_reached(address, len, false, own.is_some());
+            crate::shadow::lux_read(
+                list,
+                matches!(*view, View::Constant(..)),
+                address,
+                len,
+                &shadow,
+                own.map(|(_, n)| n),
+            );
         }
         if let Some((data, len)) = own {
             list.defer_fill(data, address as *const u8, len as usize);

@@ -812,6 +812,14 @@ pub(crate) fn own_copy_of(
     own_copy(address, len, align).map(|(.., data)| (data, len))
 }
 
+/// The place of the own host copy [`own_copy_of`] gave a view of title
+/// `address`, `len` being the length it returned: its buffer, offset in it
+/// and host address (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn own_place(address: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+    own_copy(address, len, 1).map(|(buffer, offset, gpu, _)| (buffer, offset, gpu))
+}
+
 /// Bytes per element of a typed buffer shader view: `None` for other
 /// views (structured and raw ones the host places on any dword).
 fn typed_element(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<u64> {
@@ -1140,6 +1148,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if gpu % 256 != 0 {
                 let len = u64::from(size.min(LARGEST_CONSTANT));
                 let (buffer, _, gpu, _) = own_copy(address, len, 256)?;
+                #[cfg(feature = "diagnostics")]
+                crate::shadow::lux_constant_made(address, size, gpu, true);
                 let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                     BufferLocation: gpu,
                     SizeInBytes: constant_size(size, view),
@@ -1148,6 +1158,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 unsafe { device.CreateConstantBufferView(Some(&desc), at) };
                 return Kept::of(&buffer, view_kind::CBV);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::lux_constant_made(address, size, gpu, false);
             let size = constant_size(size, view);
             let blocks = on_copy(&shadow, shadow.offset(address), size / 256, 256, view)?;
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
