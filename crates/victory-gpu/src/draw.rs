@@ -1244,7 +1244,9 @@ impl State {
         // Clamped first: the clamp binds a compute pipeline of its own. An
         // indirect dispatch's segment holds it alone, so it is clamped now
         // unless it joins an open segment.
-        let alone = if kind == DISPATCH && !crate::indirect::joins(list, (kind, stride, max)) {
+        let alone = if kind == DISPATCH
+            && !crate::indirect::joins(list, (kind, stride, max), records, count)
+        {
             let Some(clamped) =
                 crate::indirect::clamp_alone(list, (kind, stride, max), records, count)
             else {
@@ -1253,7 +1255,7 @@ impl State {
             };
             Some(clamped)
         } else {
-            if !crate::indirect::open(list, (kind, stride, max)) {
+            if !crate::indirect::open(list, (kind, stride, max), records, count) {
                 why("not bounded (no clamp, or a stride not a multiple of 4)");
                 return false;
             }

@@ -28,18 +28,26 @@
 //! the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
+#ifdef FUSED
+#define RS "UAV(u0), UAV(u1), UAV(u2), UAV(u3), SRV(t0)"
+// A segment's executions, a group row each, 8 words apiece: kind, stride,
+// how many, flags (as Record's), then where its records, its count and
+// its clamped records are from args, count and clamped.
+ByteAddressBuffer executions : register(t0);
+#else
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
 // One execution's records: kind (PC argument numbering), stride, how many,
 // flags (1: count records with work and empty ones, 2: a count word
 // limits them).
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint flags; };
+#endif
 // The title's records, only read.
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
@@ -53,28 +61,39 @@ static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID) {
+#ifdef FUSED
+    uint4 record = executions.Load4(group.y * 32);
+    uint3 offsets = executions.Load3(group.y * 32 + 16);
+    uint kind = record.x;
+    uint stride = record.y;
+    uint records = record.z;
+    uint flags = record.w;
+#else
+    uint3 offsets = uint3(0, 0, 0);
+#endif
     uint n = records;
     if ((flags & 2) != 0) {
-        n = min(count.Load(0), records);
+        n = min(count.Load(offsets.y), records);
         if (id.x == 0) {
-            clamped.Store(records * stride, n);
+            clamped.Store(offsets.z + records * stride, n);
         }
     }
     if (id.x >= n) return;
-    uint at = id.x * stride;
+    uint from = offsets.x + id.x * stride;
+    uint at = offsets.z + id.x * stride;
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint vertices = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(vertices, 1u));
+        uint vertices = min(args.Load(from), 1u << 24);
+        uint instances = min(args.Load(from + 4), (1u << 26) / max(vertices, 1u));
         cost = vertices * instances;
-        clamped.Store4(at, uint4(vertices, instances, args.Load2(at + 8)));
+        clamped.Store4(at, uint4(vertices, instances, args.Load2(from + 8)));
         if (kind == 1) {
-            clamped.Store(at + 16, args.Load(at + 16));
+            clamped.Store(at + 16, args.Load(from + 16));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = min(args.Load3(from), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -83,7 +102,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         clamped.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
+        uint3 g = args.Load3(from);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         clamped.Store3(at, g);
@@ -146,6 +165,9 @@ const SEGMENT: u64 = 8 + COMMANDS as u64 * size_of::<Command>() as u64;
 /// Bytes of a table (upload memory) and of a buffer of clamped records.
 const TABLE: u64 = 64 * SEGMENT;
 const RING: u64 = 4 << 20;
+/// Where a fused segment's executions start in its part of the table,
+/// after the count word and the dispatch ([`fused`]).
+const EXECUTIONS: u64 = 32;
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -161,7 +183,7 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match make(false) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -171,17 +193,49 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+/// The fused clamp, with `VICTORY_FUSED_CLAMP=1`: a segment's clamp is one
+/// dispatch whose group rows are its executions, read from the table, at
+/// offsets from views the segment sets once (its first execution's records
+/// and count, less 1 GiB), instead of an ExecuteIndirect of a command per
+/// execution, which costs ~3.4 µs a command on the host GPU against ~4.4
+/// µs for a whole dispatch-only one (VICT-9's probe). An execution whose
+/// records or count lie outside the views' 2 GiB opens a segment of its
+/// own.
+fn fused() -> Option<&'static Clamp> {
+    static FUSED: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    FUSED
+        .get_or_init(|| {
+            if std::env::var("VICTORY_FUSED_CLAMP").is_ok_and(|v| v == "1") {
+                tracing::info!("indirect clamps fused, one dispatch a segment (VICTORY_FUSED_CLAMP)");
+            } else {
+                return None;
+            }
+            make(true)
+                .inspect_err(|e| tracing::warn!(error = %e, "no fused argument clamp: a command per execution"))
+                .ok()
+        })
+        .as_ref()
+}
+
+fn make(fused: bool) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
+    let defines = [
+        D3D_SHADER_MACRO {
+            Name: s!("FUSED"),
+            Definition: s!("1"),
+        },
+        D3D_SHADER_MACRO::default(),
+    ];
+    // SAFETY: the source, defines and names live through the call; out
+    // pointers ours.
     let compiled = unsafe {
         D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("clamp"),
-            None,
+            fused.then_some(defines.as_ptr()),
             None,
             s!("main"),
             s!("cs_5_1"),
@@ -245,16 +299,29 @@ fn make() -> windows::core::Result<Clamp> {
             ..Default::default()
         })?;
         let mut signature: Option<ID3D12CommandSignature> = None;
-        device.CreateCommandSignature(
-            &D3D12_COMMAND_SIGNATURE_DESC {
-                ByteStride: size_of::<Command>() as u32,
-                NumArgumentDescs: arguments.len() as u32,
-                pArgumentDescs: arguments.as_ptr(),
-                NodeMask: 0,
-            },
-            &root,
-            &mut signature,
-        )?;
+        if fused {
+            device.CreateCommandSignature(
+                &D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 12,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &arguments[4],
+                    NodeMask: 0,
+                },
+                None,
+                &mut signature,
+            )?;
+        } else {
+            device.CreateCommandSignature(
+                &D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: size_of::<Command>() as u32,
+                    NumArgumentDescs: arguments.len() as u32,
+                    pArgumentDescs: arguments.as_ptr(),
+                    NodeMask: 0,
+                },
+                &root,
+                &mut signature,
+            )?;
+        }
         let signature = signature.ok_or_else(windows::core::Error::empty)?;
         Ok(Clamp {
             root,
@@ -285,21 +352,30 @@ pub(crate) struct Clamps {
 // written by the list's recording thread only.
 unsafe impl Send for Clamps {}
 
-/// An open segment: its table, where in it, and the commands so far.
+/// An open segment: its table, where in it, and the commands so far; when
+/// fused ([`fused`]), its views of records and counts and its widest
+/// execution's groups.
 struct Segment {
     table: usize,
     at: u64,
     commands: u32,
+    views: Option<(u64, u64)>,
+    groups: u32,
 }
 
 impl Clamps {
-    /// Whether an execution taking `need` bytes of a ring joins the open
-    /// segment: one is open, with room for it.
-    fn joinable(&self, need: u64) -> bool {
-        self.open
-            .as_ref()
-            .is_some_and(|segment| segment.commands < COMMANDS)
-            && self.used + need <= self.rings[self.ring].1
+    /// Whether an execution taking `need` bytes of a ring, its `len`
+    /// bytes of records at `args` and its count at `count`, joins the open
+    /// segment: one is open, with room for it, and a fused one's views
+    /// reach them.
+    fn joinable(&self, need: u64, (args, len): (u64, u64), count: Option<u64>) -> bool {
+        let reach = |view: u64, at: u64, len: u64| at >= view && at + len - view <= 1 << 31;
+        self.open.as_ref().is_some_and(|segment| {
+            segment.commands < COMMANDS
+                && segment.views.is_none_or(|(records, counts)| {
+                    reach(records, args, len) && count.is_none_or(|c| reach(counts, c, 4))
+                })
+        }) && self.used + need <= self.rings[self.ring].1
     }
 
     /// After the list is reset: everything reused from the start.
@@ -388,11 +464,17 @@ fn default_buffer(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// Before an indirect execution of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart is recorded in `list`: opens
-/// a segment unless one with room is open, recording its clamp. Replaces
-/// the list's compute root signature and pipeline then (callers bind
-/// theirs after). False if the clamp is not available.
-pub(crate) fn open(list: &HostList, (kind, stride, records): (u32, u32, u32)) -> bool {
+/// argument numbering) `stride` bytes apart, at host address `args` (its
+/// count at `count`), is recorded in `list`: opens a segment unless one it
+/// joins is open, recording its clamp. Replaces the list's compute root
+/// signature and pipeline then (callers bind theirs after). False if the
+/// clamp is not available.
+pub(crate) fn open(
+    list: &HostList,
+    (kind, stride, records): (u32, u32, u32),
+    args: u64,
+    count: Option<u64>,
+) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
@@ -400,8 +482,9 @@ pub(crate) fn open(list: &HostList, (kind, stride, records): (u32, u32, u32)) ->
         return false;
     }
     let need = region(stride, records);
+    let len = u64::from(stride) * u64::from(records);
     let mut s = list.clamps();
-    if s.joinable(need) {
+    if s.joinable(need, (args, len), count) {
         return true;
     }
     s.open = None;
@@ -426,15 +509,36 @@ pub(crate) fn open(list: &HostList, (kind, stride, records): (u32, u32, u32)) ->
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         ));
     }
+    let view = |at: u64| at.saturating_sub(1 << 30) & !255;
+    let fused = fused().map(|f| (f, view(args), view(count.unwrap_or(args))));
     // SAFETY: an open list; our root signature, pipeline, signature and
-    // buffers, which the list's clamps keep.
+    // buffers, which the list's clamps keep; the segment's part of the
+    // table's mapping, which the GPU reads only once the list runs.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&before);
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
-        l.SetComputeRootUnorderedAccessView(2, budget);
-        l.ExecuteIndirect(&c.signature, COMMANDS, &buffer, at + 8, &buffer, at);
+        match fused {
+            Some((f, records, counts)) => {
+                ((data + at as usize + 8) as *mut [u32; 3]).write_unaligned([0, 0, 1]);
+                l.SetComputeRootSignature(&f.root);
+                l.SetPipelineState(&f.pso);
+                l.SetComputeRootUnorderedAccessView(0, records);
+                l.SetComputeRootUnorderedAccessView(1, budget);
+                l.SetComputeRootUnorderedAccessView(2, counts);
+                l.SetComputeRootUnorderedAccessView(3, rings.GetGPUVirtualAddress());
+                l.SetComputeRootShaderResourceView(
+                    4,
+                    buffer.GetGPUVirtualAddress() + at + EXECUTIONS,
+                );
+                l.ExecuteIndirect(&f.signature, 1, &buffer, at + 8, None, 0);
+            }
+            None => {
+                l.SetComputeRootSignature(&c.root);
+                l.SetPipelineState(&c.pso);
+                l.SetComputeRootUnorderedAccessView(2, budget);
+                l.ExecuteIndirect(&c.signature, COMMANDS, &buffer, at + 8, &buffer, at);
+            }
+        }
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
@@ -449,6 +553,8 @@ pub(crate) fn open(list: &HostList, (kind, stride, records): (u32, u32, u32)) ->
         table,
         at,
         commands: 0,
+        views: fused.map(|(_, records, counts)| (records, counts)),
+        groups: 0,
     });
     true
 }
@@ -471,7 +577,8 @@ pub(crate) fn add(
     let Some(segment) = &s.open else {
         return None;
     };
-    let (table, offset, n) = (segment.table, segment.at, segment.commands);
+    let (table, offset, n, views) = (segment.table, segment.at, segment.commands, segment.views);
+    let groups = segment.groups.max(records.div_ceil(64));
     let buffer = s.rings[ring].0.clone();
     // SAFETY: a live buffer.
     let clamped = unsafe { buffer.GetGPUVirtualAddress() } + at;
@@ -479,27 +586,58 @@ pub(crate) fn add(
     let command = Command::new((kind, stride, records), args, count, clamped);
     let data = s.tables[table].1 + offset as usize;
     // SAFETY: the segment's part of the table's mapping (room for
-    // `COMMANDS` commands after the count), which the GPU reads only once
-    // the list runs.
+    // `COMMANDS` commands after the count, or a fused segment's dispatch
+    // and executions), which the GPU reads only once the list runs.
     unsafe {
-        ((data + 8) as *mut Command)
-            .add(n as usize)
-            .write_unaligned(command);
-        (data as *mut u32).write(n + 1);
+        match views {
+            Some((records, counts)) => {
+                let [kind, stride, how_many, flags] = command.record;
+                let from = |view: u64, at: u64| (at - view) as u32;
+                let counted = count.map_or(0, |c| from(counts, c));
+                ((data + EXECUTIONS as usize) as *mut [u32; 8])
+                    .add(n as usize)
+                    .write_unaligned([
+                        kind,
+                        stride,
+                        how_many,
+                        flags,
+                        from(records, args),
+                        counted,
+                        at as u32,
+                        0,
+                    ]);
+                ((data + 8) as *mut [u32; 3]).write_unaligned([groups, n + 1, 1]);
+            }
+            None => {
+                ((data + 8) as *mut Command)
+                    .add(n as usize)
+                    .write_unaligned(command);
+                (data as *mut u32).write(n + 1);
+            }
+        }
     }
     s.used += region(stride, records);
     let segment = s.open.as_mut()?;
     segment.commands += 1;
+    segment.groups = groups;
     if segment.commands == COMMANDS {
         s.open = None;
     }
     Some((buffer, at, count.map(|_| at + len)))
 }
 
-/// Whether an execution of `records` records `stride` bytes apart joins
-/// the open segment's clamp ([`open`] would record none).
-pub(crate) fn joins(list: &HostList, (_, stride, records): (u32, u32, u32)) -> bool {
-    list.clamps().joinable(region(stride, records))
+/// Whether an execution of `records` records `stride` bytes apart at host
+/// address `args` (its count at `count`) joins the open segment's clamp
+/// ([`open`] would record none).
+pub(crate) fn joins(
+    list: &HostList,
+    (_, stride, records): (u32, u32, u32),
+    args: u64,
+    count: Option<u64>,
+) -> bool {
+    let len = u64::from(stride) * u64::from(records);
+    list.clamps()
+        .joinable(region(stride, records), (args, len), count)
 }
 
 /// Clamps an execution alone in its segment with a dispatch of its own,
@@ -605,6 +743,9 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+        if std::env::var("VICTORY_FUSED_CLAMP").is_ok_and(|v| v == "1") {
+            assert!(super::fused().is_some(), "the fused clamp builds");
+        }
     }
 
     /// A compute pipeline whose groups count themselves into a root UAV's
@@ -713,7 +854,7 @@ void main() { uint was; counted.InterlockedAdd(0, 1, was); }
         let signature = signature.unwrap();
         let list = host.new_list().unwrap();
         let run = |args: u64, records: u32, count: Option<u64>| {
-            assert!(open(&list, (2, 12, records)));
+            assert!(open(&list, (2, 12, records), args, count));
             let (clamped, at, count_at) = add(&list, (2, 12, records), args, count).unwrap();
             // SAFETY: an open list; live objects.
             unsafe {
@@ -803,7 +944,10 @@ void main() { uint was; counted.InterlockedAdd(0, 1, was); }
         let signature = signature.unwrap();
         let list = host.new_list().unwrap();
         let run = |args: u64, records: u32, count: Option<u64>| {
-            assert!(!joins(&list, (2, 12, records)), "no segment is open");
+            assert!(
+                !joins(&list, (2, 12, records), args, count),
+                "no segment is open"
+            );
             let (clamped, at, count_at) =
                 clamp_alone(&list, (2, 12, records), args, count).unwrap();
             // SAFETY: an open list; live objects.
