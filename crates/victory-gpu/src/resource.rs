@@ -962,6 +962,25 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A texture's console memory as (address, bytes) and its description
+/// as text (diagnostics); `None` for buffers and unsized layouts.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn texture_span(this: This) -> Option<(u64, u64, String)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let d = &r.desc;
+    let text = format!(
+        "{}x{}x{} f{} flags {:#x}",
+        d.width, d.height, d.depth_or_array_size, d.format, d.flags
+    );
+    Some((r.data() as u64, footprint(d)?.size, text))
+}
+
 /// How a resource's memory is held (diagnostics).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn backing_text(this: This) -> String {

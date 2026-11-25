@@ -391,6 +391,58 @@ pub(crate) fn dump_targets(frame: u64) {
             "target programs"
         );
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        let written: Vec<(usize, u64, u64)> = targets
+            .iter()
+            .filter_map(|&(r, _)| {
+                let (address, bytes, _) = crate::resource::texture_span(r as crate::object::This)?;
+                Some((r, address, bytes))
+            })
+            .collect();
+        let mut read: Vec<(usize, u64, u64)> = Vec::new();
+        for &(r, write, _) in &accesses {
+            if write || read.iter().any(|x| x.0 == r) || targets.iter().any(|t| t.0 == r) {
+                continue;
+            }
+            if let Some((address, bytes, _)) =
+                crate::resource::texture_span(r as crate::object::This)
+            {
+                read.push((r, address, bytes));
+            }
+        }
+        for (n, (reader, target)) in aliased(&read, &written).into_iter().enumerate() {
+            if n == 300 {
+                tracing::info!(frame, "aliased reads: more left out");
+                break;
+            }
+            let r = reader as crate::object::This;
+            let (address, bytes, description) =
+                crate::resource::texture_span(r).unwrap_or_default();
+            let t = target as crate::object::This;
+            let (at, target_bytes, target_description) =
+                crate::resource::texture_span(t).unwrap_or_default();
+            let names = |res: usize, w: bool| -> Vec<&str> {
+                accesses
+                    .iter()
+                    .filter(|(x, y, _)| *x == res && *y == w)
+                    .map(|(_, _, name)| name.as_str())
+                    .collect()
+            };
+            tracing::info!(
+                frame,
+                read = ?r,
+                address = format_args!("{address:#x}+{bytes:#x}"),
+                description,
+                readers = ?names(reader, false),
+                index = targets.iter().position(|x| x.0 == target),
+                target = format_args!("{at:#x}+{target_bytes:#x}"),
+                target_description,
+                writers = ?names(target, true),
+                "a texture nothing wrote this frame read over a written target's memory"
+            );
+        }
+    }
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -408,6 +460,23 @@ pub(crate) fn dump_targets(frame: u64) {
         let prefix = format!("frame-{frame}-{i:02}-{resource:?}");
         dump_one(host, texture, state, resource, &prefix, &d, raw);
     }
+}
+
+/// Pairs (reader, target) whose memory overlaps, of textures read but not
+/// written in a frame and targets written in it, each as (resource,
+/// address, bytes): a read through another resource over memory the frame
+/// wrote, which the host keeps as two textures.
+#[cfg(feature = "diagnostics")]
+fn aliased(read: &[(usize, u64, u64)], written: &[(usize, u64, u64)]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for &(r, address, bytes) in read {
+        for &(t, at, len) in written {
+            if r != t && address < at.saturating_add(len) && at < address.saturating_add(bytes) {
+                pairs.push((r, t));
+            }
+        }
+    }
+    pairs
 }
 
 /// Saves one target as `<prefix>-<w>x<h>[x<d>]-f<format>.png`, and with
@@ -760,6 +829,21 @@ mod tests {
             .collect();
         assert_eq!(once, [1000]);
         assert!(!(0..2000).any(|n| super::world_frame(0, 100, n)));
+    }
+
+    /// A read-only texture over a written target's memory pairs with it;
+    /// one beside it, and the target itself, do not.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn reads_over_a_written_targets_memory_pair_with_it() {
+        let written = [(1, 0x1000, 0x100), (2, 0x4000, 0x100)];
+        let read = [
+            (3, 0x1080, 0x10),
+            (4, 0x1100, 0x100),
+            (1, 0x1000, 0x100),
+            (5, 0x3f00, 0x200),
+        ];
+        assert_eq!(super::aliased(&read, &written), [(3, 1), (5, 2)]);
     }
 
     #[test]
