@@ -199,6 +199,9 @@ pub(crate) enum Op {
     /// Of those, askings that found written pages (bytes: those pages):
     /// each flushes the TLB of every thread of the process.
     Found,
+    /// Of those, askings the kernel refused: the memory is not
+    /// write-watched (bytes: the ranges).
+    Refused,
     /// Guarded askings of view memory (bytes: the ranges).
     Guard,
     /// `VirtualQuery` (bytes: from the address to its region's end, which
@@ -232,10 +235,11 @@ pub(crate) enum Op {
     /// Of those, the waits for the journal and the guards.
     ArmWait,
 }
-const OPS: usize = 16;
+const OPS: usize = 17;
 const OP_NAMES: [&str; OPS] = [
     "asks",
     "asks finding writes",
+    "asks refused",
     "guarded asks",
     "queries",
     "protects",

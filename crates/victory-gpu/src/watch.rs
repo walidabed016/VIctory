@@ -279,7 +279,9 @@ fn asked_writes<T>(
         // Guarded and not written since: the guards would find nothing, and
         // the kernel cannot be asked (views) or need not be (pools).
         let unwritten = guarded && skip_unwritten() && unwritten(from * PAGE, to * PAGE);
-        let asked = if pool || unwritten {
+        // Views: the kernel would refuse the asking.
+        let view = !pool && !unwritten && !ask_views() && view(from * PAGE);
+        let asked = if pool || unwritten || view {
             None
         } else {
             ask(&mut j.found, from, to)
@@ -293,6 +295,8 @@ fn asked_writes<T>(
             let started = std::time::Instant::now();
             let written = if pool {
                 Some(guard_pool(&mut j.found, from, to))
+            } else if view {
+                Some(reguard(from * PAGE, to * PAGE, false).0)
             } else {
                 guard(from * PAGE, to * PAGE)
             };
@@ -697,6 +701,9 @@ fn ask(found: &mut Vec<usize>, from: usize, to: usize) -> Option<usize> {
     {
         use crate::copystat::{Op, cost};
         cost(Op::Ask, started, from * PAGE, ((to - from) * PAGE) as u64);
+        if failed {
+            cost(Op::Refused, started, from * PAGE, ((to - from) * PAGE) as u64);
+        }
         if !failed && count > 0 {
             cost(
                 Op::Found,
@@ -1302,6 +1309,21 @@ fn skip_unwritten() -> bool {
     })
 }
 
+/// Whether pieces of view memory are asked about with the write watch
+/// before they are guarded, which the kernel refuses: run 155 asked ~860
+/// times a frame (4.1 ms), and guarded about as many pieces after. Telling a
+/// view takes ~0.3 us ([`view`]). `VICTORY_ASK_VIEWS` asks it again.
+fn ask_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASK_VIEWS").is_some();
+        if on {
+            tracing::info!("views are asked about with the write watch (VICTORY_ASK_VIEWS)");
+        }
+        on
+    })
+}
+
 /// The runtime reserved (`watched`) or released write-watched title memory
 /// `[at, at + len)`: xmem's pools, which copies guard as they do views
 /// ([`guard_pools`]). It commits pool memory, and changes its protection,
@@ -1743,7 +1765,9 @@ mod tests {
         // SAFETY: our view; our handler opens the guarded block.
         unsafe { ((view + 3 * BLOCK + 8) as *mut u32).write(7) };
         forget_asked();
+        let asks = ASKS.get();
         let (now, after) = writes(start, end, true).expect("guarded");
+        assert_eq!(ASKS.get(), asks, "a view was asked about");
         assert!(now > later);
         let mut expected = all.clone();
         expected[3].1 = now;
