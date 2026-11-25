@@ -503,6 +503,19 @@ fn reads_console_lanes(x: &Parts) -> bool {
     if crossing {
         return true;
     }
+    // A mask operation's SCC read as data ([`super::mask_scc`]) by an
+    // instruction other than a branch on it.
+    if super::mask_scc()
+        && !x.native.wave64
+        && insts().any(|i| {
+            !matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                && i.reads
+                    .iter()
+                    .any(|(r, v)| *r == Reg::Scc && x.st.scc_some.contains_key(v))
+        })
+    {
+        return true;
+    }
     let whens = x.st.exits.iter().filter_map(|e| match *e {
         LaneExit::Branch { when, .. } => Some(when),
         _ => None,
@@ -2249,7 +2262,16 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                if super::mask_scc()
+                    && self.x.st.scc_some.contains_key(&v)
+                    && let Ok(some) = self.scc_some(v)
+                {
+                    self.vals.insert(v, Val::Bit(some));
+                    return Ok(Val::Bit(some));
+                }
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -3800,6 +3822,34 @@ impl<'a> Lower<'a> {
             self.halves_barrier();
         }
         Ok(out)
+    }
+
+    /// SCC of a mask operation as data ([`Structured::scc_some`],
+    /// [`super::mask_scc`]): whether some lane of the console wave has its
+    /// bit of the result, asked where the operation stands. The lanes that
+    /// are elsewhere have no bit (the result is ANDed with EXEC or is EXEC),
+    /// so where the host's lanes are the console's the host wave's answer is
+    /// the console's (DexNom 570a941). Halves and other host lanes: refused.
+    fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
+        let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
+        if !self.console_lanes || self.halves.is_some() || self.mask_data != MaskData::Console {
+            return Err(LANE_MASK);
+        }
+        let at = match self.def_block.get(&scc) {
+            None => self.s.entry,
+            Some(&b) => match self.tail[b] {
+                Some(t) => t,
+                None if b == self.cur_ir => self.cur,
+                None => return Err("a lane mask written after its use"),
+            },
+        };
+        let bit = self.boolean(m, at)?;
+        let i1t = self.s.t.i1;
+        let some = self
+            .s
+            .op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        Ok(some)
     }
 
     /// Halves: the ballot of a mask some instruction reads as data, taken

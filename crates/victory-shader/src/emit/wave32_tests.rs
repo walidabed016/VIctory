@@ -560,6 +560,35 @@ fn a_select_on_a_mask_held_as_a_number_tests_the_lane_s_own_bit() {
 }
 
 #[test]
+fn a_saveexec_scc_read_as_data_is_whether_the_console_wave_kept_a_lane() {
+    // `s_and_saveexec_b32 s2, vcc` on lanes 0-4 sets SCC in the first
+    // console wave only; `s_cselect_b32 s3, 7, 9` after EXEC is restored
+    // gives every lane of the wave its wave's answer (bvh_skinning's
+    // `s_andn2_wrexec_b32` then `s_cselect_b32`).
+    let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+    w.push(vop2(0x1A, 4, inline((SLOTS * 4).trailing_zeros() as u16), 0));
+    w.push(vopc(0xC4, inline(5), 0));
+    w.push(sop1(0x3C, 2, VCC_LO));
+    w.push(sop1(0x03, EXEC_LO, 2));
+    w.push(0x8503_8987);
+    w.push(vop1(0x001, 5, 3));
+    w.extend(store(5, 4, 0));
+    w.push(S_ENDPGM);
+    if !crate::emit::mask_scc() {
+        let e = lower32(&w).err().expect("refused without VICTORY_MASK_SCC");
+        assert!(e.to_string().contains("a lane mask read as data"), "{e}");
+        return;
+    }
+    let shader = build(&w);
+    for (label, got) in run(&shader) {
+        for x in 0..THREADS {
+            let want = if x < 32 { 7 } else { 9 };
+            assert_eq!(got[(x * SLOTS) as usize], want, "{label}: thread {x}");
+        }
+    }
+}
+
+#[test]
 fn short_stores_keep_the_other_half_of_their_dword() {
     // Thread x stores the short 1000 + x at byte 2x (two threads per dword,
     // at once), and at byte 256 + 4x over the dword 0xBEEFFFFF it stored
