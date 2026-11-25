@@ -2135,6 +2135,9 @@ pub(crate) fn snapshot_twins(
         }
     }
     drop(m);
+    if ranges.is_empty() {
+        return Some(Vec::new());
+    }
     let need: u64 = ranges.iter().map(|r| r.4.next_multiple_of(256)).sum();
     if ranges.iter().any(|r| r.4 >= 1 << 31) || need > KEEP_MAX {
         return None;
