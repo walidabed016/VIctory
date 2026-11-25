@@ -43,8 +43,9 @@ pub(crate) fn counts() -> (u64, u64) {
 /// change at run time, the Belobug changes turned off, whether small
 /// groups run on halves, whether byte and short buffer loads translate,
 /// whether waterfall loops leave each lane its own pass's scalars, whether
-/// textures read only for their size translate, and whether constant
-/// descriptors joined by control flow do).
+/// textures read only for their size translate, whether constant
+/// descriptors joined by control flow do, and whether descriptor dwords pass
+/// through compares and loads that do not read them as data).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -63,6 +64,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::own_pass_scalars()),
             u8::from(victory_shader::emit::size_only_textures()),
             u8::from(victory_shader::emit::joined_constants()),
+            u8::from(victory_shader::emit::unread_fields()),
         ];
         *blake3::hash(&[translator, &limit.to_le_bytes(), off, &small].concat()).as_bytes()
     })

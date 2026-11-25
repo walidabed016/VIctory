@@ -4008,7 +4008,14 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        let dims = self.field_use(inst, self.x.st.guards[b][i].is_some());
+        // A waterfall loop's compares hold in every lane without reading
+        // the descriptor dwords they compare (see `Lower::valu`).
+        let compare = super::unread_fields() && self.x.res.waterfall.compares.contains(&(b, i));
+        let dims = if compare {
+            Ok(None)
+        } else {
+            self.field_use(inst, self.x.st.guards[b][i].is_some())
+        };
         let r = dims
             .as_ref()
             .map_err(|&w| w)
@@ -5196,6 +5203,28 @@ impl<'a> Lower<'a> {
                 (inst.writes.iter())
                     .map(|w| w.0)
                     .filter(|r| matches!(r, Reg::V(_)) && !src.contains(r))
+                    .collect()
+            }
+            // So does an unguarded image load's or LDS read's, which writes
+            // every dword of its destination.
+            Fields::Image {
+                addr,
+                d16: false,
+                tfe: false,
+                lwe: false,
+                ..
+            } if !guarded && super::unread_fields() && !inst.name().contains("atomic") => {
+                let read: Vec<Reg> = addr.iter().flat_map(regs).collect();
+                (inst.writes.iter())
+                    .map(|w| w.0)
+                    .filter(|r| matches!(r, Reg::V(_)) && !read.contains(r))
+                    .collect()
+            }
+            Fields::Ds { addr, data, .. } if !guarded && super::unread_fields() => {
+                let read: Vec<Reg> = addr.iter().chain(data).flat_map(regs).collect();
+                (inst.writes.iter())
+                    .map(|w| w.0)
+                    .filter(|r| matches!(r, Reg::V(_)) && !read.contains(r))
                     .collect()
             }
             _ => Vec::new(),

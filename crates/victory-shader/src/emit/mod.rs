@@ -257,6 +257,18 @@ pub fn joined_constants() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_JOINED_CONSTANTS").is_none())
 }
 
+/// Whether dwords of an image descriptor whose size the code reads pass
+/// through instructions that do not read them as data: a waterfall loop's
+/// compares of a descriptor each lane holds in VGPRs (true in every lane),
+/// and an unguarded image load or LDS read into VGPRs that held them
+/// (overwritten); refused otherwise. On unless `VICTORY_NO_UNREAD_FIELDS`
+/// is set. The value is part of the translation, so the shader cache must
+/// key on it (`victory-gpu`'s does).
+pub fn unread_fields() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_UNREAD_FIELDS").is_none())
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

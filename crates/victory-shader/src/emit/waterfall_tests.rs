@@ -696,6 +696,51 @@ fn a_texture_read_only_for_its_size_gives_its_height() {
     }
 }
 
+/// [`a_texture_read_only_for_its_size_gives_its_height`] with a copy of a
+/// descriptor dword in v18 that an LDS swizzle then overwrites in every
+/// lane (`super::unread_fields`): the height, swizzled, to every lane.
+#[test]
+fn a_swizzle_over_a_copied_descriptor_dword_gives_the_height() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xF40C_0602,
+        0xFA00_0020, // s_load_dwordx8 s[24:31], s[4:5], 0x20
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E24_021A, // v_mov_b32 v18, s26
+        0x93A0_FF1A,
+        0x0010_000E, // s_bfe_u32 s32, s26, 0x10000e (height - 1)
+        0x8020_8120, // s_add_u32 s32, s32, 1
+        0x93A1_FF1B,
+        0x0004_000C, // s_bfe_u32 s33, s27, 0x4000c (BASE_LEVEL)
+        0x9020_2120, // s_lshr_b32 s32, s32, s33
+        0x84A0_8120, // s_max_u32 s32, s32, 1
+        0x7E22_0220, // v_mov_b32 v17, s32
+        0xD8D4_8000,
+        0x1200_0011, // ds_swizzle_b32 v18, v17 offset:0x8000 (each quad's lane 0)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x800A_1210, // buffer_store_dword v18, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let first = [[1.0f32, 0.0, 0.0, 1.0]; 2];
+    let second = [[2.0f32, 0.0, 0.0, 1.0]; 4];
+    let views = [
+        View::Texture(1, 2, &first),
+        View::Texture(1, 4, &second),
+        View::RawUav(64),
+    ];
+    let (shader, _, _) = lower_cs(&words, false);
+    let results = run_on(&shader, &views, true);
+    assert!(!results.is_empty());
+    for (label, words) in results {
+        assert_eq!(words[..32], [4; 32], "{label}");
+    }
+}
+
 #[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
