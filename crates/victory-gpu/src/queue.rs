@@ -123,7 +123,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        host.submit(&host_lists);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
@@ -276,6 +276,9 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    // After the submissions queued before: they set the real states of
+    // what they draw (`host_transition`).
+    crate::pipelined::drained();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::capture::note_present(frame);
     #[cfg(all(windows, feature = "diagnostics"))]

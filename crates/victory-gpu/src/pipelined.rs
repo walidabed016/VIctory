@@ -50,6 +50,44 @@ pub(crate) fn on() -> bool {
     })
 }
 
+/// Pipelined, with `VICTORY_SUBMIT_THREAD=1`: the title's submissions are
+/// prepared, executed and launched in order on a host submit thread, and
+/// the title returns once one is queued for it ([`queue`]).
+pub(crate) fn submit_thread() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = on() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("host submit thread (VICTORY_SUBMIT_THREAD)");
+        }
+        on
+    })
+}
+
+/// Submissions queued for the submit thread, at most.
+const QUEUED: usize = 64;
+
+/// Prepares, executes and launches a submission queued for the submit
+/// thread.
+pub(crate) type Submit = Box<dyn FnOnce() + Send>;
+
+/// A submission queued for the submit thread and not launched yet.
+struct Queued {
+    ticket: u64,
+    /// Its host lists (addresses).
+    lists: Vec<usize>,
+    /// Title fences queues signalled after it, as [`Flight::signals`].
+    signals: Vec<(usize, u64)>,
+}
+
+thread_local! {
+    /// Whether this is the submit thread.
+    static SUBMITTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// On the submit thread: the ticket of the submission it runs, until
+    /// launched.
+    static TICKET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// A submission queued and not yet completed.
 struct Flight {
     seq: u64,
@@ -117,6 +155,10 @@ struct State {
     flying: VecDeque<Flight>,
     /// Title memory refreshes wait to be copied back ([`wanted`]).
     wanted: Vec<(usize, usize)>,
+    queued: VecDeque<Queued>,
+    /// The last ticket given to a queued submission, and the last launched.
+    tickets: u64,
+    dequeued: u64,
     /// The next submission's number, and the last completed (0: none).
     next: u64,
     done: u64,
@@ -141,6 +183,7 @@ struct Pipeline {
     state: Mutex<State>,
     completed: Condvar,
     jobs: OnceLock<mpsc::Sender<Job>>,
+    submits: OnceLock<mpsc::Sender<(u64, Submit)>>,
     /// Keeps a fence alive until its deferred signal, and signals (and
     /// lets go of) it.
     hold: fn(usize),
@@ -156,6 +199,9 @@ impl Pipeline {
             state: Mutex::new(State {
                 flying: VecDeque::new(),
                 wanted: Vec::new(),
+                queued: VecDeque::new(),
+                tickets: 0,
+                dequeued: 0,
                 next: 1,
                 done: 0,
                 launched: 0,
@@ -166,6 +212,7 @@ impl Pipeline {
             }),
             completed: Condvar::new(),
             jobs: OnceLock::new(),
+            submits: OnceLock::new(),
             hold,
             signal,
             copied,
@@ -191,6 +238,114 @@ impl Pipeline {
         #[cfg(feature = "diagnostics")]
         trace::waited(why.index(), seq, started);
         s
+    }
+
+    /// Waits until queued submission `ticket` has launched.
+    fn wait_launched<'a>(
+        &'a self,
+        s: MutexGuard<'a, State>,
+        ticket: u64,
+        why: Why,
+    ) -> MutexGuard<'a, State> {
+        if s.dequeued >= ticket {
+            return s;
+        }
+        let started = Instant::now();
+        let mut s = self
+            .completed
+            .wait_while(s, |s| s.dequeued < ticket)
+            .unwrap_or_else(|e| e.into_inner());
+        let w = &mut s.waits[why.index()];
+        (w.0, w.1) = (w.0 + 1, w.1 + started.elapsed());
+        #[cfg(feature = "diagnostics")]
+        trace::waited(why.index(), 0, started);
+        s
+    }
+
+    /// Off the submit thread: waits until the newest queued submission
+    /// `hit` picks has launched.
+    fn wait_queued<'a>(
+        &'a self,
+        s: MutexGuard<'a, State>,
+        hit: impl Fn(&Queued) -> bool,
+        why: Why,
+    ) -> MutexGuard<'a, State> {
+        if SUBMITTER.get() {
+            return s;
+        }
+        match s.queued.iter().rev().find(|q| hit(q)).map(|q| q.ticket) {
+            Some(ticket) => self.wait_launched(s, ticket, why),
+            None => s,
+        }
+    }
+
+    /// Queues a submission for the submit thread, after room for it.
+    fn queue(&'static self, lists: Vec<usize>, submit: Submit) {
+        let submits = self.submits.get_or_init(|| self.start_submitting());
+        let mut s = self.lock();
+        if s.queued.len() >= QUEUED {
+            let ticket = s.queued[s.queued.len() - QUEUED].ticket;
+            s = self.wait_launched(s, ticket, Why::Depth);
+        }
+        s.tickets += 1;
+        let ticket = s.tickets;
+        s.queued.push_back(Queued {
+            ticket,
+            lists,
+            signals: Vec::new(),
+        });
+        // In order with the tickets: under the lock.
+        if submits.send((ticket, submit)).is_err() {
+            tracing::error!("the submit thread is gone");
+        }
+    }
+
+    fn start_submitting(&'static self) -> mpsc::Sender<(u64, Submit)> {
+        let (send, submits) = mpsc::channel::<(u64, Submit)>();
+        let spawned = std::thread::Builder::new()
+            .name("victory submissions".into())
+            .spawn(move || {
+                SUBMITTER.set(true);
+                for (ticket, submit) in submits {
+                    TICKET.set(Some(ticket));
+                    submit();
+                    if TICKET.take().is_some() {
+                        self.unlaunched(ticket);
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "no submit thread");
+        }
+        send
+    }
+
+    /// Queued submission `ticket` launched or ran: out of the queue; the
+    /// fence signals queues made after it.
+    fn dequeue(s: &mut State, ticket: u64) -> Vec<(usize, u64)> {
+        s.dequeued = s.dequeued.max(ticket);
+        match s.queued.iter().position(|q| q.ticket == ticket) {
+            Some(i) => s.queued.remove(i).map_or_else(Vec::new, |q| q.signals),
+            None => Vec::new(),
+        }
+    }
+
+    /// Queued submission `ticket` ran without launching: its fence signals
+    /// follow the newest submission in flight, or are made now.
+    fn unlaunched(&self, ticket: u64) {
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        let signals = Self::dequeue(s, ticket);
+        match s.flying.back_mut() {
+            Some(f) => f.signals.extend(signals),
+            None => {
+                for (fence, value) in signals {
+                    (self.signal)(fence, value);
+                }
+            }
+        }
+        drop(guard);
+        self.completed.notify_all();
     }
 
     /// Waits until no submission `hit` picks is in flight (completions
@@ -310,18 +465,24 @@ impl Pipeline {
         s.launched += 1;
         #[cfg(feature = "diagnostics")]
         trace::launched(seq);
+        let ticket = TICKET.take();
+        let signals = ticket.map_or_else(Vec::new, |t| Self::dequeue(&mut s, t));
         s.flying.push_back(Flight {
             seq,
             writes: merged(writes),
             left: None,
             reads: merged(reads),
             lists,
-            signals: Vec::new(),
+            signals,
             refreshes: Vec::new(),
         });
         // In order with the numbers: under the lock.
         if jobs.send(job).is_err() {
             tracing::error!("the completion thread is gone");
+        }
+        drop(s);
+        if ticket.is_some() {
+            self.completed.notify_all();
         }
     }
 
@@ -368,11 +529,13 @@ impl Pipeline {
     fn signal_after(&self, fence: usize, value: u64) -> bool {
         let mut guard = self.lock();
         let s = &mut *guard;
-        let Some(f) = s.flying.back_mut() else {
-            return false;
+        let signals = match (s.queued.back_mut(), s.flying.back_mut()) {
+            (Some(q), _) => &mut q.signals,
+            (None, Some(f)) => &mut f.signals,
+            (None, None) => return false,
         };
         (self.hold)(fence);
-        f.signals.push((fence, value));
+        signals.push((fence, value));
         s.deferred += 1;
         true
     }
@@ -380,10 +543,13 @@ impl Pipeline {
     /// Waits for a deferred signal of `fence` to `value` or past it;
     /// whether there was one.
     fn wait_signal(&self, fence: usize, value: u64) -> bool {
+        let reaches =
+            |signals: &[(usize, u64)]| signals.iter().any(|&(x, v)| x == fence && v >= value);
         let s = self.lock();
-        let reaches = |f: &&Flight| f.signals.iter().any(|&(x, v)| x == fence && v >= value);
-        let Some(seq) = s.flying.iter().find(reaches).map(|f| f.seq) else {
-            return false;
+        let queued = s.queued.iter().any(|q| reaches(&q.signals));
+        let s = self.wait_queued(s, |q| reaches(&q.signals), Why::Signal);
+        let Some(seq) = s.flying.iter().find(|f| reaches(&f.signals)).map(|f| f.seq) else {
+            return queued;
         };
         drop(self.wait(s, seq, Why::Signal));
         true
@@ -582,6 +748,7 @@ pub(crate) fn gpu_done(early: bool) {
 /// Waits until every submission has completed.
 pub(crate) fn wait_all() {
     if on() {
+        drained();
         PIPELINE.wait_for(Why::All, |_| true);
     }
 }
@@ -589,7 +756,35 @@ pub(crate) fn wait_all() {
 /// Before a host list is reset or let go: waits for its submissions.
 pub(crate) fn wait_list(list: usize) {
     if on() {
+        drop(PIPELINE.wait_queued(PIPELINE.lock(), |q| q.lists.contains(&list), Why::List));
         PIPELINE.wait_for(Why::List, |f| f.lists.contains(&list));
+    }
+}
+
+/// Whether a submission queued or in flight runs host list `list`.
+pub(crate) fn flying(list: usize) -> bool {
+    on() && {
+        let s = PIPELINE.lock();
+        s.queued.iter().any(|q| q.lists.contains(&list))
+            || s.flying.iter().any(|f| f.lists.contains(&list))
+    }
+}
+
+/// With the submit thread, off it: queues `submit`, the title's
+/// submission of host lists `lists`, for it; whether it did.
+pub(crate) fn queue(lists: Vec<usize>, submit: Submit) -> bool {
+    if !submit_thread() || SUBMITTER.get() {
+        return false;
+    }
+    PIPELINE.queue(lists, submit);
+    true
+}
+
+/// Off the submit thread: waits until the submissions queued for it have
+/// launched.
+pub(crate) fn drained() {
+    if submit_thread() {
+        drop(PIPELINE.wait_queued(PIPELINE.lock(), |_| true, Why::All));
     }
 }
 
@@ -778,6 +973,46 @@ mod tests {
             !p.signal_after(FENCE, 7),
             "nothing in flight: signalled at once"
         );
+    }
+
+    #[test]
+    fn queued_submissions_launch_in_order_with_the_signals_made_after_them() {
+        const FENCE: usize = 3;
+        let p = pipeline();
+        let (go, gate) = mpsc::channel::<()>();
+        p.queue(
+            vec![1],
+            Box::new(move || {
+                let _ = gate.recv();
+                p.launch(Vec::new(), Vec::new(), vec![1], Box::new(|_| {}));
+            }),
+        );
+        assert!(p.signal_after(FENCE, 5));
+        p.queue(
+            vec![2],
+            Box::new(move || p.launch(Vec::new(), Vec::new(), vec![2], Box::new(|_| {}))),
+        );
+        assert!(p.signal_after(FENCE, 6));
+        let waits_for_list_2 = move || {
+            drop(p.wait_queued(p.lock(), |q| q.lists.contains(&2), Why::List));
+            p.wait_for(Why::List, |f| f.lists.contains(&2));
+        };
+        blocks_until(waits_for_list_2, go);
+        drop(p.wait_queued(p.lock(), |_| true, Why::All));
+        p.wait_for(Why::All, |_| true);
+        assert_eq!(signalled(FENCE), [5, 6]);
+        // One that never launches: the signals after it are made at once.
+        let (go, gate) = mpsc::channel::<()>();
+        p.queue(
+            vec![3],
+            Box::new(move || {
+                let _ = gate.recv();
+            }),
+        );
+        assert!(p.signal_after(FENCE, 7));
+        assert!(!p.wait_signal(FENCE, 8));
+        blocks_until(move || assert!(p.wait_signal(FENCE, 7)), go);
+        assert_eq!(signalled(FENCE), [5, 6, 7]);
     }
 
     #[test]

@@ -392,6 +392,38 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn resets_leave_lists_in_flight_and_take_them_back_once_free() {
+        let Some(host) = host() else { return };
+        let address = |r: &Recording| std::ptr::from_ref(r.get().unwrap()) as usize;
+        let errors = errors_of(|| {
+            let recording = Recording::new(Some(host.new_list().unwrap()));
+            let uploads = Mutex::new(vec![vec![1u8; 16]]);
+            let first = address(&recording);
+            recording.get().unwrap().close();
+            recording.before_reset_as(&uploads, true, |_| false);
+            assert_eq!(address(&recording), first, "not in flight: kept");
+            assert_eq!(uploads.lock().unwrap().len(), 1);
+            recording.before_reset_as(&uploads, true, |l| l == first);
+            let second = address(&recording);
+            assert_ne!(second, first, "in flight: left to its submission");
+            assert!(uploads.lock().unwrap().is_empty(), "uploads left with it");
+            recording.get().unwrap().reset();
+            recording.get().unwrap().close();
+            recording.before_reset_as(&uploads, true, |l| l == first || l == second);
+            let third = address(&recording);
+            assert!(third != first && third != second, "both still in flight");
+            recording.get().unwrap().reset();
+            recording.get().unwrap().close();
+            recording.before_reset_as(&uploads, true, |l| l == third);
+            let fourth = address(&recording);
+            assert!(fourth == first || fourth == second, "a free one taken back");
+            recording.get().unwrap().reset();
+            recording.get().unwrap().close();
+        });
+        assert_eq!(errors.unwrap_or_default(), Vec::<String>::new());
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -893,6 +925,173 @@ impl Pending {
     }
 }
 
+/// The host lists of a submission queued for the submit thread.
+struct Queued(Vec<*const HostList>);
+
+// SAFETY: as for `Pending`: the lists are not reset, let go of or
+// submitted again until the submission completes (`pipelined::wait_list`
+// waits for queued submissions too).
+unsafe impl Send for Queued {}
+
+impl Queued {
+    fn runs(&self) -> Vec<&HostList> {
+        // SAFETY: live until the submission completes (as above).
+        self.0.iter().map(|&l| unsafe { &*l }).collect()
+    }
+}
+
+/// Pipelined, with `VICTORY_RECYCLE_LISTS=1`: a title list reset while a
+/// submission in flight runs its host list leaves that list to the
+/// submission and records into a free one, instead of waiting for it
+/// ([`Recording::before_reset`]).
+pub(crate) fn recycling() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::pipelined::on()
+            && std::env::var_os("VICTORY_RECYCLE_LISTS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("host lists recycled (VICTORY_RECYCLE_LISTS)");
+        }
+        on
+    })
+}
+
+/// Free host lists kept for title lists' resets, at most.
+const FREE_LISTS: usize = 64;
+
+/// A host list a title list left: held by submissions in flight, or free.
+struct Held(Box<HostList>);
+
+// SAFETY: as for `Pending`: nothing records into, resets or submits a
+// held list; a free one goes to one title list's reset.
+unsafe impl Send for Held {}
+
+impl Held {
+    fn address(&self) -> usize {
+        std::ptr::from_ref(&*self.0) as usize
+    }
+}
+
+/// Host lists title lists left to submissions in flight, with the upload
+/// memory the title wrote for them, until those complete; then free.
+struct Recycler {
+    held: Vec<(Held, Vec<Vec<u8>>)>,
+    free: Vec<Held>,
+}
+
+impl Recycler {
+    /// Held lists no submission in flight runs any more become free, as
+    /// many as are kept.
+    fn sweep(&mut self, flying: impl Fn(usize) -> bool) {
+        let (held, done): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|(list, _)| flying(list.address()));
+        self.held = held;
+        let room = FREE_LISTS.saturating_sub(self.free.len());
+        self.free
+            .extend(done.into_iter().take(room).map(|(list, _)| list));
+    }
+}
+
+static RECYCLER: Mutex<Recycler> = Mutex::new(Recycler {
+    held: Vec::new(),
+    free: Vec::new(),
+});
+
+/// Host lists title lists' resets took since the last frame-rate line
+/// (diagnostics): free ones, new ones.
+#[cfg(feature = "diagnostics")]
+static RECYCLED: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Logs and resets [`RECYCLED`], over `frames` frames, with the lists held
+/// and free now.
+#[cfg(feature = "diagnostics")]
+fn log_recycled(frames: f64) {
+    if !recycling() {
+        return;
+    }
+    let [free, made] = RECYCLED
+        .each_ref()
+        .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let (held, kept) = {
+        let r = RECYCLER.lock().unwrap_or_else(|e| e.into_inner());
+        (r.held.len(), r.free.len())
+    };
+    tracing::info!(
+        "recycled host lists per frame: {free:.1} free ones taken, {made:.1} made; {held} held \
+         by submissions in flight, {kept} free"
+    );
+}
+
+/// A title list's host list ([`crate::list`]), which a reset may swap
+/// for a free one ([`Recording::before_reset`]).
+pub(crate) struct Recording(std::sync::atomic::AtomicPtr<HostList>);
+
+impl Recording {
+    pub(crate) fn new(list: Option<HostList>) -> Self {
+        let list = list.map_or(std::ptr::null_mut(), |l| Box::into_raw(Box::new(l)));
+        Self(std::sync::atomic::AtomicPtr::new(list))
+    }
+
+    /// The host list now. A title list is recorded into on one thread at
+    /// a time and reset only once its submissions are queued, so no one
+    /// uses a list a reset swapped out, but its submissions.
+    pub(crate) fn get<'a>(&self) -> Option<&'a HostList> {
+        // SAFETY: made by `Box::into_raw`; freed when the title list is,
+        // or held until its submissions complete.
+        unsafe { self.0.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// Before the title list is reset: waits for the submissions in flight
+    /// that run its host list, or, recycling, leaves the list to them with
+    /// the upload memory the title wrote for it (`uploads`) and records
+    /// into a free one.
+    pub(crate) fn before_reset(&self, uploads: &Mutex<Vec<Vec<u8>>>) {
+        self.before_reset_as(uploads, recycling(), crate::pipelined::flying);
+    }
+
+    fn before_reset_as(
+        &self,
+        uploads: &Mutex<Vec<Vec<u8>>>,
+        recycle: bool,
+        flying: impl Fn(usize) -> bool,
+    ) {
+        let Some(list) = self.get() else { return };
+        let at = std::ptr::from_ref(list) as usize;
+        if !recycle || !flying(at) {
+            crate::pipelined::wait_list(at);
+            return;
+        }
+        let Some(fresh) = host().and_then(|h| h.free_list(&flying)) else {
+            crate::pipelined::wait_list(at);
+            return;
+        };
+        let left = self.0.swap(Box::into_raw(fresh), Ordering::AcqRel);
+        let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        // SAFETY: made by `Box::into_raw`, and no longer the title list's.
+        let left = Held(unsafe { Box::from_raw(left) });
+        RECYCLER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held
+            .push((left, uploads));
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        let list = *self.0.get_mut();
+        if !list.is_null() {
+            // SAFETY: made by `Box::into_raw`; the title list is let go of
+            // only after its submissions (`pipelined::wait_list`).
+            drop(unsafe { Box::from_raw(list) });
+        }
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -976,6 +1175,32 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             list.stamp_start();
             Ok(list)
+        }
+    }
+
+    /// A closed host list for a title list's reset ([`recycling`]): a free
+    /// one, or a new one.
+    fn free_list(&self, flying: impl Fn(usize) -> bool) -> Option<Box<HostList>> {
+        let free = {
+            let mut recycler = RECYCLER.lock().unwrap_or_else(|e| e.into_inner());
+            recycler.sweep(flying);
+            recycler.free.pop()
+        };
+        #[cfg(feature = "diagnostics")]
+        RECYCLED[usize::from(free.is_none())].fetch_add(1, Ordering::Relaxed);
+        if let Some(Held(list)) = free {
+            return Some(list);
+        }
+        let list = self
+            .new_list()
+            // SAFETY: our list.
+            .and_then(|list| unsafe { list.list.Close() }.map(|()| list));
+        match list {
+            Ok(list) => Some(Box::new(list)),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host list to recycle");
+                None
+            }
         }
     }
 
@@ -1129,7 +1354,27 @@ impl Host {
         }
     }
 
+    /// The title's submission of `runs`: queued for the host submit
+    /// thread ([`crate::pipelined::submit_thread`]), or run now.
+    pub(crate) fn submit(&self, runs: &[&HostList]) {
+        let lists = runs
+            .iter()
+            .map(|l| std::ptr::from_ref(*l) as usize)
+            .collect();
+        let queued = Queued(runs.iter().map(|l| std::ptr::from_ref(*l)).collect());
+        let submit = move || {
+            if let Some(host) = host() {
+                host.execute(&queued.runs());
+            }
+        };
+        if !crate::pipelined::queue(lists, Box::new(submit)) {
+            self.execute(runs);
+        }
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // After the title's submissions queued before.
+        crate::pipelined::drained();
         // One submission prepared at a time; pipelined, copies keep what
         // copy-back needs per submission slot (`crate::shadow::preparing`).
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3130,6 +3375,7 @@ impl Meter {
                 log_gpu_times(span);
                 crate::pipelining::log(span);
                 crate::pipelined::log(span);
+                log_recycled(span);
                 log_gpu_memory();
                 let uploaded = crate::texture::UPLOADED
                     .each_ref()

@@ -116,7 +116,7 @@ struct List {
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: crate::host::Recording,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -140,7 +140,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    unsafe { (*this.cast::<List>()).host.get() }
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -216,13 +216,13 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::Recording::new(crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
             }
-        }),
+        })),
         #[cfg(windows)]
         state: Default::default(),
     });
@@ -268,14 +268,13 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for;
-    // pipelined, waited for here).
-    #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        crate::pipelined::wait_list(std::ptr::from_ref(host) as usize);
-    }
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
+    // Every submission of the list has run (submissions are waited for;
+    // pipelined, waited for here, or left the host list they run).
+    #[cfg(windows)]
+    // SAFETY: as above.
+    unsafe { &(*this.cast::<List>()).host }.before_reset(uploads);
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(windows)]
     with_state(this, |host, state| {
