@@ -825,11 +825,26 @@ pub(crate) fn gpu_done(early: bool) {
     }
 }
 
+/// Diagnostics (`VICTORY_GPU_SPANS`): the oldest submission in flight, now
+/// done, ran on the GPU from `start` to `end`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn gpu_span(start: Instant, end: Instant) {
+    let seq = PIPELINE.lock().flying.front().map(|f| f.seq);
+    if let Some(seq) = seq {
+        trace::span(seq, start, end);
+    }
+}
+
 /// Waits until every submission has completed.
+#[track_caller]
 pub(crate) fn wait_all() {
     if on() {
+        #[cfg(feature = "diagnostics")]
+        let (caller, started) = (std::panic::Location::caller(), Instant::now());
         drained();
         PIPELINE.wait_for(Why::All, |_| true);
+        #[cfg(feature = "diagnostics")]
+        trace::waited_all(caller, started);
     }
 }
 
