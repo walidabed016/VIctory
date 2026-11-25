@@ -2215,6 +2215,15 @@ pub(crate) fn upload_twins(list: &ID3D12GraphicsCommandList) -> u64 {
         let Some(twin) = &s.twin else {
             continue;
         };
+        // The copies read and write its buffers when the submission runs,
+        // and the title may have released the copy: this may be its last
+        // reference.
+        if !ranges.is_empty()
+            && let Some(host) = host()
+        {
+            host.retire(s.buffer.clone());
+            host.retire(twin.clone());
+        }
         let start = s.start as usize;
         for (from, to) in merge(ranges) {
             if s.mirror() {
@@ -4708,6 +4717,61 @@ pub(crate) mod tests {
         }
         drop((buffer, slab));
         unregister(usize::MAX - 14, at as u64);
+        release(at);
+    }
+
+    /// The title releases a copy whose twin has yet to take what copy-back
+    /// gave its host copy: the next submission's upload keeps both buffers
+    /// until it has run (they went with the copy's last reference, and the
+    /// device was removed).
+    #[test]
+    fn an_upload_keeps_a_released_copys_buffers_until_it_runs() {
+        let _serial = crate::watch::serial();
+        if !gpu() || !twins_on() {
+            return;
+        }
+        let host = host().unwrap();
+        let at = title_memory(1330, 256 * MIB, 32 * MIB, 32 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 29, at as u64, 512 << 10);
+        let s = find(at as u64, 512 << 10).unwrap();
+        assert!(s.twin.is_some() && !s.in_place);
+        let (upload, data) = host.upload_buffer(4096).unwrap();
+        // SAFETY: our mapped upload buffer.
+        unsafe { data.cast::<u32>().write(0xfeed) };
+        crate::pipelined::wait_all();
+        crate::watch::forget_asked();
+        let (first, list) = (host.new_list().unwrap(), host.new_list().unwrap());
+        s.refresh(&first, at as u64, 4096);
+        first.close();
+        host.execute(&[&first]);
+        crate::pipelined::wait_all();
+        // The title writes x after the copy and its twin took it, and the
+        // GPU writes y beside it: copy-back gives the copy x, for the twin
+        // to take.
+        let (x, y) = (at + 64, at + 128);
+        // SAFETY: our test memory.
+        unsafe { (x as *mut u32).write(7) };
+        s.gpu_writes(&list, at as u64, 4096);
+        // SAFETY: an open list; live buffers holding the ranges.
+        unsafe {
+            list.list
+                .CopyBufferRegion(s.resource(), s.offset(y as u64), &upload, 0, 4)
+        };
+        list.close();
+        host.execute(&[&list]);
+        crate::pipelined::wait_all();
+        // SAFETY: as above.
+        let read = |a: usize| unsafe { (a as *const u32).read() };
+        assert_eq!((read(x), read(y)), (7, 0xfeed));
+        drop(s);
+        unregister(usize::MAX - 29, at as u64);
+        let next = host.new_list().unwrap();
+        next.close();
+        host.execute(&[&next]);
+        crate::pipelined::wait_all();
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         release(at);
     }
 
