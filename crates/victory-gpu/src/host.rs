@@ -445,9 +445,11 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
-/// Whether each list of a submission runs and is timed on its own, slow
-/// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// Whether submissions are timed: their lists' commands by GPU timestamps
+/// and the waits for them split, slow lists logged with their commands
+/// (`VICTORY_GPU_TIMING`, diagnostics builds; the commands are noted with
+/// `VICTORY_D3D12_DRED` on). Lists are submitted as without timing; only
+/// the copies into and out of VRAM twins are waited for on their own.
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -456,52 +458,56 @@ fn timing() -> bool {
 
 /// GPU time of the commands lists noted, since the last frame-rate line
 /// (diagnostics, timing on): ms, count and the longest by command kind and
-/// pipeline; lists run, ms waited for them, ms between their first and last
-/// timestamps, ms in timed commands, commands timed and not.
+/// pipeline; submissions and lists run, ms waited for them (`before`, the
+/// submissions' [`Split`]s, `after`), ms in timed commands, commands timed
+/// and not.
 #[cfg(feature = "diagnostics")]
 #[derive(Default)]
 struct GpuTimes {
     by_label: std::collections::HashMap<String, (f64, u64, f64)>,
+    submissions: u64,
     lists: u64,
     waited: f64,
-    span: f64,
     timed: f64,
     commands: u64,
     untimed: u64,
-    /// Of the waits, ms, as in [`Split`]; and waiting for the tile
-    /// mappings queued before a submission's lists.
+    /// Waiting for the tile mappings and copies into twins queued before
+    /// submissions' lists, and for the copies out of twins after them.
+    before: f64,
+    after: f64,
+    /// Of the waits for the lists, as in [`Split`].
     submit: f64,
     launch: f64,
+    inside: f64,
+    gaps: f64,
+    wake: f64,
+    /// Of the time in lists: in preludes, and from lists' start to their
+    /// first noted command.
     prelude: f64,
     lead: f64,
-    wake: f64,
-    tiles: f64,
 }
 
-/// A timed list's submission on the CPU (QueryPerformanceCounter ticks):
-/// before and after ExecuteCommandLists, when the wait ended, and the
-/// queue's clock calibration then (GPU ticks, CPU ticks).
+/// A timed submission on the CPU (QueryPerformanceCounter ticks): before
+/// and after ExecuteCommandLists, and when the wait ended.
 #[cfg(feature = "diagnostics")]
 struct Submitted {
     before: i64,
     after: i64,
     woke: i64,
-    calibration: Option<(u64, u64)>,
 }
 
-/// A timed list's wait, ms (diagnostics): in ExecuteCommandLists, from
-/// calling it to the GPU's first timestamp (zero without the queue's clock
-/// calibration), in its prelude, from its start to its first noted command,
-/// from its start to its end, from its end to the wait's end (zero without
-/// the calibration).
+/// A timed submission's wait for its lists, ms (diagnostics): in
+/// ExecuteCommandLists; from calling it to the GPU's first timestamp; in
+/// the lists (preludes included); between one list's end and the next's
+/// start; from the last list's end to the wait's end. Without the queue's
+/// clock calibration, launch and wake are zero.
 #[cfg(feature = "diagnostics")]
 #[derive(Debug, Default)]
 struct Split {
     submit: f64,
     launch: f64,
-    prelude: f64,
-    lead: f64,
-    span: f64,
+    inside: f64,
+    gaps: f64,
     wake: f64,
 }
 
@@ -585,23 +591,27 @@ fn log_gpu_times(frames: f64) {
     };
     let frames = frames.max(1.0);
     tracing::info!(
-        "GPU timing per frame: {:.1} lists, {:.1} ms waited for them, {:.1} ms from their first \
-         timestamp to their last, {:.1} ms in {:.0} timed commands ({:.0} more not timed); of the \
-         waits: {:.1} ms in ExecuteCommandLists, {:.1} ms from calling it to the GPU's first \
-         timestamp, {:.1} ms in preludes, {:.1} ms from lists' start to their first noted command, \
-         {:.1} ms from lists' end to the wait's end; {:.1} ms waiting for tile mappings",
+        "GPU timing per frame: {:.1} submissions of {:.1} lists, {:.1} ms waited for the GPU: \
+         {:.1} ms for tile mappings and copies into twins; {:.1} ms from calling \
+         ExecuteCommandLists to the GPU's first timestamp ({:.1} ms inside the call); {:.1} ms in \
+         lists ({:.1} in preludes, {:.1} before their first noted command, {:.1} in {:.0} timed \
+         commands, {:.0} more not timed); {:.1} ms between lists; {:.1} ms from the last list's \
+         end to the wait's end; {:.1} ms for copies out of twins",
+        t.submissions as f64 / frames,
         t.lists as f64 / frames,
         t.waited / frames,
-        t.span / frames,
+        t.before / frames,
+        t.launch / frames,
+        t.submit / frames,
+        t.inside / frames,
+        t.prelude / frames,
+        t.lead / frames,
         t.timed / frames,
         t.commands as f64 / frames,
         t.untimed as f64 / frames,
-        t.submit / frames,
-        t.launch / frames,
-        t.prelude / frames,
-        t.lead / frames,
+        t.gaps / frames,
         t.wake / frames,
-        t.tiles / frames,
+        t.after / frames,
     );
     let mut kinds: std::collections::HashMap<&str, (f64, u64)> = Default::default();
     for (label, (ms, n, _)) in &t.by_label {
@@ -861,6 +871,91 @@ impl Host {
         }
     }
 
+    /// Diagnostics: waits until the queue has run all it was given; the ms
+    /// that took, or `None` if it could not wait.
+    #[cfg(feature = "diagnostics")]
+    fn drain(&self, submitted: &mut u64) -> Option<f64> {
+        let start = std::time::Instant::now();
+        *submitted += 1;
+        // SAFETY: the fence and event are ours.
+        unsafe {
+            self.queue
+                .Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
+                .ok()?;
+            WaitForSingleObject(self.event, INFINITE);
+        }
+        Some(start.elapsed().as_secs_f64() * 1e3)
+    }
+
+    /// Diagnostics, timing on, after a submission of `runs` ran and its
+    /// lists were waited for `waited`: their command times, and the wait
+    /// split; slow lists are logged with their slowest commands.
+    #[cfg(feature = "diagnostics")]
+    fn time_submission(
+        &self,
+        runs: &[&HostList],
+        waited: std::time::Duration,
+        submitted: &Submitted,
+    ) {
+        let (mut gpu, mut cpu) = (0, 0);
+        // SAFETY: plain queries.
+        let (frequency, calibrated) = unsafe {
+            (
+                self.queue.GetTimestampFrequency().unwrap_or(1),
+                self.queue.GetClockCalibration(&mut gpu, &mut cpu).is_ok(),
+            )
+        };
+        let ms = |ticks: i64| ticks as f64 * 1e3 / frequency.max(1) as f64;
+        // CPU times and GPU timestamps as ms since ExecuteCommandLists was
+        // called.
+        let since = |qpc: i64| (qpc - submitted.before) as f64 * 1e3 / qpc_frequency() as f64;
+        let on_cpu = |stamp: u64| since(cpu as i64) + ms(stamp.wrapping_sub(gpu) as i64);
+        let took = |(first, end): (u64, u64)| ms(end.wrapping_sub(first) as i64);
+        let ran: Vec<Option<(u64, u64)>> = runs.iter().map(|l| l.tally(frequency)).collect();
+        let timed: Vec<(u64, u64)> = ran.iter().flatten().copied().collect();
+        let mut split = Split {
+            submit: since(submitted.after),
+            inside: timed.iter().map(|&r| took(r)).sum(),
+            gaps: timed.windows(2).map(|w| took((w[0].1, w[1].0))).sum(),
+            ..Split::default()
+        };
+        if calibrated && let (Some(first), Some(last)) = (timed.first(), timed.last()) {
+            split.launch = on_cpu(first.0);
+            split.wake = since(submitted.woke) - on_cpu(last.1);
+        }
+        let waited = waited.as_secs_f64() * 1e3;
+        {
+            let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+            let t = times.get_or_insert_with(GpuTimes::default);
+            t.submissions += 1;
+            t.waited += waited;
+            t.submit += split.submit;
+            t.launch += split.launch;
+            t.inside += split.inside;
+            t.gaps += split.gaps;
+            t.wake += split.wake;
+        }
+        if waited > 50.0 {
+            tracing::warn!(
+                ms = waited as u64,
+                lists = runs.len(),
+                ?split,
+                "slow timed submission"
+            );
+        }
+        for (list, ran) in runs.iter().zip(ran) {
+            let Some(ms) = ran.map(took).filter(|&ms| ms > 50.0) else {
+                continue;
+            };
+            let commands = list.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            tracing::warn!(ms = ms as u64, commands, "slow host list");
+            for (ms, op) in list.slowest(frequency, 6) {
+                tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            }
+        }
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -870,13 +965,10 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         crate::watch::forget_asked();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -951,109 +1043,75 @@ impl Host {
                 counter.fetch_add(n, Ordering::Relaxed);
             }
         }
-        // Diagnostics: the tile mappings just queued, waited for on their own.
-        #[cfg(feature = "diagnostics")]
-        if timing() {
-            *submitted += 1;
-            // SAFETY: the fence and event are ours.
-            let waited = unsafe {
-                self.queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
-                    .map(|()| WaitForSingleObject(self.event, INFINITE))
-            };
-            if waited.is_ok() {
-                let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
-                times.get_or_insert_with(GpuTimes::default).tiles +=
-                    prepared.elapsed().as_secs_f64() * 1e3;
-            }
-        }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
         for list in &twins_before {
             // SAFETY: a closed list, run before the submission's.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list.clone())]) };
         }
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            let before = qpc();
-            // SAFETY: closed lists.
-            unsafe { self.queue.ExecuteCommandLists(group) };
-            #[cfg(feature = "diagnostics")]
-            let after = qpc();
-            if i + 1 == groups.len()
-                && let Some(list) = twins_after.take()
-            {
+        // Diagnostics (`VICTORY_GPU_TIMING`): the tile mappings and copies
+        // into twins just queued are waited for on their own, and so are the
+        // copies out of twins after the lists.
+        #[cfg(feature = "diagnostics")]
+        if timing()
+            && let Some(ms) = self.drain(&mut submitted)
+        {
+            let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+            let t = times.get_or_insert_with(GpuTimes::default);
+            (t.before, t.waited) = (t.before + ms, t.waited + ms);
+        }
+        #[cfg(feature = "diagnostics")]
+        let (twins_after, timed_after) = match timing() {
+            true => (None, twins_after),
+            false => (twins_after, None),
+        };
+        *submitted += 1;
+        #[cfg(feature = "diagnostics")]
+        let (launched, before) = (std::time::Instant::now(), qpc());
+        // SAFETY: closed lists.
+        unsafe { self.queue.ExecuteCommandLists(&lists) };
+        #[cfg(feature = "diagnostics")]
+        let after = qpc();
+        if let Some(list) = twins_after {
+            // SAFETY: a closed list, run after the submission's.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        }
+        // SAFETY: the fence and event are ours.
+        unsafe {
+            let waited = self
+                .queue
+                .Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+            match waited {
+                Ok(()) => {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if timing() {
+            let woke = qpc();
+            self.time_submission(
+                runs,
+                launched.elapsed(),
+                &Submitted {
+                    before,
+                    after,
+                    woke,
+                },
+            );
+            if let Some(list) = timed_after {
                 // SAFETY: a closed list, run after the submission's.
                 unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
-            }
-            // SAFETY: the fence and event are ours.
-            unsafe {
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Some(ms) = self.drain(&mut submitted) {
+                    let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+                    let t = times.get_or_insert_with(GpuTimes::default);
+                    (t.after, t.waited) = (t.after + ms, t.waited + ms);
                 }
             }
-            #[cfg(feature = "diagnostics")]
-            if timing() {
-                let woke = qpc();
-                let waited = started.elapsed();
-                let (mut gpu, mut cpu) = (0, 0);
-                // SAFETY: plain queries.
-                let (frequency, calibrated) = unsafe {
-                    (
-                        self.queue.GetTimestampFrequency().unwrap_or(1),
-                        self.queue.GetClockCalibration(&mut gpu, &mut cpu).is_ok(),
-                    )
-                };
-                let calibration = calibrated.then_some((gpu, cpu));
-                let split = runs[i].tally(
-                    frequency,
-                    waited,
-                    &Submitted {
-                        before,
-                        after,
-                        woke,
-                        calibration,
-                    },
-                );
-                if waited > std::time::Duration::from_millis(50) {
-                    let commands = runs[i]
-                        .notes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .len();
-                    tracing::warn!(ms = waited.as_millis(), commands, ?split, "slow host list");
-                    for (ms, op) in runs[i].slowest(frequency, 6) {
-                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                    }
-                }
-            }
-            let _ = (i, started);
         }
         // Retired before this submission: no submission still runs that
         // read them.
         drop(retired);
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1369,47 +1427,23 @@ impl HostList {
         times
     }
 
-    /// Adds the list's command times to the frame's GPU time by command
-    /// and pipeline, and splits the wait for it (diagnostics, timing on,
-    /// after the list ran and was waited for `waited`).
+    /// Adds the list's times to the frame's GPU time by command and
+    /// pipeline (diagnostics, timing on, after the list ran). Returns its
+    /// first timestamp (its prelude's start if a prelude ran) and its last.
     #[cfg(feature = "diagnostics")]
-    fn tally(&self, frequency: u64, waited: std::time::Duration, submitted: &Submitted) -> Split {
+    fn tally(&self, frequency: u64) -> Option<(u64, u64)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         let (stamps, prelude) = self.timestamps(notes.len());
         let ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
-        // CPU times and GPU timestamps as ms since ExecuteCommandLists was
-        // called.
-        let since = |qpc: i64| (qpc - submitted.before) as f64 * 1e3 / qpc_frequency() as f64;
-        let on_cpu = submitted.calibration.map(|(gpu, cpu)| {
-            move |stamp: u64| {
-                since(cpu as i64)
-                    + stamp.wrapping_sub(gpu) as i64 as f64 * 1e3 / frequency.max(1) as f64
-            }
-        });
-        let mut split = Split {
-            submit: since(submitted.after),
-            ..Split::default()
-        };
-        if let (Some(&start), Some(&end)) = (stamps.first(), stamps.last()) {
-            split.prelude = prelude.map_or(0.0, |[from, to]| ms(to.saturating_sub(from)));
-            split.lead = ms(stamps[1].saturating_sub(start));
-            split.span = ms(end.saturating_sub(start));
-            if let Some(on_cpu) = on_cpu {
-                split.launch = on_cpu(prelude.map_or(start, |p| p[0]));
-                split.wake = since(submitted.woke) - on_cpu(end);
-            }
-        }
         let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
         let t = times.get_or_insert_with(GpuTimes::default);
         t.lists += 1;
-        t.waited += waited.as_secs_f64() * 1e3;
-        t.submit += split.submit;
-        t.launch += split.launch;
-        t.prelude += split.prelude;
-        t.lead += split.lead;
-        t.span += split.span;
-        t.wake += split.wake;
         t.untimed += notes.len().saturating_sub(NOTED) as u64;
+        let (&start, &end) = (stamps.first()?, stamps.last()?);
+        let first = prelude.map_or(start, |p| p[0]);
+        t.inside += ms(end.saturating_sub(first));
+        t.prelude += prelude.map_or(0.0, |[from, to]| ms(to.saturating_sub(from)));
+        t.lead += ms(stamps[1].saturating_sub(start));
         for (s, (note, _)) in stamps
             .get(1..)
             .unwrap_or_default()
@@ -1424,7 +1458,7 @@ impl HostList {
             e.1 += 1;
             e.2 = e.2.max(took);
         }
-        split
+        Some((first, end))
     }
 
     /// Diagnostics, timing on: the timestamp of the list's start (just
