@@ -138,6 +138,8 @@ impl Iterator for Written<'_> {
 /// copies into title memory ran, or its shaders' writes go back): every
 /// range is asked about again.
 pub(crate) fn forget_asked() {
+    #[cfg(feature = "diagnostics")]
+    FORGOTTEN_AT.store(CHANGE.load(Ordering::SeqCst), Ordering::Relaxed);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.fresh.clear();
     j.ours.clear();
@@ -164,7 +166,7 @@ pub(crate) fn wrote_since(asked: u64, start: usize, end: usize) -> bool {
 /// next asking of a range not asked about since [`forget_asked`]). Its pages
 /// count as written now: the asking it returns.
 pub(crate) fn wrote(start: usize, end: usize) -> u64 {
-    changed(start / BLOCK, end.div_ceil(BLOCK));
+    changed(By::Us, start / BLOCK, end.div_ceil(BLOCK));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.asked += 1;
     let now = j.asked;
@@ -182,7 +184,7 @@ pub(crate) fn wrote(start: usize, end: usize) -> u64 {
         .collect();
     for a in aliases {
         g.clean.remove(a, a + 1);
-        changed(a, a + 1);
+        changed(By::Alias, a, a + 1);
         j.written.insert(a * BLOCK / PAGE, now);
         j.ours.push((now, a * BLOCK, (a + 1) * BLOCK));
     }
@@ -456,17 +458,58 @@ pub(crate) const REGION: usize = 4 << 20;
 static CHANGES: [AtomicU64; 1 << 18] = [const { AtomicU64::new(0) }; 1 << 18];
 static CHANGE: AtomicU64 = AtomicU64::new(0);
 
+/// Who changed title memory ([`changed`]).
+#[derive(Clone, Copy)]
+enum By {
+    /// The title wrote a guarded block.
+    Title,
+    /// We wrote it: shaders' writes copied back, copies into title memory.
+    Us,
+    /// The runtime wrote physical pages.
+    Runtime,
+    /// Pages shown at another address changed.
+    Alias,
+    /// It was mapped or unmapped, or a pool or host heap began or ended.
+    Mapping,
+}
+
+/// Diagnostics: changes by who made them ([`By`]), and regions changed
+/// for the first time since the last [`forget_asked`] (once per
+/// submission), which that asking's [`CHANGE`] number tells.
+#[cfg(feature = "diagnostics")]
+static CHANGED_BY: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(feature = "diagnostics")]
+static FORGOTTEN_AT: AtomicU64 = AtomicU64::new(0);
+
 /// Blocks `[from, to)` may no longer hold what a copy took, or are
 /// guarded or clean no more.
-fn changed(from: usize, to: usize) {
+fn changed(by: By, from: usize, to: usize) {
     let now = CHANGE.fetch_add(1, Ordering::SeqCst) + 1;
     let (a, b) = (
         from * BLOCK / REGION,
         to.saturating_mul(BLOCK).div_ceil(REGION),
     );
+    #[cfg(feature = "diagnostics")]
+    let forgotten = FORGOTTEN_AT.load(Ordering::Relaxed);
     for region in &CHANGES[a.min(CHANGES.len())..b.min(CHANGES.len())] {
-        region.fetch_max(now, Ordering::SeqCst);
+        let _old = region.fetch_max(now, Ordering::SeqCst);
+        #[cfg(feature = "diagnostics")]
+        if _old <= forgotten {
+            CHANGED_BY[5].fetch_add(1, Ordering::Relaxed);
+        }
     }
+    #[cfg(feature = "diagnostics")]
+    CHANGED_BY[by as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = by;
+}
+
+/// Diagnostics: changes to title memory since the last call, by title
+/// writes, ours, the runtime's, aliases and mappings, and the regions
+/// changed for the first time since a submission began, summed.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn change_counts() -> [u64; 6] {
+    CHANGED_BY.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
 }
 
 /// The latest change's number ([`changed`]).
@@ -889,7 +932,7 @@ fn guard_aliases(g: &mut Guards, from: usize, to: usize) {
         }
         if !guarded {
             g.clean.remove(block, block + 1);
-            changed(block, block + 1);
+            changed(By::Alias, block, block + 1);
         }
     }
 }
@@ -905,20 +948,20 @@ fn aliases_written(g: &mut Guards, from: usize, to: usize) {
     for a in aliases {
         save(g, a, a + 1);
         g.clean.remove(a, a + 1);
-        changed(a, a + 1);
+        changed(By::Alias, a, a + 1);
     }
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+fn open(g: &mut Guards, by: By, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let runs = g.protected.within(start / BLOCK, end.div_ceil(BLOCK));
     for &(from, to) in &runs {
         save(g, from, to);
         g.protected.remove(from, to);
         g.clean.remove(from, to);
-        changed(from, to);
+        changed(by, from, to);
         for block in from..to {
             let mut old = 0;
             // SAFETY: a block we made read-only.
@@ -1131,7 +1174,7 @@ pub(crate) fn disarm(slot: usize) {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    open(&mut guards(), By::Us, at, at.saturating_add(len));
 }
 
 /// Before our own write into title memory `[at, at + len)` from the CPU,
@@ -1146,7 +1189,7 @@ pub(crate) fn writing_in_place<T>(at: usize, len: usize, write: impl FnOnce(bool
         let (from, to) = (at / BLOCK, (at + len).div_ceil(BLOCK));
         let ours = g.protected.gaps(from, to).is_empty()
             && !g.unmapping.iter().any(|&(f, t)| f < to && from < t);
-        open(&mut g, at, at + len);
+        open(&mut g, By::Us, at, at + len);
         ours
     };
     write(ours)
@@ -1211,7 +1254,7 @@ pub fn title_memory_shows(at: usize, len: usize, first: u64) {
     for a in others {
         save(&mut g, a, a + 1);
         g.clean.remove(a, a + 1);
-        changed(a, a + 1);
+        changed(By::Alias, a, a + 1);
     }
 }
 
@@ -1254,7 +1297,7 @@ pub fn physical_pages_writing(first: u64, n: usize) {
     for b in blocks {
         save(&mut g, b, b + 1);
         g.clean.remove(b, b + 1);
-        changed(b, b + 1);
+        changed(By::Runtime, b, b + 1);
     }
 }
 
@@ -1283,7 +1326,7 @@ pub fn physical_pages_written(first: u64, n: usize) {
     let now = j.asked;
     for b in blocks {
         g.clean.remove(b, b + 1);
-        changed(b, b + 1);
+        changed(By::Runtime, b, b + 1);
         j.written.insert(b * BLOCK / PAGE, now);
     }
 }
@@ -1337,7 +1380,7 @@ fn ask_views() -> bool {
 pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
     let mut g = guards();
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    changed(from, to);
+    changed(By::Mapping, from, to);
     if watched {
         g.pools.insert(from, to);
     } else {
@@ -1355,7 +1398,7 @@ pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
 pub(crate) fn title_memory_held(at: usize, len: usize, held: bool) {
     let mut g = guards();
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    changed(from, to);
+    changed(By::Mapping, from, to);
     if held {
         g.held.insert(from, to);
     } else {
@@ -1394,7 +1437,7 @@ fn unguard(g: &mut Guards, from: usize, to: usize, mapped: bool) {
     g.protected.remove(from, to);
     // Unmapped blocks are clean without being guarded.
     g.clean.remove(from, to);
-    changed(from, to);
+    changed(By::Mapping, from, to);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1420,7 +1463,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open(&mut g, By::Title, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;

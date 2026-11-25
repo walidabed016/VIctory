@@ -140,6 +140,14 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     )];
+    let [title, ours, runtime, alias, mapping, regions] =
+        crate::watch::change_counts().map(|n| n as f64 / frames);
+    lines.push(format!(
+        "title memory changes per frame: {title:.0} by title writes, {ours:.0} by ours, \
+         {runtime:.0} by the runtime, {alias:.0} by aliases, {mapping:.0} by mappings; \
+         {:.1} regions of 4 MiB changed per submission",
+        regions / c[C::Submissions as usize].max(1.0)
+    ));
     cost_lines(frames, &mut lines);
     lines.push(crate::resource::alias::line(frames));
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();

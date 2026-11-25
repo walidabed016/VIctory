@@ -5232,8 +5232,15 @@ pub(crate) mod tests {
             "asked about unchanged regions"
         );
         let w = at + 5 * MIB + 8;
+        #[cfg(feature = "diagnostics")]
+        crate::watch::change_counts();
         // SAFETY: our view (guarded: our handler opens the block).
         unsafe { (w as *mut u32).write(0x5eed) };
+        #[cfg(feature = "diagnostics")]
+        {
+            let [title, .., regions] = crate::watch::change_counts();
+            assert!(title >= 1 && regions >= 1, "a title write not counted");
+        }
         assert_eq!(
             s.unsynced(at, at + 8 * MIB),
             Some((at + 4 * MIB, at + 8 * MIB))
