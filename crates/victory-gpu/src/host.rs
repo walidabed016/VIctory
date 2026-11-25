@@ -423,6 +423,15 @@ mod tests {
     }
 
     #[test]
+    fn free_lists_kept_are_64_unless_set() {
+        assert_eq!(free_lists_from(None), 64);
+        assert_eq!(free_lists_from(Some("x")), 64);
+        assert_eq!(free_lists_from(Some(" 256 ")), 256);
+        assert_eq!(free_lists_from(Some("0")), 1);
+        assert_eq!(free_lists_from(Some("100000")), 4096);
+    }
+
+    #[test]
     fn resets_leave_lists_in_flight_and_take_them_back_once_free() {
         let Some(host) = host() else { return };
         let address = |r: &Recording| std::ptr::from_ref(r.get().unwrap()) as usize;
@@ -1021,8 +1030,28 @@ pub(crate) fn recycling() -> bool {
     })
 }
 
-/// Free host lists kept for title lists' resets, at most.
-const FREE_LISTS: usize = 64;
+/// Free host lists kept for title lists' resets, at most: 64, else
+/// `VICTORY_FREE_LISTS` (1 to 4096). Lists freed past it are let go of,
+/// and resets that find none free make new ones: in run 155 (~100-140
+/// held by submissions in flight) that was ~45 lists a frame each way,
+/// and a title thread spent ~30% of its stack samples in resets letting
+/// lists' buffers go, and recording threads some in making them.
+fn free_lists() -> usize {
+    static FREE: OnceLock<usize> = OnceLock::new();
+    *FREE.get_or_init(|| {
+        let set = std::env::var("VICTORY_FREE_LISTS").ok();
+        let free = free_lists_from(set.as_deref());
+        if set.is_some() {
+            tracing::info!(free, "free host lists kept (VICTORY_FREE_LISTS)");
+        }
+        free
+    })
+}
+
+fn free_lists_from(set: Option<&str>) -> usize {
+    set.and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(64, |n| n.clamp(1, 4096))
+}
 
 /// A host list a title list left: held by submissions in flight, or free.
 struct Held(Box<HostList>);
@@ -1052,7 +1081,7 @@ impl Recycler {
             .into_iter()
             .partition(|(list, _)| flying(list.address()));
         self.held = held;
-        let room = FREE_LISTS.saturating_sub(self.free.len());
+        let room = free_lists().saturating_sub(self.free.len());
         self.free
             .extend(done.into_iter().take(room).map(|(list, _)| list));
     }
