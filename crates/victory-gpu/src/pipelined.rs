@@ -56,6 +56,9 @@ struct Flight {
     /// Title memory its shaders write `[from, to)`, sorted and merged:
     /// copied back when it completes.
     writes: Vec<(usize, usize)>,
+    /// Of `writes`, those not copied back yet once its copy-back has begun
+    /// ([`copied_back_but`]); none before.
+    left: Option<Vec<(usize, usize)>>,
     /// Title memory its lists read through host copies and staging
     /// buffers, as `writes`.
     reads: Vec<(usize, usize)>,
@@ -109,6 +112,8 @@ pub(crate) enum Writer {
 
 struct State {
     flying: VecDeque<Flight>,
+    /// Title memory refreshes wait to be copied back ([`wanted`]).
+    wanted: Vec<(usize, usize)>,
     /// The next submission's number, and the last completed (0: none).
     next: u64,
     done: u64,
@@ -139,6 +144,7 @@ impl Pipeline {
         Self {
             state: Mutex::new(State {
                 flying: VecDeque::new(),
+                wanted: Vec::new(),
                 next: 1,
                 done: 0,
                 launched: 0,
@@ -183,6 +189,39 @@ impl Pipeline {
         }
     }
 
+    /// Waits until no submission in flight has `[from, to)` of its writes
+    /// left to copy back, noting the range wanted meanwhile.
+    fn wait_copied(&self, why: Why, from: usize, to: usize) {
+        let left = |f: &Flight| overlaps(f.left.as_ref().unwrap_or(&f.writes), from, to);
+        let mut s = self.lock();
+        if !s.flying.iter().any(left) {
+            return;
+        }
+        let started = Instant::now();
+        s.wanted.push((from, to));
+        let mut s = self
+            .completed
+            .wait_while(s, |s| s.flying.iter().any(left))
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = s.wanted.iter().position(|&r| r == (from, to)) {
+            s.wanted.swap_remove(i);
+        }
+        let w = &mut s.waits[why.index()];
+        (w.0, w.1) = (w.0 + 1, w.1 + started.elapsed());
+    }
+
+    /// The oldest submission in flight has only `left` of its writes left
+    /// to copy back.
+    fn copied_back_but(&self, left: Vec<(usize, usize)>) {
+        let mut s = self.lock();
+        let Some(f) = s.flying.front_mut() else {
+            return;
+        };
+        f.left = Some(merged(left));
+        drop(s);
+        self.completed.notify_all();
+    }
+
     /// Before preparing a submission of `lists`: none of them in flight
     /// (they reset their allocators and preludes and refill their uploads)
     /// and room for one more. Its number.
@@ -219,6 +258,7 @@ impl Pipeline {
         s.flying.push_back(Flight {
             seq,
             writes: merged(writes),
+            left: None,
             reads: merged(reads),
             lists,
             signals: Vec::new(),
@@ -346,10 +386,51 @@ pub(crate) fn launch(
 }
 
 /// Before preparation reads or writes title memory `[from, to)`: waits
-/// until no submission in flight writes it (its copy-back is done).
+/// until no submission in flight writes it (its copy-back is done). A
+/// refresh waits only until the copy-backs of the range are done
+/// ([`early_refreshes`]).
 pub(crate) fn wait_writes(from: usize, to: usize, by: Writer) {
+    if !on() {
+        return;
+    }
+    if matches!(by, Writer::Refresh) && early_refreshes() {
+        PIPELINE.wait_copied(Why::Writes(by), from, to);
+        return;
+    }
+    PIPELINE.wait_for(Why::Writes(by), |f| overlaps(&f.writes, from, to));
+}
+
+/// Whether a refresh waits only until the copy-backs of the ranges it
+/// copies are done, not those of everything the submissions in flight
+/// write, and copy-back does first the copies refreshes wait for
+/// ([`wanted`]), then the smallest: in run 98 refreshes waited ~46 ms a
+/// frame for submissions in flight, whose copy-backs took ~45 ms a frame.
+/// `VICTORY_NO_EARLY_REFRESH` turns it off.
+pub(crate) fn early_refreshes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_EARLY_REFRESH").is_none();
+        if !on {
+            tracing::info!("refreshes wait for whole copy-backs (VICTORY_NO_EARLY_REFRESH)");
+        }
+        on
+    })
+}
+
+/// The copy-back of the oldest submission in flight has done all but
+/// `left` (title memory `[from, to)`): refreshes of the rest go on.
+pub(crate) fn copied_back_but(left: impl IntoIterator<Item = (usize, usize)>) {
     if on() {
-        PIPELINE.wait_for(Why::Writes(by), |f| overlaps(&f.writes, from, to));
+        PIPELINE.copied_back_but(left.into_iter().collect());
+    }
+}
+
+/// Title memory refreshes wait for copy-back to write
+/// ([`early_refreshes`]).
+pub(crate) fn wanted() -> Vec<(usize, usize)> {
+    match on() {
+        true => PIPELINE.lock().wanted.clone(),
+        false => Vec::new(),
     }
 }
 
@@ -606,6 +687,41 @@ mod tests {
         p.wait_for(Why::List, |f| f.lists.contains(&8));
         blocks_until(move || p.wait_for(why, writes(150, 160)), go);
         p.wait_for(why, writes(150, 160));
+    }
+
+    /// A refresh waits until the copy-back of its range is done, noted
+    /// wanted meanwhile; other steps wait for the whole submission.
+    #[test]
+    fn a_refresh_waits_only_for_the_copy_back_of_its_range() {
+        let p = pipeline();
+        let (part, parted) = mpsc::channel::<()>();
+        let (go, gate) = mpsc::channel::<()>();
+        p.launch(
+            vec![(100, 200), (300, 400)],
+            Vec::new(),
+            vec![9],
+            Box::new(move |_| {
+                let _ = parted.recv();
+                p.copied_back_but(vec![(300, 400)]);
+                let _ = gate.recv();
+            }),
+        );
+        let refresh = Why::Writes(Writer::Refresh);
+        blocks_until(move || p.wait_copied(refresh, 150, 160), part);
+        p.wait_copied(refresh, 150, 160);
+        let waiter = std::thread::spawn(move || p.wait_copied(refresh, 300, 350));
+        let started = Instant::now();
+        while p.lock().wanted != [(300, 350)] {
+            assert!(started.elapsed() < Duration::from_secs(10), "never wanted");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = Why::Writes(Writer::Snapshot);
+        blocks_until(
+            move || p.wait_for(snapshot, |f| overlaps(&f.writes, 150, 160)),
+            go,
+        );
+        waiter.join().unwrap();
+        assert!(p.lock().wanted.is_empty());
     }
 
     #[test]

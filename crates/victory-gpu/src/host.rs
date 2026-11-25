@@ -1407,10 +1407,53 @@ impl Host {
             None => vec![std::collections::HashSet::new(); back.len()],
         };
         let told = crate::shadow::told(compares.as_deref(), back.len(), slot);
-        for (of, ((shadow, declared), unchanged)) in back.iter().zip(&unchanged).enumerate() {
-            let written = shadow.copy_back(declared, unchanged, told.of(of), slot);
+        // Refreshes waiting for a copy-back wait for it alone
+        // (`crate::pipelined::early_refreshes`): the copies they wait for
+        // go first, then the smallest. Copies whose declared ranges overlap
+        // (nested buffers, loose slabs) keep their order: the later one
+        // writes back shared words last, as before.
+        let early = crate::pipelined::on() && crate::pipelined::early_refreshes();
+        let ranges = |of: usize| back[of].1.iter().map(|&(a, n)| (a, a + n));
+        let meets =
+            |of: usize, (from, to): (usize, usize)| ranges(of).any(|(a, b)| a < to && from < b);
+        let after: Vec<Vec<usize>> = (0..back.len())
+            .map(|of| match early {
+                true => (of + 1..back.len())
+                    .filter(|&o| ranges(of).any(|r| meets(o, r)))
+                    .collect(),
+                false => Vec::new(),
+            })
+            .collect();
+        let mut before = vec![0; back.len()];
+        for &o in after.iter().flatten() {
+            before[o] += 1;
+        }
+        let size = |of: usize| back[of].1.iter().map(|&(_, n)| n).sum::<usize>();
+        let mut left: Vec<usize> = (0..back.len()).collect();
+        while !left.is_empty() {
+            let k = match early {
+                false => 0,
+                true => {
+                    let wanted = crate::pipelined::wanted();
+                    let free = |k: &usize| before[left[*k]] == 0;
+                    (0..left.len())
+                        .filter(free)
+                        .find(|&k| wanted.iter().any(|&r| meets(left[k], r)))
+                        .or_else(|| (0..left.len()).filter(free).min_by_key(|&k| size(left[k])))
+                        .unwrap_or(0)
+                }
+            };
+            let of = left.remove(k);
+            for &o in &after[of] {
+                before[o] -= 1;
+            }
+            let (shadow, declared) = &back[of];
+            let written = shadow.copy_back(declared, &unchanged[of], told.of(of), slot);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             crate::shadow::touched(shadow);
+            if early {
+                crate::pipelined::copied_back_but(left.iter().flat_map(|&of| ranges(of)));
+            }
         }
         told.clear(&unchanged);
         drop(told);
