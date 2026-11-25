@@ -126,13 +126,10 @@ struct Pipeline {
     /// lets go of) it.
     hold: fn(usize),
     signal: fn(usize, u64),
-    /// Tells the GPU that a submission (its number) has completed, its
-    /// copy-back done ([`newest_writing`]).
-    copied: fn(u64),
 }
 
 impl Pipeline {
-    const fn new(hold: fn(usize), signal: fn(usize, u64), copied: fn(u64)) -> Self {
+    const fn new(hold: fn(usize), signal: fn(usize, u64)) -> Self {
         Self {
             state: Mutex::new(State {
                 flying: VecDeque::new(),
@@ -146,7 +143,6 @@ impl Pipeline {
             jobs: OnceLock::new(),
             hold,
             signal,
-            copied,
         }
     }
 
@@ -249,7 +245,6 @@ impl Pipeline {
         for &(fence, value) in &f.signals {
             (self.signal)(fence, value);
         }
-        (self.copied)(f.seq);
         s.done = f.seq;
         drop(s);
         self.completed.notify_all();
@@ -301,7 +296,7 @@ fn overlaps(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(first).is_some_and(|&(start, _)| start < to)
 }
 
-static PIPELINE: Pipeline = Pipeline::new(hold_fence, signal_fence, crate::host::copied_back);
+static PIPELINE: Pipeline = Pipeline::new(hold_fence, signal_fence);
 
 fn hold_fence(fence: usize) {
     crate::object::add_ref(fence as This);
@@ -340,27 +335,6 @@ pub(crate) fn wait_writes(from: usize, to: usize, by: Writer) {
     if on() {
         PIPELINE.wait_for(Why::Writes(by), |f| overlaps(&f.writes, from, to));
     }
-}
-
-/// The newest submission in flight whose shaders write any of `ranges`
-/// (title memory `[from, to)`): its number, which the GPU learns when its
-/// copy-back is done ([`crate::host::copied_back`]). None when not
-/// pipelined.
-pub(crate) fn newest_writing(ranges: impl IntoIterator<Item = (usize, usize)>) -> Option<u64> {
-    if !on() {
-        return None;
-    }
-    let ranges: Vec<(usize, usize)> = ranges.into_iter().collect();
-    let s = PIPELINE.lock();
-    s.flying
-        .iter()
-        .rev()
-        .find(|f| {
-            ranges
-                .iter()
-                .any(|&(from, to)| overlaps(&f.writes, from, to))
-        })
-        .map(|f| f.seq)
 }
 
 /// Before preparation writes title memory `[from, to)` as the GPU would
@@ -477,7 +451,7 @@ mod tests {
     }
 
     fn pipeline() -> &'static Pipeline {
-        Box::leak(Box::new(Pipeline::new(|_| {}, record, |_| {})))
+        Box::leak(Box::new(Pipeline::new(|_| {}, record)))
     }
 
     /// A job that completes once its sender is used (or dropped).

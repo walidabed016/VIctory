@@ -39,10 +39,6 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
-    /// Submissions whose copy-back is done, by number
-    /// ([`crate::pipelined::newest_writing`]): the GPU waits on it before
-    /// compares that store into host copies a copy-back in flight reads.
-    copied: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     /// Resources heap slots stopped viewing (see [`Host::retire`]).
@@ -139,18 +135,6 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
-/// Pipelined: submission `seq` has completed, its copy-back done; the GPU
-/// may run compares that wait for it.
-pub(crate) fn copied_back(seq: u64) {
-    let Some(host) = host() else {
-        return;
-    };
-    // SAFETY: our fence.
-    if let Err(e) = unsafe { host.copied.Signal(seq) } {
-        tracing::error!(error = %e, seq, "a copy-back done not told to the GPU");
-    }
-}
-
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -233,7 +217,6 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let copied: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -254,7 +237,6 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
-            copied,
             submitted: Mutex::new(0),
             retired: Mutex::default(),
             twin_lists: Mutex::default(),
@@ -812,12 +794,9 @@ impl Step {
             }
             &Step::Fill(_, src, len) => crate::pipelined::wait_writes(src, src + len, Writer::Fill),
             Step::Run(_) => crate::pipelined::wait_all(),
-            &Step::GpuWrite(ref shadow, address, len) => {
-                // Its snapshot is taken now, on the CPU, unless the compare
-                // tells copy-back what shaders changed by word.
-                if !shadow.told_by_words() {
-                    crate::pipelined::wait_writes(address, address + len, Writer::Snapshot);
-                }
+            &Step::GpuWrite(_, address, len) => {
+                // Its snapshot is taken now, on the CPU.
+                crate::pipelined::wait_writes(address, address + len, Writer::Snapshot);
             }
             Step::Texture(staging) => {
                 let (from, to) = staging.memory();
@@ -1218,7 +1197,6 @@ impl Host {
                 counter.fetch_add(n, Ordering::Relaxed);
             }
         }
-        crate::shadow::snapshot_untold(&back, compares.as_deref());
         for list in &twins_before {
             // SAFETY: a closed list, run before the submission's.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list.clone())]) };
@@ -1247,21 +1225,6 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let after = qpc();
         if let Some(list) = twins_after {
-            // Pipelined: its compares store into host copies, which the
-            // copy-backs still in flight may read; the GPU waits for them.
-            let compared = compares
-                .as_deref()
-                .map(crate::shadow::compared)
-                .unwrap_or_default();
-            if let Some(seq) = crate::pipelined::newest_writing(compared.iter().copied()) {
-                // SAFETY: our queue and fence.
-                if let Err(e) = unsafe { self.queue.Wait(&self.copied, seq) } {
-                    tracing::warn!(error = %e, "compares wait for copy-backs on the CPU");
-                    for &(from, to) in &compared {
-                        crate::pipelined::wait_writes(from, to, crate::pipelined::Writer::Snapshot);
-                    }
-                }
-            }
             // SAFETY: a closed list, run after the submission's.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         }
@@ -1396,14 +1359,11 @@ impl Host {
             Some(compares) => crate::shadow::unchanged(compares, back.len(), slot),
             None => vec![std::collections::HashSet::new(); back.len()],
         };
-        let told = crate::shadow::told(compares.as_deref(), back.len(), slot);
-        for (of, ((shadow, declared), unchanged)) in back.iter().zip(&unchanged).enumerate() {
-            let written = shadow.copy_back(declared, unchanged, told.of(of), slot);
+        for ((shadow, declared), unchanged) in back.iter().zip(&unchanged) {
+            let written = shadow.copy_back(declared, unchanged, slot);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             crate::shadow::touched(shadow);
         }
-        told.clear(&unchanged);
-        drop(told);
         crate::watch::disarm(slot);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
