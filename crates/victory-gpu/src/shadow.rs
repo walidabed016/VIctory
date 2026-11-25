@@ -3513,6 +3513,78 @@ fn lux_reads_done() {
     }
 }
 
+/// Constant views of lux programs' fresh tables logged at most: per
+/// program and capture frame, and in all (diagnostics).
+#[cfg(feature = "diagnostics")]
+const LUX_TABLE_CONSTANTS: (usize, usize) = (16, 400);
+
+#[cfg(feature = "diagnostics")]
+static LUX_TABLE_LOGGED: Mutex<Option<std::collections::HashMap<(u64, String), usize>>> =
+    Mutex::new(None);
+
+/// Diagnostics (WAL-10): on capture frames, logs at submission each
+/// constant view of a lux program's fresh table, which the list copies
+/// into its own memory at `to` from title memory at `address` just
+/// before (the view shaders read is made there): its register, the words
+/// title memory and the copy hold, and the copy's words, up to
+/// [`LUX_READ`] bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn lux_table_constant(
+    list: &HostList,
+    register: Option<u32>,
+    address: u64,
+    size: u32,
+    to: *mut u8,
+) {
+    let frame = crate::queue::presented() + 1;
+    if !crate::capture::listed(frame) {
+        return;
+    }
+    let program = crate::pipeline::host_pipeline(
+        crate::descriptor::host::BINDING.get() as crate::object::This
+    )
+    .map_or("none", |p| p.name.as_str());
+    if !LUX_PROGRAMS.iter().any(|h| program.contains(h)) {
+        return;
+    }
+    {
+        let mut logged = LUX_TABLE_LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+        let logged = logged.get_or_insert_with(Default::default);
+        if logged.values().sum::<usize>() >= LUX_TABLE_CONSTANTS.1 {
+            return;
+        }
+        let count = logged.entry((frame, program.to_owned())).or_default();
+        if *count >= LUX_TABLE_CONSTANTS.0 {
+            return;
+        }
+        *count += 1;
+    }
+    let n = (size as usize).min(LUX_READ) / 4;
+    let (program, to) = (program.to_owned(), to as usize);
+    list.defer_host(move || {
+        // SAFETY: title memory the view covers, and the list's copy of it,
+        // filled just before.
+        let read = |at: usize| unsafe { (at as *const u32).read_unaligned() };
+        let title: Vec<u32> = (0..n).map(|k| read(address as usize + 4 * k)).collect();
+        let copy: Vec<u32> = (0..n).map(|k| read(to + 4 * k)).collect();
+        let (title_nonzero, copy_nonzero, differ, first, ..) = lux_compare(&title, &copy);
+        let words: Vec<String> = copy.iter().map(|w| format!("{w:08x}")).collect();
+        tracing::info!(
+            frame,
+            program,
+            register,
+            address = format_args!("{address:#x}"),
+            size,
+            title_nonzero,
+            copy_nonzero,
+            differ,
+            ?first,
+            words = words.join(" "),
+            "lux probe: a table's constant view at submission"
+        );
+    });
+}
+
 /// Diagnostics (WAL-10): on capture frames, logs each constant view a lux
 /// program has made: its title address and size and where the host view
 /// is made (`own`: on its own host copy).

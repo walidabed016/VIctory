@@ -932,6 +932,14 @@ impl State {
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
+                        #[cfg(feature = "diagnostics")]
+                        crate::shadow::lux_table_constant(
+                            list,
+                            used.map(|u| u.lower_bound),
+                            address,
+                            size,
+                            to,
+                        );
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
