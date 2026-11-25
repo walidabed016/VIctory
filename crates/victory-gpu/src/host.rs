@@ -644,6 +644,39 @@ fn log_gpu_times(frames: f64) {
     }
 }
 
+/// Logs the host GPU's memory use against the budgets the OS gives the
+/// process, in VRAM and in system memory (diagnostics): past the VRAM
+/// budget, the OS moves allocations to system memory.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_memory() {
+    let Some(host) = host() else {
+        return;
+    };
+    // SAFETY: plain DXGI queries into our structures.
+    let used = unsafe {
+        let luid = host.device.GetAdapterLuid();
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter3>(luid))
+            .and_then(|a| {
+                let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                let mut system = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)?;
+                a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut system)?;
+                Ok((local, system))
+            })
+    };
+    let Ok((local, system)) = used else {
+        return;
+    };
+    tracing::info!(
+        "GPU memory: {} of a {} MiB budget in VRAM, {} of {} MiB in system memory",
+        local.CurrentUsage >> 20,
+        local.Budget >> 20,
+        system.CurrentUsage >> 20,
+        system.Budget >> 20,
+    );
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -2384,6 +2417,7 @@ impl Meter {
                 crate::texture::seen::log(span);
                 crate::shadow::log_roots(span);
                 log_gpu_times(span);
+                log_gpu_memory();
                 let uploaded = crate::texture::UPLOADED
                     .each_ref()
                     .map(|n| n.swap(0, Ordering::Relaxed) as f64 / span.max(1.0));
