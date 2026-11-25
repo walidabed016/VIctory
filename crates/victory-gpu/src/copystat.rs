@@ -141,6 +141,7 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
         mb(c[C::TexChanged as usize]),
     )];
     cost_lines(frames, &mut lines);
+    lines.push(crate::resource::alias::line(frames));
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

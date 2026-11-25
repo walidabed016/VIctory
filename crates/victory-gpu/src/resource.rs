@@ -16,6 +16,9 @@ use crate::object::{
     guid,
 };
 
+#[cfg(windows)]
+pub(crate) mod alias;
+
 /// The interfaces every device child also answers for.
 pub(crate) const PAGEABLE_IIDS: [Iid; 3] = [
     guid(
@@ -1146,6 +1149,10 @@ impl Drop for Resource {
                 );
             }
         }
+        alias::forget(
+            std::ptr::from_ref::<Resource>(self) as usize,
+            self.data() as u64,
+        );
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         #[cfg(windows)]
