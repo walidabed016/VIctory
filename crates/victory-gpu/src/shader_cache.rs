@@ -50,7 +50,8 @@ pub(crate) fn counts() -> (u64, u64) {
 /// held as numbers translate, whether a lane's loops share a count of
 /// passes and how many, whether byte and short buffer stores translate, whether vector
 /// addresses joined in two blocks do, whether a lane-mask operation's SCC
-/// reads as data, and how mesh programs take wave operations).
+/// reads as data, whether a lane mask joined with numbers does, and how
+/// mesh programs take wave operations).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -76,6 +77,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::subdword_stores()),
             u8::from(victory_shader::emit::split_joins()),
             u8::from(victory_shader::emit::mask_scc()),
+            u8::from(victory_shader::emit::mask_joins()),
         ];
         let mesh = victory_shader::emit::mesh_wave_ops();
         if mesh != victory_shader::emit::MeshWaveOps::Lane {
