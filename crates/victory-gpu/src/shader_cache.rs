@@ -40,8 +40,8 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies the translator: its fingerprint and the translation
 /// settings it runs with (the loop limit, which a diagnostics build can
-/// change at run time, the Belobug changes turned off, and whether small
-/// groups run on halves).
+/// change at run time, the Belobug changes turned off, whether small
+/// groups run on halves, and whether byte and short buffer loads translate).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -54,7 +54,10 @@ fn build() -> &'static [u8; 32] {
         }
         let translator = env!("VICTORY_TRANSLATOR").as_bytes();
         let off = victory_shader::emit::no_belobug().as_bytes();
-        let small = [u8::from(victory_shader::emit::small_groups_on_halves())];
+        let small = [
+            u8::from(victory_shader::emit::small_groups_on_halves()),
+            u8::from(victory_shader::emit::subdword_buffer_loads()),
+        ];
         *blake3::hash(&[translator, &limit.to_le_bytes(), off, &small].concat()).as_bytes()
     })
 }

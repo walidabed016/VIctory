@@ -216,6 +216,16 @@ pub fn small_groups_on_halves() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_GROUPS_WAVE64").is_none())
 }
 
+/// Whether buffer loads of a byte or short (`buffer_load_ubyte`,
+/// `buffer_load_ushort` and their signed forms) are translated, as the
+/// dword holding them shifted and extended; refused otherwise. On unless
+/// `VICTORY_NO_SUBDWORD_LOADS` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn subdword_buffer_loads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_SUBDWORD_LOADS").is_none())
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

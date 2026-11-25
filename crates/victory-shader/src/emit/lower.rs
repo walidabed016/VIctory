@@ -9538,12 +9538,21 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        // A byte or short: the dword holding it, shifted down and extended.
+        let sub = match plain.strip_prefix("buffer_load_") {
+            Some("ubyte") => Some((8, false)),
+            Some("sbyte") => Some((8, true)),
+            Some("ushort") => Some((16, false)),
+            Some("sshort") => Some((16, true)),
+            _ => None,
+        }
+        .filter(|_| super::subdword_buffer_loads());
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || sub.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -9610,6 +9619,9 @@ impl<'a> Lower<'a> {
             None => off,
         };
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if sub.is_some() {
+                return Err("a byte or short read from a constant buffer");
+            }
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
@@ -9658,6 +9670,16 @@ impl<'a> Lower<'a> {
                 Some((.., lead, _)) if !typed => self.s.m.bin(c, Bin::Add, off, lead),
                 _ => off,
             },
+        };
+        // shortcut: a byte or short is taken not to cross a dword.
+        let (off, shift) = match sub {
+            Some(_) => {
+                let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                let byte = self.s.m.bin(c, Bin::And, off, three);
+                let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+                (self.s.m.bin(c, Bin::And, off, not3), Some(shift))
+            }
+            None => (off, None),
         };
         // A raw (or with `UAV`, typed) slot's handle of the kind `k`.
         let props = |k: u32| {
@@ -9819,8 +9841,12 @@ impl<'a> Lower<'a> {
                     self.raw_load(h, off, count)
                 }
                 Some((index, per_lane, .., kind)) => {
-                    let kinds = [view_kind::CBV, view_kind::RAW_SRV, view_kind::RAW_UAV];
-                    self.by_kind(kind, &kinds, count as usize, |l, k| {
+                    let kinds: &[u32] = if sub.is_some() {
+                        &[view_kind::RAW_SRV, view_kind::RAW_UAV]
+                    } else {
+                        &[view_kind::CBV, view_kind::RAW_SRV, view_kind::RAW_UAV]
+                    };
+                    self.by_kind(kind, kinds, count as usize, |l, k| {
                         if k == view_kind::CBV {
                             let h =
                                 l.s.heap_handle(l.cur, index, false, per_lane, (13, 0x1_0000));
@@ -9850,6 +9876,18 @@ impl<'a> Lower<'a> {
                 }
                 self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
             }
+            return Ok(());
+        }
+        if let (Some((width, signed)), Some(shift)) = (sub, shift) {
+            let c = self.cur;
+            let x = self.s.m.bin(c, Bin::LShr, xs[0], shift);
+            let left = self.s.m.i32(32 - width);
+            let x = self.s.m.bin(c, Bin::Shl, x, left);
+            let x = self
+                .s
+                .m
+                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         for (k, x) in xs.into_iter().enumerate() {

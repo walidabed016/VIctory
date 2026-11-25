@@ -235,6 +235,59 @@ const LOAD_BY_CONSTANT: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// Each lane loads the short at byte 2 * lane of the buffer at the heap slot
+/// the root constant names (`buffer_load_ushort`) and stores it at dword
+/// `lane` of the UAV.
+const LOAD_SHORT_BY_CONSTANT: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0 (the resource heap)
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0x8F03_8502, // s_lshl_b32 s3, s2, 5 (the slot in the root constant)
+    0xF408_0202,
+    0x0600_0000, // s_load_dwordx4 s[8:11], s[4:5], s3
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0x3406_0081, // v_lshlrev_b32 v3, 1, v0
+    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE028_1000,
+    0x8002_0103, // buffer_load_ushort v1, v3, s[8:11], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_1000,
+    0x8003_0104, // buffer_store_dword v1, v4, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// A short load reads its half of the dword holding it, zero-extended, from
+/// raw views; constant buffer slots give nothing.
+#[test]
+fn short_loads_read_their_half_of_a_dword() {
+    let (shader, heaps) = build(LOAD_SHORT_BY_CONSTANT);
+    assert!(heaps.unknown.is_empty(), "{:?}", heaps.unknown);
+    let (data, other) = (data(), other());
+    let (views, records) = heap(&data, &other);
+    let mut failed = Vec::new();
+    for slot in 1..8 {
+        let mut want: Vec<u32> = (0..LANES)
+            .map(|l| match slot {
+                1 => 0,
+                _ => read(slot, 2 * l) >> (16 * (l % 2)) & 0xffff,
+            })
+            .collect();
+        want.resize(2 * LANES as usize, 0);
+        for (label, uavs) in run(&shader, slot, &views, &records) {
+            if uavs[0] != want {
+                failed.push(format!(
+                    "{label} slot {slot}: got {:?}, want {want:?}",
+                    uavs[0]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 #[test]
 fn vector_loads_read_a_slot_by_the_kind_of_its_view() {
     let (shader, heaps) = build(LOAD_BY_CONSTANT);
