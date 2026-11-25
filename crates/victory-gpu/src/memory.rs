@@ -15,8 +15,13 @@
 //! into the list's upload memory, and every copy is brought up to date at
 //! each submission (page by page, as every refresh). Shaders mark the
 //! pages they write in the table's bitmap; after the submission each
-//! marked page goes back into title memory
+//! marked page of a title buffer's copy goes back into title memory
 //! ([`crate::shadow::Shadow::copy_back_page`]) and the bitmap is cleared.
+//! Pages of loose memory (outside title buffers) stay on the host: the
+//! title's own data shares them, and a whole page from the copy put back
+//! what the title wrote there since the copy took it (run 131: a child
+//! array of the title's scene nodes, read as a pointer, crashed it).
+//! shortcut: the title never sees what shaders write in loose memory.
 //! Such shaders read their root views there too, so the host makes a copy
 //! for each root view's address before the table.
 //!
@@ -85,6 +90,7 @@ struct Stats {
     uses: std::collections::BTreeMap<String, u64>,
     tables: u64,
     written: u64,
+    kept: u64,
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
@@ -105,7 +111,7 @@ pub(crate) fn note_use(pipeline: &str) {
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.missed_pages + s.missed_regions == 0 {
+    if s.uses.is_empty() && s.written + s.kept + s.missed_pages + s.missed_regions == 0 {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
@@ -114,11 +120,13 @@ pub(crate) fn log_frame() {
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
-         copied back, missed {} pages and {} 256 MiB regions with no copy (first: {})",
+         copied back, {} of loose memory kept on the host, missed {} pages and {} 256 MiB \
+         regions with no copy (first: {})",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
         s.written,
+        s.kept,
         s.missed_pages,
         s.missed_regions,
         missed.join(" ")
@@ -237,7 +245,7 @@ pub(crate) fn build(
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let (mut written, mut pages, mut regions, mut missed) = (0, 0, 0, Vec::new());
+        let (mut written, mut kept, mut pages, mut regions, mut missed) = (0, 0, 0, 0, Vec::new());
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
             while bits != 0 {
@@ -253,6 +261,7 @@ pub(crate) fn build(
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    Some(Some(k)) if copies[pieces[*k].0].is_loose() => kept += 1,
                     Some(Some(k)) => {
                         let n = copies[pieces[*k].0].copy_back_page(at as usize);
                         tracing::debug!(
@@ -272,6 +281,7 @@ pub(crate) fn build(
         }
         stats(|s| {
             s.written += written;
+            s.kept += kept;
             s.missed_pages += pages;
             s.missed_regions += regions;
             let room = 4usize.saturating_sub(s.first_missed.len());

@@ -614,6 +614,11 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Whether it copies title memory outside title buffers (see the field).
+    pub(crate) fn is_loose(&self) -> bool {
+        self.loose
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
     /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
     /// the bytes of the page (cut to the copy) that differ from title memory
