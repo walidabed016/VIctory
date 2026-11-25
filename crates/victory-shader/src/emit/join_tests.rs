@@ -253,6 +253,81 @@ fn scalar_table_at_a_join(cmp: u8) -> Vec<u32> {
     w
 }
 
+/// Each lane counts an index up from `min(v0 & 7, 3)` until it passes
+/// `min(v0 >> 3, 3)` (or, without `clamp`, `v0 >> 3`), at least once,
+/// adding `index + 1` to element `index` of an array in v20..v23 through
+/// `v_movrels_b32` and `v_movreld_b32` in waterfall loops over the index
+/// (M0 from `v_readfirstlane_b32`), and stores the array's sum. As in the
+/// light-loop prescalarisation, the array's registers run on into two that
+/// hold descriptor dwords (v24, v25) and into the index and its end (v28,
+/// v29), to the program's last VGPR: each move names them all.
+fn index_loop(clamp: bool) -> Vec<u32> {
+    // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0; v4 = v0 * 4;
+    // s[16:17] = exec.
+    let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
+    w.extend([vop2(0x1A, 4, u16::from(TWO), 0), sop1(0x04, 16, EXEC_LO)]);
+    // v7 = v0 & 7; v8 = v0 >> 3; v27 = med3_u32(v7, 0, 3);
+    // v29 = med3_u32(v8, 0, 3) (or v8).
+    w.extend([vop2(0x1B, 7, 128 + 7, 0), vop2(0x16, 8, 128 + 3, 0)]);
+    w.extend(vop3(0x159, 27, v(7), u16::from(ZERO), 128 + 3));
+    if clamp {
+        w.extend(vop3(0x159, 29, v(8), u16::from(ZERO), 128 + 3));
+    } else {
+        w.push(vop1(0x01, 29, v(8)));
+    }
+    // v20..v23, v26, v30, v31 = 0; s_waitcnt lgkmcnt(0); v24 = s8; v25 = s9.
+    for r in [20, 21, 22, 23, 26, 30, 31] {
+        w.push(vop1(0x01, r, u16::from(ZERO)));
+    }
+    w.extend([0xBF8C_C07F, vop1(0x01, 24, 8), vop1(0x01, 25, 9)]);
+    // s[12:13] = exec (the lanes still counting); v28 = v27; s_branch body.
+    w.extend([sop1(0x04, 12, EXEC_LO), vop1(0x01, 28, v(27))]);
+    let to_body = w.len();
+    w.push(0);
+    // head: exec = s[14:15] & s[12:13].
+    let head = w.len();
+    w.push(sop2(0x0F, EXEC_LO, 14, 12));
+    w[to_body] = sopp(0x02, to_body, w.len());
+    // A move in a waterfall over v28: s[6:7] = exec; again: s2 = the first
+    // lane's v28; vcc = v28 == s2; s_and_saveexec_b64 s[4:5], vcc; m0 = s2;
+    // the move; exec ^= s[4:5]; s_cbranch_execnz again; exec = s[6:7].
+    let waterfall = |w: &mut Vec<u32>, mov: u32| {
+        w.push(sop1(0x04, 6, EXEC_LO));
+        let again = w.len();
+        w.extend([
+            vop1(0x02, 2, v(28)),
+            vopc(0xC2, 2, 28),
+            sop1(0x24, 4, VCC_LO),
+        ]);
+        w.extend([sop1(0x03, 124, 2), mov, sop2(0x13, EXEC_LO, EXEC_LO, 4)]);
+        w.push(sopp(0x09, w.len(), again));
+        w.push(sop1(0x04, EXEC_LO, 6));
+    };
+    // body: v_movrels_b32 v5, v20; v5 += v28 + 1; v_movreld_b32 v20, v5.
+    waterfall(&mut w, vop1(0x43, 5, v(20)));
+    w.extend([vop2(0x25, 5, v(28), 5), vop2(0x25, 5, u16::from(ONE), 5)]);
+    waterfall(&mut w, vop1(0x42, 20, v(5)));
+    // v28 += 1; s[14:15] = exec; v_cmpx_gt_u32 exec, v28, v29 (the lanes
+    // done); s[12:13] &= ~exec; s_cbranch_scc1 head.
+    w.extend([vop2(0x25, 28, u16::from(ONE), 28), sop1(0x04, 14, EXEC_LO)]);
+    w.extend([vopc(0xD4, v(28), 29), sop2(0x15, 12, 12, EXEC_LO)]);
+    w.push(sopp(0x05, w.len(), head));
+    // exec = s[16:17]; v6 = v20 + v21 + v22 + v23;
+    // buffer_store_dword v6, v4, s[8:11], 0 offen.
+    w.push(sop1(0x04, EXEC_LO, 16));
+    w.extend([
+        vop2(0x25, 6, v(20), 21),
+        vop2(0x25, 6, v(22), 6),
+        vop2(0x25, 6, v(23), 6),
+    ]);
+    w.extend([
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 6 << 8 | 4,
+    ]);
+    w.push(S_ENDPGM);
+    w
+}
+
 /// Lowers a wave64 compute program of one wave whose UAV table is at s0.
 fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
     let native = NativeProgram {
@@ -421,6 +496,30 @@ fn a_scalar_table_address_joined_from_two_paths_reads_each_paths_dword() {
         for (label, got) in run(&shader) {
             assert_eq!(got, want, "{label}, s_cmp {cmp:#x}");
         }
+    }
+}
+
+#[test]
+fn an_m0_index_a_loop_keeps_in_range_reads_no_register_past_it() {
+    let shader = lower_cs(&index_loop(true)).expect("lower");
+    let want: Vec<u32> = (0..THREADS)
+        .map(|l| {
+            let (first, last) = ((l & 7).min(3), (l >> 3).min(3));
+            (first..=last.max(first)).map(|k| k + 1).sum()
+        })
+        .collect();
+    for (label, got) in run(&shader) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn an_m0_index_no_bound_shows_for_reads_every_register_it_names() {
+    match lower_cs(&index_loop(false)) {
+        Err(ShaderError::Unsupported { what, .. }) => {
+            assert_eq!(what, "a descriptor's address or format read as data");
+        }
+        other => panic!("{:?}", other.map(|_| ())),
     }
 }
 

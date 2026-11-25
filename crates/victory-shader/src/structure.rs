@@ -119,6 +119,12 @@ impl Bools {
         }
     }
 
+    /// The node of `atom` alone, if the pass made one.
+    pub fn find(&self, atom: Atom) -> Option<Bool> {
+        let v = *self.ids.get(&atom)?;
+        self.unique.get(&(v, Bool::FALSE, Bool::TRUE)).copied()
+    }
+
     /// The atom tested at the top of `b` and the results when it is false
     /// and true; `None` for the constants.
     pub fn node(&self, b: Bool) -> Option<(Atom, Bool, Bool)> {

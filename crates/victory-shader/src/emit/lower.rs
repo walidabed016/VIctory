@@ -657,6 +657,17 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// One search of [`Lower::bound`].
+struct Bounding {
+    /// M0-relative moves are taken to change no register past this index.
+    past: u32,
+    /// The moves the search took so (block and instruction).
+    used: Vec<Site>,
+    /// The values being bounded.
+    path: Vec<Value>,
+    budget: usize,
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, split: Split) -> Self {
         let p = x.p;
@@ -5036,6 +5047,214 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The largest M0 the M0-relative move `inst` reads, when one shows
+    /// (see [`Self::bound`]): guessed with no such move changing a register
+    /// past its first, then proved for every move the proof takes to change
+    /// none past the guess. By induction over time: the first move to read
+    /// a larger M0 would read one bounded by values set before it, while
+    /// every move kept to the guess.
+    fn m0_bound(&self, inst: &Inst) -> Option<u32> {
+        let at = |inst: &Inst, past: u32| {
+            let m0 = inst.read(Reg::S(crate::ir::M0))?;
+            let mut b = Bounding {
+                past,
+                used: Vec::new(),
+                path: Vec::new(),
+                budget: 256,
+            };
+            Some((self.bound(m0, &mut b)?, b.used))
+        };
+        let (guess, _) = at(inst, 0)?;
+        let (m0, mut todo) = at(inst, guess)?;
+        let mut done = Vec::new();
+        if m0 > guess {
+            return None;
+        }
+        while let Some(s) = todo.pop() {
+            if done.contains(&s) {
+                continue;
+            }
+            done.push(s);
+            let (m0, used) = at(&self.x.p.blocks[s.0].insts[s.1], guess)?;
+            if m0 > guess {
+                return None;
+            }
+            todo.extend(used);
+        }
+        Some(guess)
+    }
+
+    /// An upper bound on the unsigned value `v` holds in each lane that
+    /// passes where it is set, when one shows: a constant; a copy, the first
+    /// lane's copy of a vector value, or a register an M0-relative move
+    /// keeps (one past `b.past`); a median; a join of values each bounded,
+    /// or bounded on its edge by a compare that answers the same in every
+    /// lane taking the edge (a loop index each lane leaves the loop past).
+    /// No step gives more than the bound of something it reads, so a value
+    /// met again around a loop adds nothing.
+    fn bound(&self, v: Value, b: &mut Bounding) -> Option<u32> {
+        if b.path.contains(&v) {
+            return Some(0);
+        }
+        b.budget = b.budget.checked_sub(1)?;
+        b.path.push(v);
+        let x = self.bound_of(v, b);
+        b.path.pop();
+        x
+    }
+
+    fn bound_of(&self, v: Value, b: &mut Bounding) -> Option<u32> {
+        let (p, st) = (self.x.p, self.x.st);
+        if let Some(&(h, i)) = self.phi_at.get(&v) {
+            let mut max = 0;
+            for (j, &q) in p.blocks[h].preds.iter().enumerate() {
+                let mut known = vec![(st.reach[q], true)];
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = st.exits[q]
+                    && taken != not_taken
+                {
+                    known.push((when, taken == h));
+                }
+                if !st.bools.meet(&known) {
+                    continue;
+                }
+                let arg = p.blocks[h].phis[i].args[j];
+                let x = match self.compared(arg, &known, b) {
+                    Some(x) => x,
+                    None => self.bound(arg, b)?,
+                };
+                max = max.max(x);
+            }
+            return Some(max);
+        }
+        let (site, inst) = p
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(k, block)| {
+                block
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, x)| ((k, i), x))
+            })
+            .find(|(_, x)| x.writes.iter().any(|w| w.1 == v))?;
+        let reg = inst.writes.iter().find(|w| w.1 == v)?.0;
+        let x = match &inst.fields {
+            Fields::Sop { src, .. } if inst.name() == "s_mov_b32" => {
+                self.operand_bound(inst, src.first()?, b)?
+            }
+            Fields::Valu(f) if f.sdwa.is_none() && f.dpp.is_none() && f.neg | f.abs == 0 => {
+                match (inst.name(), reg, f.dst) {
+                    (
+                        "v_movreld_b32" | "v_movrelsd_b32",
+                        Reg::V(r),
+                        Some(Operand::Vector { reg: d, .. }),
+                    ) => {
+                        if u32::from(r.checked_sub(d)?) <= b.past {
+                            return None;
+                        }
+                        b.used.push(site);
+                        return self.bound(inst.read(reg)?, b);
+                    }
+                    ("v_mov_b32" | "v_readfirstlane_b32", ..) => {
+                        self.operand_bound(inst, f.src.first()?, b)?
+                    }
+                    ("v_med3_u32", ..) => {
+                        // At most the larger of any two operands.
+                        let mut x: Vec<u32> = f
+                            .src
+                            .iter()
+                            .filter_map(|o| self.operand_bound(inst, o, b))
+                            .collect();
+                        x.sort_unstable();
+                        *x.get(1)?
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        // Lanes outside EXEC keep a VGPR's old value.
+        match (reg, st.guards[site.0][site.1]) {
+            (Reg::V(_), Some(_)) => Some(x.max(self.bound(inst.read(reg)?, b)?)),
+            _ => Some(x),
+        }
+    }
+
+    fn operand_bound(&self, inst: &Inst, op: &Operand, b: &mut Bounding) -> Option<u32> {
+        match *op {
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            Operand::Scalar { code, .. } => self.bound(inst.read(Reg::S(code))?, b),
+            Operand::Vector { reg, .. } => self.bound(inst.read(Reg::V(reg))?, b),
+            _ => None,
+        }
+    }
+
+    /// A bound on `a` in the lanes where `known` holds, from an unsigned
+    /// compare of `a` with a bounded value that answers the same in each.
+    fn compared(&self, a: Value, known: &[(Bool, bool)], b: &mut Bounding) -> Option<u32> {
+        let st = self.x.st;
+        for inst in self.x.p.blocks.iter().flat_map(|k| &k.insts) {
+            let Fields::Valu(f) = &inst.fields else {
+                continue;
+            };
+            let name = inst.name();
+            let Some(op) = name
+                .strip_prefix("v_cmpx_")
+                .or(name.strip_prefix("v_cmp_"))
+                .and_then(|r| r.strip_suffix("_u32"))
+            else {
+                continue;
+            };
+            let (Some(x), Some(y), None, None) = (f.src.first(), f.src.get(1), f.sdwa, f.dpp)
+            else {
+                continue;
+            };
+            let mask = match f.dst {
+                _ if name.starts_with("v_cmpx_") => inst.write(Reg::S(EXEC)),
+                Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(code)),
+                _ => None,
+            };
+            let Some(lane) = mask.and_then(|m| st.bools.find(Atom::Lane(m))) else {
+                continue;
+            };
+            let reads = |o: &Operand| match *o {
+                Operand::Scalar { code, .. } => inst.read(Reg::S(code)) == Some(a),
+                Operand::Vector { reg, .. } => inst.read(Reg::V(reg)) == Some(a),
+                _ => false,
+            };
+            // Whether every lane where `known` holds gets `answer`.
+            let all = |answer: bool| {
+                let mut k = known.to_vec();
+                k.push((lane, !answer));
+                !st.bools.meet(&k)
+            };
+            let answer = match (all(true), all(false)) {
+                (true, _) => true,
+                (_, true) => false,
+                _ => continue,
+            };
+            // `a` at most, or below, the other operand.
+            let (other, below) = match (op, reads(x), reads(y), answer) {
+                ("gt", true, _, false) | ("le", true, _, true) => (y, false),
+                ("ge", true, _, false) | ("lt", true, _, true) => (y, true),
+                ("lt", _, true, false) | ("ge", _, true, true) => (x, false),
+                ("le", _, true, false) | ("gt", _, true, true) => (x, true),
+                _ => continue,
+            };
+            let Some(m) = self.operand_bound(inst, other, b) else {
+                continue;
+            };
+            return Some(if below { m.saturating_sub(1) } else { m });
+        }
+        None
+    }
+
     /// The heap index of the descriptor `src` (one read from a table or
     /// heap, or chosen among such), computed in the current block, and
     /// whether it may differ between lanes.
@@ -5592,8 +5811,11 @@ impl<'a> Lower<'a> {
             "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
-                // VGPR count (the registers the instruction reads or writes).
+                // VGPR count (the registers the instruction reads or writes),
+                // or to the largest M0 that shows: the registers past it
+                // keep their values.
                 let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let last = self.m0_bound(inst).map_or(u8::MAX, |m| m.min(255) as u8);
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
                     Some(Operand::Vector { reg: dreg, .. }),
@@ -5604,7 +5826,7 @@ impl<'a> Lower<'a> {
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
                     let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
+                    for k in 0..=255u8.saturating_sub(sreg).min(last) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
                             break;
                         };
@@ -5621,9 +5843,17 @@ impl<'a> Lower<'a> {
                     return int(self, value);
                 }
                 for k in 0..=255u8.saturating_sub(dreg) {
-                    let Some(_) = inst.write(Reg::V(dreg + k)) else {
+                    let Some(new) = inst.write(Reg::V(dreg + k)) else {
                         break;
                     };
+                    if k > last {
+                        let kept = match inst.read(Reg::V(dreg + k)) {
+                            Some(o) => self.get(o).unwrap_or_else(Val::Missing),
+                            None => Val::Missing("an M0-relative move"),
+                        };
+                        self.vals.insert(new, kept);
+                        continue;
+                    }
                     let old = match inst.read(Reg::V(dreg + k)) {
                         Some(o) => self.i32_of(o)?,
                         None => self.s.m.i32(0),
