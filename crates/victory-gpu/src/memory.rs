@@ -13,15 +13,19 @@
 //! names): every host copy made so far gets its pair of views in dynamic
 //! slots of that heap (held until the list is reset), the page table goes
 //! into the list's upload memory, and every copy is brought up to date at
-//! each submission (page by page, as every refresh). Shaders mark the
-//! pages they write in the table's bitmap; after the submission each
-//! marked page of a title buffer's copy goes back into title memory
-//! ([`crate::shadow::Shadow::copy_back_page`]) and the bitmap is cleared.
-//! Pages of loose memory (outside title buffers) stay on the host: the
-//! title's own data shares them, and a whole page from the copy put back
-//! what the title wrote there since the copy took it (run 131: a child
-//! array of the title's scene nodes, read as a pointer, crashed it).
-//! shortcut: the title never sees what shaders write in loose memory.
+//! each submission (page by page, as every refresh), and then armed
+//! ([`crate::shadow::Shadow::arm_table`]): what each copy held before the
+//! submission is known after it. Shaders mark the pages they write in the
+//! table's bitmap; after the submission the bytes shaders changed in each
+//! marked page of a title buffer's copy go back into title memory, and
+//! only those ([`crate::shadow::Shadow::copy_back_page`]); the bitmap is
+//! cleared. The title's threads write those buffers meanwhile: a whole page
+//! from the copy put back what the title wrote there since the copy took it
+//! (run 131: a child array of the title's scene nodes, read as a pointer,
+//! crashed it). Pages of loose memory (outside title buffers) stay on the
+//! host unless `VICTORY_LOOSE_COPY_BACK=1` has them go back the same way.
+//! shortcut: by default the title never sees what shaders write in loose
+//! memory.
 //! Such shaders read their root views there too, so the host makes a copy
 //! for each root view's address before the table.
 //!
@@ -45,6 +49,26 @@ use crate::shadow::Shadow;
 const BLOCK: usize = 4096;
 /// Level-1 entries: 2^40 bytes in 256 MiB blocks.
 const LEVEL1: usize = 4096;
+
+/// Title blocks (64 KiB) page tables have written in copies that go back:
+/// kept before each submission where they cannot be armed.
+static WRITTEN: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether page tables' writes in loose memory go back into it too, byte
+/// for byte as in title buffers (`VICTORY_LOOSE_COPY_BACK=1`).
+fn loose_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_LOOSE_COPY_BACK").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "what page tables' shaders write in loose memory goes back into it (VICTORY_LOOSE_COPY_BACK)"
+            );
+        }
+        on
+    })
+}
 
 /// A list's page table.
 pub(crate) struct Map {
@@ -83,13 +107,15 @@ impl Map {
 }
 
 /// Since the last frame line: draws and dispatches with shaders using title
-/// memory (by pipeline), page tables made, pages copied back, pages and 256
-/// MiB regions missed (no copy), and the first missed addresses.
+/// memory (by pipeline), page tables made, pages copied back (and of them,
+/// those whose earlier bytes were not known), pages and 256 MiB regions
+/// missed (no copy), and the first missed addresses.
 #[derive(Default)]
 struct Stats {
     uses: std::collections::BTreeMap<String, u64>,
     tables: u64,
     written: u64,
+    unknown: u64,
     kept: u64,
     missed_pages: u64,
     missed_regions: u64,
@@ -120,12 +146,13 @@ pub(crate) fn log_frame() {
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
-         copied back, {} of loose memory kept on the host, missed {} pages and {} 256 MiB \
-         regions with no copy (first: {})",
+         copied back ({} left in the copy: not known before), {} of loose memory kept on \
+         the host, missed {} pages and {} 256 MiB regions with no copy (first: {})",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
         s.written,
+        s.unknown,
         s.kept,
         s.missed_pages,
         s.missed_regions,
@@ -243,21 +270,34 @@ pub(crate) fn build(
     // SAFETY: a live buffer.
     let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
-    // Every copy current at each submission.
+    // Every copy current at each submission, then armed: copy-back tells
+    // what shaders changed from what it held.
     for s in &copies {
         let (start, len) = s.range();
         s.refresh(list, start, len);
     }
+    let back: Vec<Arc<Shadow>> = copies
+        .iter()
+        .filter(|s| !s.is_loose() || loose_back())
+        .cloned()
+        .collect();
+    list.defer_keep(move || {
+        let written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        for s in &back {
+            s.arm_table(&written);
+        }
+    });
     let data = data as usize;
     tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
     stats(|s| s.tables += 1);
     let precise = before.map(|m| m.precise.clone()).unwrap_or_default();
     let byte_for_byte = precise.clone();
-    list.defer_after(move || {
+    list.defer_after(move |slot| {
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let (mut written, mut kept, mut pages, mut regions, mut missed) = (0, 0, 0, 0, Vec::new());
+        let (mut written, mut unknown, mut kept, mut pages, mut regions, mut missed) =
+            (0, 0, 0, 0, 0, Vec::new());
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
             while bits != 0 {
@@ -273,16 +313,22 @@ pub(crate) fn build(
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
-                    Some(Some(k)) if copies[pieces[*k].0].is_loose() => kept += 1,
+                    Some(Some(k)) if copies[pieces[*k].0].is_loose() && !loose_back() => kept += 1,
                     Some(Some(k)) => {
-                        let n = copies[pieces[*k].0].copy_back_page(at as usize);
+                        WRITTEN
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert((at >> 16) as usize);
+                        let (n, known) = copies[pieces[*k].0].copy_back_page(at as usize, slot);
                         tracing::debug!(
                             page = format_args!("{at:#x}"),
                             copy = format_args!("{:#x?}", copies[pieces[*k].0].range()),
                             bytes = n,
+                            known,
                             "title memory page written back"
                         );
                         written += 1;
+                        unknown += u64::from(!known);
                     }
                     _ => {
                         pages += 1;
@@ -293,6 +339,7 @@ pub(crate) fn build(
         }
         stats(|s| {
             s.written += written;
+            s.unknown += unknown;
             s.kept += kept;
             s.missed_pages += pages;
             s.missed_regions += regions;

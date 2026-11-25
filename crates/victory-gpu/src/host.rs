@@ -807,6 +807,9 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Work that keeps what host copies hold before the submission runs:
+    /// after the refreshes before it, with no submission in flight.
+    Keep(Box<dyn Fn() + Send>),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -843,8 +846,9 @@ struct Deferred {
     /// ([`crate::resource::alias`]).
     aliased: crate::resource::alias::Recorded,
     /// Work done once the list has run, before the bottom-of-pipe writes
-    /// (title memory shaders wrote at addresses they computed goes back).
-    after: Vec<Box<dyn Fn() + Send>>,
+    /// (title memory shaders wrote at addresses they computed goes back),
+    /// given the submission's slot.
+    after: Vec<Box<dyn Fn(usize) + Send>>,
 }
 
 impl Step {
@@ -866,7 +870,7 @@ impl Step {
                 crate::pipelined::wait_reads(dst, dst + len);
             }
 
-            Step::Run(_) => crate::pipelined::wait_all(),
+            Step::Run(_) | Step::Keep(_) => crate::pipelined::wait_all(),
             Step::Texture(staging) => {
                 let (from, to) = staging.memory();
                 crate::pipelined::wait_writes(from, to, Writer::Texture);
@@ -1758,12 +1762,14 @@ impl Host {
         }
         told.clear(&unchanged);
         drop(told);
-        crate::watch::disarm(slot);
+        // While the blocks the submission armed still tell what they held.
         for list in runs {
             for work in &list.deferred().after {
-                work();
+                work(slot);
             }
         }
+        crate::shadow::tables_done(slot);
+        crate::watch::disarm(slot);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
@@ -2394,9 +2400,17 @@ impl HostList {
     }
 
     /// Runs `work` once the list has run (each submission), before its
-    /// bottom-of-pipe writes.
-    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+    /// bottom-of-pipe writes, with the submission's slot
+    /// ([`crate::shadow::preparing`]).
+    pub(crate) fn defer_after(&self, work: impl Fn(usize) + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// Runs `work` when the list is submitted, after the refreshes before
+    /// it and once no submission is in flight: it keeps what host copies
+    /// hold before the submission runs.
+    pub(crate) fn defer_keep(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Keep(Box::new(work)));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -2597,6 +2611,11 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::Keep(work) => {
+                    batch.flush();
+                    work();
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {

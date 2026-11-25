@@ -100,6 +100,9 @@ pub(crate) struct Shadow {
     /// the copy held them (by title block).
     armed: [Mutex<Vec<(usize, usize, u64)>>; SLOTS],
     kept: [Mutex<BTreeMap<usize, Vec<u8>>>; SLOTS],
+    /// What the copy held before the submission, for page tables' writes
+    /// ([`Shadow::arm_table`]).
+    table: [Mutex<Option<TableArmed>>; SLOTS],
     /// The buffer is title memory itself ([`in_place`]): nothing to copy.
     /// With a twin ([`in_place_twins_on`]), the twin takes the pages the
     /// title writes, and the compare stores the words shaders changed into
@@ -114,6 +117,31 @@ pub(crate) struct Shadow {
     dirty: Mutex<Vec<(usize, usize)>>,
     /// Listed for the next upload ([`touched`]).
     listed: AtomicBool,
+}
+
+/// What a copy held before a submission whose page table names it
+/// ([`Shadow::arm_table`]): the asking at which its title blocks were armed,
+/// the runs of blocks not armed, and the bytes of those of them kept.
+struct TableArmed {
+    asked: u64,
+    unarmed: Vec<(usize, usize)>,
+    kept: BTreeMap<usize, Vec<u8>>,
+}
+
+/// The copies armed for page tables, by submission slot
+/// ([`tables_done`]).
+static TABLES: [Mutex<Vec<Arc<Shadow>>>; SLOTS] = [const { Mutex::new(Vec::new()) }; SLOTS];
+
+/// After the page tables' copy-back of the submission in `slot`: its copies
+/// forget what they held before it ([`Shadow::arm_table`]).
+pub(crate) fn tables_done(slot: usize) {
+    let copies = std::mem::take(&mut *TABLES[slot].lock().unwrap_or_else(|e| e.into_inner()));
+    for s in copies {
+        s.table[slot]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -619,59 +647,132 @@ impl Shadow {
         self.loose
     }
 
+    /// At a submission whose page table names the copy (`crate::memory`),
+    /// after its refreshes: its title blocks are armed as for
+    /// [`Shadow::writing`] over view memory, so that
+    /// [`Shadow::copy_back_page`] tells the bytes shaders wrote at addresses
+    /// they computed from what the copy held. Of the blocks not armed, those
+    /// page tables wrote before (`written`, title blocks) are kept as the
+    /// copy holds them. For the submission being prepared.
+    pub(crate) fn arm_table(self: &Arc<Self>, written: &std::collections::BTreeSet<usize>) {
+        if self.in_place {
+            return;
+        }
+        let slot = prep_slot();
+        let start = self.start as usize;
+        let (asked, unarmed) = {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let base = start / PAGE;
+            crate::watch::arm(start, start + self.len as usize, slot, |page| {
+                copied.get(page.wrapping_sub(base)).copied().unwrap_or(0)
+            })
+        };
+        let kept = unarmed
+            .iter()
+            .flat_map(|&(a, b)| written.range(a..b))
+            .map(|&block| (block, self.block_bytes(block)))
+            .collect();
+        let armed = TableArmed {
+            asked,
+            unarmed,
+            kept,
+        };
+        let mut table = self.table[slot].lock().unwrap_or_else(|e| e.into_inner());
+        if table.replace(armed).is_none() {
+            TABLES[slot]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(self.clone());
+        }
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
     /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
-    /// the bytes of the page (cut to the copy) that differ from title memory
-    /// go back into it, when the title has not written the page since the
-    /// copy took it (then title memory is the copy as it was before the
-    /// submission, and what differs is what the GPU wrote). Returns the
-    /// bytes written; a page the title wrote meanwhile keeps the title's
-    /// bytes (logged once).
-    // shortcut: a page the copy holds only in part (at its ends) has no
-    // "copied" mark and is compared without the title-write check.
-    pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+    /// the bytes of the page (cut to the copy) that shaders changed go back
+    /// into title memory, and only those, as for views
+    /// ([`Shadow::copy_back`]). What the copy held before the submission is
+    /// the page's bytes kept or saved since it was armed
+    /// ([`Shadow::arm_table`]), else title memory (armed, not written
+    /// since). The title's threads write these buffers while the GPU runs; a
+    /// whole page from the copy put its older bytes back over theirs. A page
+    /// whose earlier bytes are not known (not armed: at the copy's ends, not
+    /// guarded, saved for another submission; and not kept) keeps the
+    /// title's bytes. Returns the bytes written and whether the earlier
+    /// bytes were known. Of the submission in `slot`.
+    // shortcut: what shaders wrote in a page whose earlier bytes are not
+    // known stays in the copy; page tables keep the page from then on.
+    pub(crate) fn copy_back_page(&self, page: usize, slot: usize) -> (usize, bool) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
-            return 0;
-        }
-        let index = page / PAGE - start / PAGE;
-        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
-        if watched
-            && let Some((_, written)) = crate::watch::writes(page, page + PAGE, true)
-            && let Some(&(_, w)) = written.iter().find(|&&(p, _)| p == page / PAGE)
-        {
-            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner())[index];
-            if copied != 0 && w > copied {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(
-                        page = format_args!("{page:#x}"),
-                        "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
-                    )
-                });
-                return 0;
-            }
+            return (0, true);
         }
         let n = to - from;
         let at = self.host_at(from - start, n);
         if at.is_null() {
-            return 0;
+            return (0, true);
         }
+        let block = page / PAGE;
+        let old = {
+            let table = self.table[slot].lock().unwrap_or_else(|e| e.into_inner());
+            table.as_ref().and_then(|t| match t.kept.get(&block) {
+                Some(bytes) => Some(bytes.clone()),
+                None if t.unarmed.iter().any(|&(a, b)| a <= block && block < b) => None,
+                None => crate::watch::before(block, t.asked)
+                    .map(|bytes| bytes[from - page..to - page].to_vec()),
+            })
+        };
+        let Some(old) = old else {
+            return (0, false);
+        };
         // SAFETY: inside the copy's memory; only the submitting thread
         // writes it.
         let host = unsafe { std::slice::from_raw_parts(at, n) };
         let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
-            return 0;
+        if !crate::host::read_into(from as *const u8, &mut title) {
+            return (0, true);
+        }
+        // Runs of the bytes shaders changed that title memory lacks, and
+        // whether it holds the copy's bytes everywhere else.
+        let (mut runs, mut same): (Vec<(usize, usize)>, bool) = (Vec::new(), true);
+        for c in (0..n).step_by(64) {
+            let e = (c + 64).min(n);
+            if host[c..e] == old[c..e] {
+                same &= title[c..e] == host[c..e];
+                continue;
+            }
+            for i in c..e {
+                if host[i] == old[i] {
+                    same &= title[i] == host[i];
+                } else if title[i] != host[i] {
+                    match runs.last_mut() {
+                        Some(run) if run.1 == i => run.1 = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
+                }
+            }
+        }
+        if runs.is_empty() {
+            return (0, true);
         }
         crate::watch::writing(from, n);
-        crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        // Our write is not the title's: the copy holds the page as it is.
-        if watched && let Some((now, _)) = crate::watch::writes(page, page + PAGE, true) {
-            self.copied.lock().unwrap_or_else(|e| e.into_inner())[index] = now;
+        let mut written = 0;
+        for &(a, b) in &runs {
+            crate::host::write_mapped((from + a) as *mut u8, host[a..].as_ptr(), b - a);
+            written += b - a;
         }
-        n
+        // Our writes are not the title's: where it wrote nothing else, the
+        // copy holds the page as it is.
+        if same
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, _)) = crate::watch::writes(page, page + PAGE, true)
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(taken) = copied.get_mut(block - start / PAGE) {
+                *taken = now;
+            }
+        }
+        (written, true)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -710,6 +811,7 @@ impl Shadow {
             before: Default::default(),
             armed: Default::default(),
             kept: Default::default(),
+            table: Default::default(),
             in_place,
             #[cfg(feature = "diagnostics")]
             audit: Default::default(),
@@ -4881,6 +4983,61 @@ pub(crate) mod tests {
         assert!(s.kept[0].lock().unwrap().is_empty() && s.armed[0].lock().unwrap().is_empty());
         drop(s);
         unregister(usize::MAX - 8, at as u64);
+        unmap(&made);
+    }
+
+    /// Page tables' copy-back ([`Shadow::copy_back_page`]) writes only the
+    /// bytes shaders changed: in an armed block the title wrote during the
+    /// submission (saved first), and in one written before arming that page
+    /// tables wrote before (kept). A block neither armed nor kept keeps the
+    /// title's bytes.
+    #[test]
+    fn page_tables_copy_back_only_the_bytes_shaders_changed() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = (961 * SLAB) as usize - 256 * MIB;
+        let made = views(at, &[24 * MIB, 24 * MIB]);
+        assert_eq!(made.len(), 2, "no free address for test views");
+        register(usize::MAX - 30, at as u64, 48 << 20);
+        let s = find(at as u64, 48 << 20).unwrap();
+        assert!(!s.in_place);
+        crate::watch::forget_asked();
+        s.update(at, 48 << 20);
+        // Written after the refresh: not armed.
+        let (kept, unknown) = (at + 2 * MIB + 100, at + 6 * MIB + 100);
+        // SAFETY: our views (guarded: our handler opens the block).
+        unsafe {
+            (kept as *mut u32).write(0xe);
+            (unknown as *mut u32).write(0xe);
+        }
+        s.arm_table(&[kept / PAGE].into());
+        let armed = at + 4 * MIB;
+        let gpu = [armed + 64, kept + 8, unknown + 8];
+        for w in gpu {
+            // SAFETY: inside the copy's memory.
+            unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
+        }
+        // SAFETY: our views.
+        unsafe { ((armed + 128) as *mut u32).write(7) };
+        assert_eq!(s.copy_back_page(armed, 0), (4, true));
+        assert_eq!(s.copy_back_page(kept / PAGE * PAGE, 0), (4, true));
+        assert_eq!(s.copy_back_page(unknown / PAGE * PAGE, 0), (0, false));
+        tables_done(0);
+        crate::watch::disarm(0);
+        assert!(s.table[0].lock().unwrap().is_none());
+        // SAFETY: our views.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        assert_eq!(read(armed + 64), 0xfeed);
+        assert_eq!(read(armed + 128), 7, "the title's write was undone");
+        assert_eq!(read(armed + 192), word(armed + 192));
+        assert_eq!(read(kept + 8), 0xfeed);
+        assert_eq!(read(kept), 0xe, "the title's write was undone");
+        assert_eq!(read(unknown), 0xe);
+        assert_eq!(read(unknown + 8), word(unknown + 8));
+        drop(s);
+        unregister(usize::MAX - 30, at as u64);
         unmap(&made);
     }
 
