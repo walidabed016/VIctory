@@ -635,21 +635,36 @@ impl State {
                 };
             }
             // Root views a shader reads as title memory: the copies holding
-            // their addresses go into the page table.
+            // their addresses go into the page table. One at an address no
+            // copy can hold would read zeros and drop its writes: a BVH
+            // build on such inputs can climb or spin until the driver resets
+            // the host GPU (run 127), so the draw or dispatch is dropped.
             let mut roots = Vec::new();
             for u in &t.host.user_data {
                 if u.root == RootType::Descriptor
                     && u.dword == 0
-                    && let Some(Root::View(address)) =
+                    && let Some(&Root::View(address)) =
                         self.roots_ref(compute).get(usize::from(u.slot))
-                    && let Some(shadow) = crate::shadow::find(*address, 1)
                 {
+                    let Some(shadow) = crate::shadow::find(address, 1) else {
+                        if stage.memory.is_some() && address != 0 {
+                            once!(
+                                address = format_args!("{address:#x}"),
+                                pipeline = %p.name,
+                                "a draw or dispatch reading title memory dropped: a root view no host copy holds (logged once)"
+                            );
+                            #[cfg(feature = "diagnostics")]
+                            crate::pipeline::note_why("a root view no host copy holds".to_owned());
+                            return false;
+                        }
+                        continue;
+                    };
                     let uav = t.used.iter().any(|r| {
                         r.slot == u.slot
                             && r.root == RootType::Descriptor
                             && r.kind == ResourceType::Uav
                     });
-                    roots.push((*address, uav.then_some(shadow)));
+                    roots.push((address, uav.then_some(shadow)));
                 }
             }
             if let Some((param, dwords)) = stage.user_data {

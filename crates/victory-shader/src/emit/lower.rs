@@ -75,6 +75,9 @@ pub(crate) struct Lowered {
     /// Group barriers the 32-lane halves add.
     #[cfg(test)]
     pub halves_barriers: u32,
+    /// Each loop's iteration limit, by header in reverse postorder.
+    #[cfg(test)]
+    pub loop_limits: Vec<u32>,
     /// The index of each non-uniform heap handle in a lane outside every
     /// EXEC the program set ([`super::bitcode::Module::second_arms`]).
     #[cfg(test)]
@@ -337,8 +340,9 @@ struct Lower<'a> {
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
-    /// IR block, and its incoming (value, DXIL block) pairs.
-    counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// IR block, its incoming (value, DXIL block) pairs, and the loop's
+    /// limit ([`LOOP_LIMIT`] or [`SPIN_LIMIT`]).
+    counters: HashMap<usize, (V, Vec<(V, usize)>, u32)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// Wave64 on 32-lane halves ([`super::halves`]).
@@ -358,6 +362,8 @@ struct Lower<'a> {
     phi_sites: HashMap<(usize, Vec<Site>), Site>,
     #[cfg(test)]
     halves_barriers: u32,
+    #[cfg(test)]
+    loop_limits: Vec<u32>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -368,6 +374,31 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// Iterations after which a loop that can wait on memory is left (per
+/// entry, and no more than [`super::loop_limit`]): one whose body holds
+/// an atomic, a coherent access, a cache invalidation or a BVH
+/// intersection ([`may_wait`]). Such a loop runs as long as memory other
+/// waves write says (a spin on a flag, a BVH builder's climb to the root, a
+/// traversal's stack), and memory the host has not mirrored or holds stale
+/// can keep it going; at microseconds a pass, [`LOOP_LIMIT`] passes are
+/// seconds and the driver resets the host GPU (run 127: one warp of
+/// XboxBvhBuilder's refit, compute 5552dac6a2b7a1fd).
+// shortcut: a genuine wait or traversal of more passes than this is cut short too.
+pub(super) const SPIN_LIMIT: u32 = 1 << 13;
+
+/// Whether a wave can wait on another through `i` in a loop: an atomic, a
+/// coherent `glc` or `dlc` access, a cache invalidation.
+fn may_wait(i: &Inst) -> bool {
+    let coherent = match &i.fields {
+        Fields::Smem { cache, .. }
+        | Fields::Buffer { cache, .. }
+        | Fields::Image { cache, .. }
+        | Fields::Flat { cache, .. } => cache.glc || cache.dlc,
+        _ => false,
+    };
+    coherent || i.name().contains("atomic") || i.name().ends_with("_inv")
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -505,23 +536,13 @@ fn apart_waves(x: &Parts) -> bool {
         Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
         _ => i.name() == "s_barrier",
     };
-    let waits = |i: &Inst| {
-        let coherent = match &i.fields {
-            Fields::Smem { cache, .. }
-            | Fields::Buffer { cache, .. }
-            | Fields::Image { cache, .. }
-            | Fields::Flat { cache, .. } => cache.glc || cache.dlc,
-            _ => false,
-        };
-        coherent || i.name().contains("atomic") || i.name().ends_with("_inv")
-    };
     threads.is_multiple_of(64)
         && cs.lds_bytes() == 0
         && x.p.blocks.iter().enumerate().all(|(b, block)| {
             block
                 .insts
                 .iter()
-                .all(|i| !shares(i) && !(looped[b] && waits(i)))
+                .all(|i| !shares(i) && !(looped[b] && may_wait(i)))
         })
 }
 
@@ -1099,6 +1120,8 @@ impl<'a> Lower<'a> {
             phi_sites: HashMap::new(),
             #[cfg(test)]
             halves_barriers: 0,
+            #[cfg(test)]
+            loop_limits: Vec::new(),
         }
     }
 
@@ -1787,17 +1810,44 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`, `SPIN_LIMIT`).
         for &b in &order {
-            let header = p.blocks[b]
+            let mut stack: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
-                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
-                let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
-                self.counters.insert(b, (phi, Vec::new()));
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q])
+                .collect();
+            if stack.is_empty() {
+                continue;
             }
+            let mut body = HashSet::from([b]);
+            while let Some(x) = stack.pop() {
+                if body.insert(x) {
+                    stack.extend(
+                        p.blocks[x]
+                            .preds
+                            .iter()
+                            .filter(|&&q| self.block[q].is_some()),
+                    );
+                }
+            }
+            let waits = body.iter().any(|&x| {
+                p.blocks[x]
+                    .insts
+                    .iter()
+                    .any(|i| may_wait(i) || i.name().starts_with("image_bvh"))
+            });
+            let limit = if waits {
+                SPIN_LIMIT.min(super::loop_limit())
+            } else {
+                super::loop_limit()
+            };
+            let blk = self.block[b].expect("reachable");
+            let phi = self.s.m.phi(blk, self.s.t.i32);
+            self.counters.insert(b, (phi, Vec::new(), limit));
+            #[cfg(test)]
+            self.loop_limits.push(limit);
         }
         self.cur = self.s.entry;
         self.cur_ir = order[0];
@@ -1901,6 +1951,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             halves_barriers: self.halves_barriers,
+            #[cfg(test)]
+            loop_limits: self.loop_limits.clone(),
             #[cfg(test)]
             nonuniform_outside_exec: self
                 .s
@@ -5948,7 +6000,7 @@ impl<'a> Lower<'a> {
         }
         self.cross_lane(false)?;
         let c = self.cur;
-        let (count, _) = self.counters[&l];
+        let (count, ..) = self.counters[&l];
         let most = self.wave_active(Op::MaxU, count);
         let last = self.s.m.cmp(c, pred::EQ, count, most);
         let (lane, none) = (self.lane_index(), self.s.m.i32(u32::MAX));
@@ -11260,7 +11312,7 @@ impl<'a> Lower<'a> {
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
     fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
+        if let Some((_, incoming, _)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
@@ -11268,13 +11320,13 @@ impl<'a> Lower<'a> {
 
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
+    /// the loop's limit by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
-        let (phi, _) = self.counters[&to];
+        let (phi, _, limit) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -11565,7 +11617,7 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+        for (phi, incoming, _) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
@@ -11741,6 +11793,28 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn loops_that_can_wait_on_memory_stop_sooner() {
+        // A scalar loop of 64 passes, with a cache invalidation in it or
+        // two no-ops in its place.
+        let looped = |wait: [u32; 2]| {
+            [
+                0xBE82_0380, // s_mov_b32 s2, 0
+                wait[0],
+                wait[1],
+                0x8102_8102, // s_add_i32 s2, s2, 1
+                0xBF0A_C002, // s_cmp_lt_u32 s2, 64
+                0xBF85_FFFB, // s_cbranch_scc1 -> the loop's start
+                S_ENDPGM,
+            ]
+        };
+        let limits = |words: &[u32]| lower_with(words, vec![], vec![]).unwrap().loop_limits;
+        let plain = limits(&looped([0xBF80_0000, 0xBF80_0000]));
+        let waiting = limits(&looped([0xF480_0000, 0x0000_0000]));
+        assert_eq!(plain, [crate::emit::loop_limit()]);
+        assert_eq!(waiting, [super::SPIN_LIMIT.min(crate::emit::loop_limit())]);
     }
 
     fn perm_features(selector: u32) -> u64 {
