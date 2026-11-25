@@ -271,6 +271,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Time title threads waited for host pipelines since the last call.
+#[cfg(windows)]
+pub(crate) fn take_waited() -> std::time::Duration {
+    make::take_waited()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
