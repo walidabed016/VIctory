@@ -8,6 +8,8 @@
 //!   buffer copies;
 //! - the world's 174 MB buffer, three views, refreshed in every submission
 //!   and written by shaders in 4 of them;
+//! - a 90 MiB buffer used in place, as run 79's hair strands' is, written
+//!   by shaders in every third submission, 4 blocks of it changed;
 //! - three title copies by the GPU (`CopyMemoryToMemoryX`) a submission;
 //! - title writes between submissions: pages of write-watched pools,
 //!   blocks of views, blocks of the world buffer;
@@ -153,6 +155,8 @@ fn world_frame() {
     let world_len = at - world;
     crate::shadow::register(1, world as u64, world_len as u64);
     let small: Vec<usize> = (0..200).map(|k| pools[1].0 + 64 * MIB + k * MIB).collect();
+    let (hair, hair_len) = (pools[0].0 + 512 * MIB, 90 * MIB);
+    crate::shadow::register(300, hair as u64, hair_len as u64);
     for (k, &b) in small.iter().enumerate() {
         crate::shadow::register(2 + k, b as u64, 256 << 10);
     }
@@ -189,6 +193,19 @@ fn world_frame() {
                 for k in 0..4 {
                     let offset = (rng.next(world_len / (64 << 10)) * (64 << 10)) as u64;
                     let _ = k;
+                    // SAFETY: an open list; live buffers, the range inside both.
+                    unsafe {
+                        list.list
+                            .CopyBufferRegion(copy.resource(), offset, &upload, 0, 64 << 10)
+                    };
+                }
+            }
+            if s % 3 == 0 {
+                let copy = crate::shadow::find(hair as u64, hair_len as u64).unwrap();
+                copy.refresh(list, hair as u64, hair_len as u64);
+                copy.gpu_writes(list, hair as u64, hair_len as u64);
+                for _ in 0..4 {
+                    let offset = (rng.next(hair_len / (64 << 10)) * (64 << 10)) as u64;
                     // SAFETY: an open list; live buffers, the range inside both.
                     unsafe {
                         list.list
