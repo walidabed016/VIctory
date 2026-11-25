@@ -384,6 +384,15 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let pixel = self.pixel;
+        one_mode_per_row(
+            if pixel {
+                &mut self.inputs
+            } else {
+                &mut self.outputs
+            },
+            pixel,
+        );
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -773,5 +782,28 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Gives each signature row one interpolation mode, as DXIL wants (the
+/// console packs an integer beside a float in one row). A float that is
+/// interpolated nowhere takes the mode of the row's other elements: a pixel
+/// shader input it never reads, or any output of another stage, whose
+/// interpolation the pixel shader's input declares.
+fn one_mode_per_row(elements: &mut [SigElement], pixel: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(pixel && e.usage != 0);
+    for i in 0..elements.len() {
+        if elements[i].row.is_none() || !free(&elements[i]) {
+            continue;
+        }
+        let row = elements[i].row;
+        let mut modes = elements
+            .iter()
+            .filter(|e| e.row == row && !free(e))
+            .map(|e| e.interp);
+        let mode = modes.next().filter(|&m| m != 0 && modes.all(|n| n == m));
+        if let Some(mode) = mode {
+            elements[i].interp = mode;
+        }
     }
 }

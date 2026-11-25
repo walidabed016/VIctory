@@ -1412,4 +1412,189 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// The console packs an integer beside a float in one signature row
+    /// (TEXCOORD0 in x and y of row 1, TEXCOORD1 in z and w); DXIL wants one
+    /// interpolation mode per row. A mesh program writes both, its position's
+    /// x and y, then 7 and 9. One pixel program reads the integers flat and
+    /// never reads the floats, another reads only the floats, interpolated.
+    /// Each pair validates and links where the console put the values: the
+    /// first sees the integers, the second the floats interpolated across
+    /// the triangle.
+    #[test]
+    #[cfg(windows)]
+    fn a_row_with_an_integer_beside_a_float_passes_both_through_a_linked_pair() {
+        use crate::native::{PsInput, Usage, VsOutput};
+        let el = |name: &str, index, kind, comp, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let floats = el("TEXCOORD", 0, 0, 9, 1, 0, 2);
+        let integers = el("TEXCOORD", 1, 0, 5, 1, 2, 2);
+        let translate = |native: NativeProgram, parts: &[(FourCC, &[u8])]| {
+            let bytes = crate::dxbc::build(parts);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            out
+        };
+        let ms_words = [
+            0xD765_000Bu32,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v11, -1, 0
+            0xD766_000B,
+            0x0002_16C1, // v_mbcnt_hi_u32_b32 v11, -1, v11
+            0x7E28_02F6, // v_mov_b32 v20, 4.0
+            0x7D84_1682, // v_cmp_eq_u32 vcc, 2, v11
+            0x0206_28F3, // v_cndmask_b32 v3, -1.0, v20, vcc
+            0x7D84_1681, // v_cmp_eq_u32 vcc, 1, v11
+            0x0208_28F3, // v_cndmask_b32 v4, -1.0, v20, vcc
+            0x7E0A_02F0, // v_mov_b32 v5, 0.5
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0x7E0E_02FF,
+            0x0020_0400, // v_mov_b32 v7, 0x200400 (vertices 0, 1, 2)
+            0x7E18_0287, // v_mov_b32 v12, 7
+            0x7E1A_0289, // v_mov_b32 v13, 9
+            0x7D88_1683, // v_cmp_gt_u32 vcc, 3, v11
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xF800_020F,
+            0x0D0C_0403, // exp param0, v3, v4, v12, v13
+            0xF800_08CF,
+            0x0605_0403, // exp pos0, v3, v4, v5, v6 done
+            0x7D84_1680, // v_cmp_eq_u32 vcc, 0, v11
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xF800_0941,
+            0x0000_0007, // exp prim, v7, off, off, off done
+            0xBF81_0000, // s_endpgm
+        ];
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 24,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: ms_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = el("SV_Position", 0, 3, 9, 0, 0, 4);
+        let osg1 = container::signature(&[position, floats.clone(), integers.clone()], false);
+        let ms = translate(ms_native, &[(FourCC::OSG1, &osg1)]);
+        let pixel = |words: &[u32], inputs: &[SigElement]| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![PsInput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    // PERSP_CENTER: I and J in v0 and v1.
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let isg1 = container::signature(inputs, true);
+            let osg1 = container::signature(&[el("SV_Target", 0, 16, 9, 0, 0, 4)], false);
+            translate(native, &[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)])
+        };
+        let flat = pixel(
+            &[
+                0xC80A_0202, // v_interp_mov_f32 v2, p0, attr0.z
+                0xC80E_0302, // v_interp_mov_f32 v3, p0, attr0.w
+                0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+                0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+                0xF800_180F,
+                0x0302_0302, // exp mrt0, v2, v3, v2, v3 done vm
+                0xBF81_0000,
+            ],
+            &[floats.clone(), integers],
+        );
+        let interpolated = pixel(
+            &[
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                0xC80C_0100, // v_interp_p1_f32 v3, v0, attr0.y
+                0xC80D_0101, // v_interp_p2_f32 v3, v1, attr0.y
+                0xF800_180F,
+                0x0302_0302, // exp mrt0, v2, v3, v2, v3 done vm
+                0xBF81_0000,
+            ],
+            &[floats],
+        );
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let draw = |ps: &HostShader| {
+            let (root, pso) = host.mesh_pipeline(&ms, ps).unwrap();
+            host.draw(
+                &root,
+                &pso,
+                &super::host::Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (4, 4),
+                    mesh_groups: 1,
+                },
+            )
+            .unwrap()
+        };
+        let texels = draw(&flat);
+        assert!(
+            texels.iter().all(|t| *t == [7.0, 9.0, 7.0, 9.0]),
+            "{texels:?}"
+        );
+        // The pixel centre's x and y on the target, as the position gives them.
+        for (n, t) in draw(&interpolated).into_iter().enumerate() {
+            let x = (2 * (n % 4) + 1) as f32 / 4.0 - 1.0;
+            let y = 1.0 - (2 * (n / 4) + 1) as f32 / 4.0;
+            assert!(
+                (t[0] - x).abs() < 1e-5 && (t[1] - y).abs() < 1e-5 && t[2] == t[0],
+                "texel {n}: {t:?}"
+            );
+        }
+    }
 }
