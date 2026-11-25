@@ -6191,15 +6191,27 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_readlane_b32" if self.halves.is_some() => {
+                // Halves: lane % 32 of each half, then the half lane bit 5
+                // names.
+                let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                self.cross_lane(false)?;
+                let w = self.read_lane(a, lane);
+                let [(low, high)] = self.exchange([w], APART)?;
+                let c = self.cur;
+                let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
+                let bit = self.s.m.bin(c, Bin::And, lane, k32);
+                let up = self.s.m.cmp(c, pred::NE, bit, z);
+                let r = self.s.m.select(c, up, high, low);
+                int(self, r)
+            }
             "v_readlane_b32" => {
-                // A constant lane that `v_writelane` spilled one scalar to on
-                // every path (`resource::restored`) reads back that scalar:
-                // lane writes and reads ignore EXEC, and each host lane keeps
-                // its own wave's scalar. Outside compute the lane is the
-                // console's, not the host's; in compute the VGPR need not
-                // have a value (a constant buffer's descriptor spilled beside
-                // numbers).
-                if let Some(m) = self.restored(inst) {
+                // Outside compute, a constant lane is the console's, not the
+                // host's; when `v_writelane` spilled a scalar there on every
+                // path (`resource::restored`), the scalar reads back as such.
+                if self.s.threads.is_none()
+                    && let Some(m) = self.restored(inst)
+                {
                     let x = match m {
                         Moved::Value(v) => self.i32_of(v)?,
                         Moved::Const(k) => self.s.m.i32(k),
@@ -6207,19 +6219,6 @@ impl<'a> Lower<'a> {
                     return int(self, x);
                 }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                if self.halves.is_some() {
-                    // Halves: lane % 32 of each half, then the half lane bit 5
-                    // names.
-                    self.cross_lane(false)?;
-                    let w = self.read_lane(a, lane);
-                    let [(low, high)] = self.exchange([w], APART)?;
-                    let c = self.cur;
-                    let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
-                    let bit = self.s.m.bin(c, Bin::And, lane, k32);
-                    let up = self.s.m.cmp(c, pred::NE, bit, z);
-                    let r = self.s.m.select(c, up, high, low);
-                    return int(self, r);
-                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
