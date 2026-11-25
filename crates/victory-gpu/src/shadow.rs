@@ -169,6 +169,114 @@ fn split<T: Send>(n: usize, len: usize, f: impl Fn(std::ops::Range<usize>) -> T 
         .collect()
 }
 
+/// The threads copy-back runs on, the completion thread among them
+/// ([`Shadow::copy_back`]): in run 149 copy-back took 56.8 ms a frame on the
+/// completion thread alone, and the submit thread waited ~43 ms of it (for
+/// room, and behind older copy-backs) while the GPU sat idle.
+/// `VICTORY_COPY_BACK_THREADS` sets them (4 unless set; 1: the completion
+/// thread alone).
+fn copy_back_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let set = std::env::var("VICTORY_COPY_BACK_THREADS").ok();
+        let n = set
+            .as_deref()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        if set.is_some() {
+            tracing::info!(threads = n, "copy-back threads (VICTORY_COPY_BACK_THREADS)");
+        }
+        n
+    })
+}
+
+/// Runs `f` on each of `items` on copy-back's threads
+/// ([`copy_back_threads`]), the caller among them: the results in order. Its
+/// own threads, started once, so that the preparation's splits never queue
+/// behind copy-back, nor run its parts ([`crate::texture::split`]).
+fn on_copy_back_threads<I: Send, R: Send>(items: Vec<I>, f: impl Fn(I) -> R + Sync) -> Vec<R> {
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, MutexGuard, Once};
+    type Job = Box<dyn FnOnce() + Send>;
+    static QUEUE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+    static QUEUED: Condvar = Condvar::new();
+    fn queue() -> MutexGuard<'static, VecDeque<Job>> {
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        for _ in 1..copy_back_threads() {
+            let worker = victory_core::thread::spawn_host("victory copy-back", || {
+                loop {
+                    let mut waiting = queue();
+                    let job = loop {
+                        match waiting.pop_front() {
+                            Some(job) => break job,
+                            None => {
+                                waiting = QUEUED.wait(waiting).unwrap_or_else(|e| e.into_inner())
+                            }
+                        }
+                    };
+                    drop(waiting);
+                    job();
+                }
+            });
+            if worker.is_err() {
+                break;
+            }
+        }
+    });
+    let results: Vec<Mutex<Option<std::thread::Result<R>>>> =
+        items.iter().map(|_| Mutex::new(None)).collect();
+    let left = (Mutex::new(items.len()), Condvar::new());
+    {
+        let mut waiting = queue();
+        for (item, result) in items.into_iter().zip(&results) {
+            let (f, left) = (&f, &left);
+            let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item)));
+                *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(done);
+                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                *n -= 1;
+                if *n == 0 {
+                    left.1.notify_all();
+                }
+            });
+            // SAFETY: the job borrows from this call, which returns only
+            // once every job it queued has run; a job does not unwind.
+            waiting.push_back(unsafe {
+                std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job)
+            });
+        }
+    }
+    QUEUED.notify_all();
+    // The caller runs jobs too: they run even if no thread could start.
+    loop {
+        let job = queue().pop_front();
+        let Some(job) = job else { break };
+        job();
+    }
+    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *n > 0 {
+        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(n);
+    results
+        .into_iter()
+        .map(|r| {
+            match r
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every job ran")
+            {
+                Ok(r) => r,
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        })
+        .collect()
+}
+
 /// The runs of words shaders wrote and the span of the words the copy takes
 /// from title memory ([`merge_words`]).
 type Merged = (Vec<(usize, usize)>, Option<(usize, usize)>);
@@ -410,6 +518,7 @@ fn any_bit(bits: &[u32], first: usize, count: usize) -> bool {
 /// the bit of the word holding the range's first byte, with the title
 /// blocks it found no word changed in ([`unchanged`]), whose bits go
 /// unread.
+#[derive(Clone, Copy)]
 enum How<'a> {
     Was(&'a Was<'a>),
     Bits {
@@ -1162,9 +1271,9 @@ impl Shadow {
             end = end.max(r.1);
             r.0 < r.1
         });
-        let mut written = 0;
         #[cfg(feature = "diagnostics")]
         let lux_merged = merged.clone();
+        let mut ranges: Vec<(usize, usize, How)> = Vec::new();
         for (from, to) in merged {
             let mut at = from;
             for &(a, b, _) in &by_words {
@@ -1175,12 +1284,12 @@ impl Shadow {
                     break;
                 }
                 if a > at {
-                    written += self.write_back(at, a, &How::Was(&was));
+                    ranges.push((at, a, How::Was(&was)));
                 }
                 at = at.max(b);
             }
             if at < to {
-                written += self.write_back(at, to, &How::Was(&was));
+                ranges.push((at, to, How::Was(&was)));
             }
         }
         if let Some((bits, _)) = told {
@@ -1190,9 +1299,48 @@ impl Shadow {
                     first,
                     unchanged,
                 };
-                written += self.write_back(from, to, &how);
+                ranges.push((from, to, how));
             }
         }
+        let written = match copy_back_threads() {
+            1 => ranges
+                .into_iter()
+                .map(|(from, to, how)| self.write_back(from, to, &how))
+                .sum(),
+            _ => {
+                // Parts of at most SPREAD bytes of title memory, cut where
+                // the pieces are.
+                const SPREAD: usize = 4 << 20;
+                let mut parts = Vec::new();
+                for (from, to, how) in ranges {
+                    let mut at = from;
+                    while at < to {
+                        let next = (((start + at) / SPREAD + 1) * SPREAD - start).min(to);
+                        let how = match how {
+                            How::Bits {
+                                bits,
+                                first,
+                                unchanged,
+                            } => How::Bits {
+                                bits,
+                                first: first + at / 4 - from / 4,
+                                unchanged,
+                            },
+                            was => was,
+                        };
+                        parts.push((at, next, how));
+                        at = next;
+                    }
+                }
+                on_copy_back_threads(parts, |(from, to, how)| {
+                    #[cfg(feature = "diagnostics")]
+                    let _charged = crate::copystat::charge(crate::copystat::Caller::CopyBack);
+                    self.write_back(from, to, &how)
+                })
+                .into_iter()
+                .sum()
+            }
+        };
         #[cfg(feature = "diagnostics")]
         lux_copy_back(self, &lux_merged, "after");
         // The submission is done with its armed blocks (its copy-back
@@ -4424,6 +4572,32 @@ pub(crate) mod tests {
             assert_eq!(lanes, words, "round {round}");
             assert_eq!((t1, h1), (t2, h2), "round {round}");
         }
+    }
+
+    /// Copy-back's threads run every item once, the results in order, on
+    /// more than one thread, also when called from several threads at once.
+    #[test]
+    fn copy_back_threads_run_every_item_once_in_order() {
+        let callers: Vec<_> = (0..3)
+            .map(|c| {
+                std::thread::spawn(move || {
+                    let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+                    let got = on_copy_back_threads((0..200).collect(), |i: usize| {
+                        threads.lock().unwrap().insert(std::thread::current().id());
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        i * 10 + c
+                    });
+                    assert_eq!(got, (0..200).map(|i| i * 10 + c).collect::<Vec<_>>());
+                    threads.into_inner().unwrap().len()
+                })
+            })
+            .collect();
+        let most = callers
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .max()
+            .unwrap();
+        assert!(copy_back_threads() == 1 || most > 1, "ran on one thread");
     }
 
     #[test]
