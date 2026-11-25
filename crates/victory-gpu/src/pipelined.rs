@@ -4,9 +4,7 @@
 //! signals the title fences queues signalled after it. Meanwhile the title
 //! thread prepares the next one, and waits only where a step would touch
 //! memory a submission still in flight writes or reads, for one of its
-//! lists still in flight, or for room ([`DEPTH`]). A title list reset while
-//! its submission is in flight records into a spare host list instead of
-//! waiting (`crate::list`).
+//! lists still in flight, or for room ([`DEPTH`]).
 //!
 //! Off unless `VICTORY_PIPELINED=1` and the host copies keep their
 //! copy-back state per submission ([`READY`]); never with
@@ -69,7 +67,6 @@ struct Flight {
 enum Why {
     Depth,
     List,
-    Reset,
     Writes,
     Reads,
     All,
@@ -83,10 +80,8 @@ struct State {
     done: u64,
     launched: u64,
     deferred: u64,
-    /// Title list resets that took a spare host list.
-    spared: u64,
     /// Per [`Why`]: waits and time waited.
-    waits: [(u64, Duration); 7],
+    waits: [(u64, Duration); 6],
 }
 
 /// Completes a submission, given when the one before it completed.
@@ -111,8 +106,7 @@ impl Pipeline {
                 done: 0,
                 launched: 0,
                 deferred: 0,
-                spared: 0,
-                waits: [(0, Duration::ZERO); 7],
+                waits: [(0, Duration::ZERO); 6],
             }),
             completed: Condvar::new(),
             jobs: OnceLock::new(),
@@ -163,11 +157,6 @@ impl Pipeline {
             s = self.wait(s, seq, Why::Depth);
         }
         s.next
-    }
-
-    /// Whether a submission in flight runs `list`.
-    fn runs(&self, list: usize) -> bool {
-        self.lock().flying.iter().any(|f| f.lists.contains(&list))
     }
 
     /// Queues a submission's completion.
@@ -338,18 +327,8 @@ pub(crate) fn wait_all() {
 /// Before a host list is reset or let go: waits for its submissions.
 pub(crate) fn wait_list(list: usize) {
     if on() {
-        PIPELINE.wait_for(Why::Reset, |f| f.lists.contains(&list));
+        PIPELINE.wait_for(Why::List, |f| f.lists.contains(&list));
     }
-}
-
-/// Whether a submission in flight runs host list `list`.
-pub(crate) fn in_flight(list: usize) -> bool {
-    on() && PIPELINE.runs(list)
-}
-
-/// A title list reset took a spare host list (counted for the log).
-pub(crate) fn spared() {
-    PIPELINE.lock().spared += 1;
 }
 
 /// A queue signals `fence`: deferred until the submissions queued before
@@ -370,29 +349,25 @@ pub(crate) fn log(frames: f64) {
     if !on() {
         return;
     }
-    let (launched, deferred, spared, waits) = {
+    let (launched, deferred, waits) = {
         let mut s = PIPELINE.lock();
-        let counts = (s.launched, s.deferred, s.spared, s.waits);
-        (s.launched, s.deferred, s.spared, s.waits) = (0, 0, 0, [(0, Duration::ZERO); 7]);
+        let counts = (s.launched, s.deferred, s.waits);
+        (s.launched, s.deferred, s.waits) = (0, 0, [(0, Duration::ZERO); 6]);
         counts
     };
     let f = frames.max(1.0);
     let w = waits.map(|(n, t)| (n as f64 / f, t.as_secs_f64() * 1e3 / f));
     tracing::info!(
-        "pipelined submissions per frame: {:.1}, {:.1} fence signals deferred, {:.1} list \
-         resets onto a spare host list; title threads waited (times, ms) for room {:.1} \
-         {:.1}, for their lists {:.1} {:.1}, to reset lists {:.1} {:.1}, for memory shaders \
-         write {:.1} {:.1}, for memory read {:.1} {:.1}, for all {:.1} {:.1}, for fences \
-         {:.1} {:.1}",
+        "pipelined submissions per frame: {:.1}, {:.1} fence signals deferred; title threads \
+         waited (times, ms) for room {:.1} {:.1}, for their lists {:.1} {:.1}, for memory \
+         shaders write {:.1} {:.1}, for memory read {:.1} {:.1}, for all {:.1} {:.1}, for \
+         fences {:.1} {:.1}",
         launched as f64 / f,
         deferred as f64 / f,
-        spared as f64 / f,
         w[Why::Depth as usize].0,
         w[Why::Depth as usize].1,
         w[Why::List as usize].0,
         w[Why::List as usize].1,
-        w[Why::Reset as usize].0,
-        w[Why::Reset as usize].1,
         w[Why::Writes as usize].0,
         w[Why::Writes as usize].1,
         w[Why::Reads as usize].0,
@@ -538,18 +513,6 @@ mod tests {
         );
         drop(gos);
         p.wait_for(Why::All, |_| true);
-    }
-
-    #[test]
-    fn a_list_runs_until_its_submission_completes() {
-        let p = pipeline();
-        let (go, job) = held();
-        p.launch(Vec::new(), Vec::new(), vec![5, 6], job);
-        assert!(p.runs(5) && p.runs(6));
-        assert!(!p.runs(7));
-        go.send(()).unwrap();
-        p.wait_for(Why::All, |_| true);
-        assert!(!p.runs(5) && !p.runs(6));
     }
 
     #[test]
