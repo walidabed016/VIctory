@@ -867,6 +867,11 @@ impl Pending {
         let Some(host) = host() else {
             return;
         };
+        // SAFETY: the fence is ours.
+        #[cfg(feature = "diagnostics")]
+        let early = self
+            .value
+            .is_some_and(|value| unsafe { host.fence.GetCompletedValue() } >= value);
         if let Some(value) = self.value {
             // SAFETY: the fence is ours; without an event the call returns
             // once the fence reaches the value.
@@ -881,6 +886,8 @@ impl Pending {
             // SAFETY: live until the submission completes (as above).
             .map(|&l| unsafe { &*l })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        crate::pipelined::gpu_done(early);
         let since = self.done.prepared.max(last);
         host.complete(&runs, self.done, since);
     }

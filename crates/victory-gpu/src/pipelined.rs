@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use crate::object::This;
 
+#[cfg(feature = "diagnostics")]
+mod trace;
+
 /// Whether shadow.rs and watch.rs keep copy-back state per submission
 /// (snapshots, armed blocks, pending ranges, the twin compares' buffers)
 /// and leave copy-back's writes out of the title's. Until then, copying a
@@ -166,6 +169,8 @@ impl Pipeline {
             .unwrap_or_else(|e| e.into_inner());
         let w = &mut s.waits[why.index()];
         (w.0, w.1) = (w.0 + 1, w.1 + started.elapsed());
+        #[cfg(feature = "diagnostics")]
+        trace::waited(why.index(), seq, started);
         s
     }
 
@@ -191,6 +196,8 @@ impl Pipeline {
             let seq = s.flying[s.flying.len() - DEPTH].seq;
             s = self.wait(s, seq, Why::Depth);
         }
+        #[cfg(feature = "diagnostics")]
+        trace::preparing(s.next);
         s.next
     }
 
@@ -207,6 +214,8 @@ impl Pipeline {
         let seq = s.next;
         s.next += 1;
         s.launched += 1;
+        #[cfg(feature = "diagnostics")]
+        trace::launched(seq);
         s.flying.push_back(Flight {
             seq,
             writes: merged(writes),
@@ -251,6 +260,8 @@ impl Pipeline {
         }
         (self.copied)(f.seq);
         s.done = f.seq;
+        #[cfg(feature = "diagnostics")]
+        trace::retired(f.seq);
         drop(s);
         self.completed.notify_all();
     }
@@ -374,6 +385,16 @@ pub(crate) fn wait_reads(from: usize, to: usize) {
     }
 }
 
+/// The completion thread saw the oldest submission in flight done on the
+/// GPU; `early`: done before it got to it (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn gpu_done(early: bool) {
+    let seq = PIPELINE.lock().flying.front().map(|f| f.seq);
+    if let Some(seq) = seq {
+        trace::gpu_done(seq, early);
+    }
+}
+
 /// Waits until every submission has completed.
 pub(crate) fn wait_all() {
     if on() {
@@ -457,6 +478,19 @@ pub(crate) fn log(frames: f64) {
         w[Why::Signal.index()].0,
         w[Why::Signal.index()].1,
     );
+    let names = [
+        "room",
+        "lists",
+        "memory read",
+        "all",
+        "fences",
+        "refreshes",
+        "snapshots",
+        "fills",
+        "title copies",
+        "textures",
+    ];
+    trace::log(f, &names);
 }
 
 #[cfg(test)]
