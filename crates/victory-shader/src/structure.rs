@@ -560,7 +560,70 @@ impl<'a> Lanes<'a> {
                 self.when[b] = Some(self.branch(last));
             }
         }
+        self.active_joins();
         execs
+    }
+
+    /// Marks lane masks joined at a block's entry (other than EXEC)
+    /// [`Structured::active`] where each incoming mask holds only lanes of
+    /// the EXEC coming in with it, the join's own lanes taken as arrived:
+    /// what a loop carries round, such as the lanes a waterfall loop has
+    /// still to take.
+    fn active_joins(&mut self) {
+        let p = self.p;
+        for block in &p.blocks {
+            // A half of EXEC on incoming edge `n`, or on entry (`None`): its
+            // join, else the value the block reads before writing it.
+            let exec = |half: u8, n: Option<usize>| {
+                let reg = Reg::S(EXEC + half);
+                match block.phis.iter().find(|phi| phi.reg == reg) {
+                    Some(phi) => Some(n.map_or(phi.value, |n| phi.args[n])),
+                    None => block
+                        .insts
+                        .iter()
+                        .find(|i| i.read(reg).is_some() || i.write(reg).is_some())?
+                        .read(reg),
+                }
+            };
+            let exec_key = |n| Some((exec(0, n)?, exec(u8::from(p.wave64), n)?));
+            let Some(entry) = exec_key(None) else {
+                continue;
+            };
+            for phi in &block.phis {
+                let Reg::S(code) = phi.reg else {
+                    continue;
+                };
+                if code == EXEC || code == EXEC + 1 || (p.wave64 && code % 2 == 1) {
+                    continue;
+                }
+                let high = match block.phis.iter().find(|h| h.reg == Reg::S(code + 1)) {
+                    Some(h) if p.wave64 => Some(h),
+                    None if p.wave64 => continue,
+                    _ => None,
+                };
+                let arg = |n: usize| (phi.args[n], high.map_or(phi.args[n], |h| h.args[n]));
+                let Some(&own) = self
+                    .masks
+                    .get(&(phi.value, high.map_or(phi.value, |h| h.value)))
+                else {
+                    continue;
+                };
+                let arrived = self.mask(entry).0;
+                let elsewhere = self.b.not(own);
+                let given = self.b.or(elsewhere, arrived);
+                let held = (0..block.preds.len()).all(|n| {
+                    let Some(e) = exec_key(Some(n)) else {
+                        return false;
+                    };
+                    let (m, e) = (self.mask(arg(n)).0, self.mask(e).0);
+                    let m = self.b.and(m, given);
+                    self.b.implies(m, e)
+                });
+                if held {
+                    self.active.insert(phi.value);
+                }
+            }
+        }
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.

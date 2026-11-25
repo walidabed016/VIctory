@@ -399,3 +399,43 @@ fn masks_of_lanes_outside_exec_read_as_data_are_the_scalar_units() {
         }
     }
 }
+
+#[test]
+fn a_lane_mask_a_loop_carries_reads_as_the_lanes_it_still_holds() {
+    // A waterfall loop over the lanes whose x & 5 is not 0, kept in s2
+    // (not EXEC): each turn takes the first lane left (`s_ff1`), which
+    // stores how many were left (`s_bcnt1`), and drops it from s2. The
+    // lane of rank k stores n - k; the others keep their register.
+    let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+    w.push(vop2(0x1A, 9, inline((SLOTS * 4).trailing_zeros() as u16), 0));
+    w.push(vop2(0x1B, 1, inline(31), 0));
+    w.extend(mov_k(8, DEAD));
+    w.push(vop2(0x1B, 12, inline(5), 0));
+    w.push(vopc(0xC5, ZERO, 12));
+    // s_and_b32 s2, vcc_lo, exec_lo
+    w.push(0x8000_0000 | 14 << 23 | 2 << 16 | (EXEC_LO as u32) << 8 | VCC_LO as u32);
+    let head = w.len();
+    w.push(sop1(0x13, 4, 2));
+    w.push(sop1(0x0F, 3, 2));
+    w.push(vopc(0xC2, 4, 1));
+    w.push(sop1(0x3C, 6, VCC_LO));
+    w.push(vop1(0x001, 8, 3));
+    w.push(sop1(0x03, EXEC_LO, 6));
+    // s_lshl_b32 s5, 1, s4; s_andn2_b32 s2, s2, s5; s_cmp_lg_u32 s2, 0
+    w.push(0x8000_0000 | 30 << 23 | 5 << 16 | 4 << 8 | inline(1) as u32);
+    w.push(0x8000_0000 | 20 << 23 | 2 << 16 | 5 << 8 | 2);
+    w.push(0xBF07_8002);
+    w.push(sopp(0x05, head as i16 - w.len() as i16 - 1));
+    w.extend(store(8, 9, 0));
+    w.push(S_ENDPGM);
+    let shader = build(&w);
+    let on = |x: u32| x & 5 != 0;
+    let n = (0..32).filter(|&l| on(l)).count() as u32;
+    for (label, got) in run(&shader) {
+        for x in 0..THREADS {
+            let rank = (x & !31..x).filter(|&g| on(g)).count() as u32;
+            let want = if on(x) { n - rank } else { DEAD };
+            assert_eq!(got[(x * SLOTS) as usize], want, "{label}: thread {x}");
+        }
+    }
+}
