@@ -2756,8 +2756,28 @@ struct Keep(Option<(ID3D12Resource, u64, u64)>);
 // SAFETY: D3D12 resources are free-threaded.
 unsafe impl Send for Keep {}
 
-/// By submission slot, as [`NOTES`].
+/// By submission slot, as [`NOTES`]; all in the first with [`shared_keep`].
 static KEEP: [Mutex<Keep>; SLOTS] = [const { Mutex::new(Keep(None)) }; SLOTS];
+
+/// Whether every slot keeps the twins' ranges in one VRAM buffer, the
+/// first of [`KEEP`]: the host queue runs a submission's compares before
+/// the next one's snapshots, so what one keeps is free on the GPU once its
+/// compares ran, before its copy-back. A slot of its own held up to
+/// [`KEEP_MAX`] of VRAM for each level of `VICTORY_PIPELINE_DEPTH`
+/// (in run F1, at depth 3, VRAM use was 21505 of a 22508 MiB budget).
+/// `VICTORY_SHARED_KEEP=1`.
+fn shared_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SHARED_KEEP").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "submission slots keep twins' ranges in one VRAM buffer (VICTORY_SHARED_KEEP)"
+            );
+        }
+        on
+    })
+}
 
 /// Where the compare marks the words shaders changed in twinned copies, a
 /// bit per word of the ranges in the order [`KEEP`] holds them
@@ -2893,11 +2913,20 @@ pub(crate) fn snapshot_twins(
     if ranges.iter().any(|r| r.4 >= 1 << 31) || need > KEEP_MAX {
         return None;
     }
-    let mut keep = KEEP[slot].lock().unwrap_or_else(|e| e.into_inner());
+    let shared = shared_keep();
+    let mut keep = KEEP[if shared { 0 } else { slot }]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if keep.0.as_ref().is_none_or(|k| k.2 < need) {
         // The slot's last submission has completed: the smaller buffer can
-        // go.
-        keep.0 = None;
+        // go. Shared, the compares of submissions queued before may not have
+        // run yet: it goes once the next submission completes.
+        if let Some((old, ..)) = keep.0.take()
+            && shared
+            && let Some(host) = host()
+        {
+            host.retire(old);
+        }
         let size = need.next_multiple_of(64 << 20);
         let Some(buffer) = vram_buffer(size) else {
             NO_KEEP.store(true, Ordering::Relaxed);
