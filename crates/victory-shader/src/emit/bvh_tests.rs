@@ -3,7 +3,8 @@
 //! programs running `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`
 //! over random nodes and rays on the host GPU and WARP, compared with the
 //! reference word for word. The nodes come from an ordinary buffer (a root
-//! SRV whose address the program shifts into the descriptor).
+//! SRV whose address the program shifts into the descriptor), or from title
+//! memory at a pointer in root constants (`Lower::memory`).
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -515,14 +516,18 @@ fn program(wide: bool) -> Vec<u32> {
     w
 }
 
-fn build(wide: bool) -> HostShader {
+fn build(wide: bool, memory: bool) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
         layout: vec![
             RootParam {
-                root: RootType::Descriptor,
+                root: if memory {
+                    RootType::Constants
+                } else {
+                    RootType::Descriptor
+                },
                 table_offset_dwords: 0,
                 sgprs: 2,
                 base_register: 0,
@@ -569,11 +574,12 @@ fn build(wide: bool) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    assert!(
+    assert_eq!(
         res.descriptors
             .iter()
             .any(|d| matches!(d.source, resource::Source::Built { .. })),
-        "the BVH's base traced to the root SRV"
+        !memory,
+        "the BVH's base traced to the root SRV, or read from the operand"
     );
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
@@ -599,6 +605,10 @@ fn build(wide: bool) -> HostShader {
         view_strides: lowered.view_strides,
         heap_indices: Vec::new(),
         heap_unknown: 0,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -700,8 +710,9 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
     (w, ty, ray)
 }
 
-fn run_cases(wide: bool, batches: usize) {
-    let shader = build(wide);
+fn run_cases(wide: bool, batches: usize, memory: bool) {
+    let shader = build(wide, memory);
+    assert_eq!(shader.memory, memory);
     let mut rng = Rng(if wide { 77 } else { 7 });
     let batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
         .map(|_| (0..LANES).map(|_| case(&mut rng)).collect())
@@ -720,8 +731,11 @@ fn run_cases(wide: bool, batches: usize) {
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!((u.root, u.slot), (RootType::Table, 1), "{u:?}");
-            ud[u.index as usize] = 0;
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Constants, 0) if memory => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
         }
         let (mut hits, mut tris) = (0, 0);
         for cases in &batches {
@@ -741,16 +755,36 @@ fn run_cases(wide: bool, batches: usize) {
                 let at = LANES * 16 + 32 * n;
                 data[at..at + 28].copy_from_slice(w);
             }
+            let (roots, views) = if memory {
+                (
+                    vec![
+                        (0, Root::Constants(ud.clone())),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                    ],
+                    vec![
+                        View::RawUav((LANES * 4) as u32),
+                        View::Memory(&data),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                )
+            } else {
+                (
+                    vec![
+                        (0, Root::Constants(ud.clone())),
+                        (1, Root::View { srv: true, data: data.clone() }),
+                    ],
+                    vec![View::RawUav((LANES * 4) as u32)],
+                )
+            };
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![
-                            (0, Root::Constants(ud.clone())),
-                            (1, Root::View { srv: true, data }),
-                        ],
-                        views: &[View::RawUav((LANES * 4) as u32)],
+                        roots,
+                        views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -775,10 +809,36 @@ fn run_cases(wide: bool, batches: usize) {
 
 #[test]
 fn intersections_on_the_gpu_equal_the_reference() {
-    run_cases(false, 16);
+    run_cases(false, 16, false);
 }
 
 #[test]
 fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
-    run_cases(true, 8);
+    run_cases(true, 8, false);
+}
+
+/// The title address of the rays and nodes in the title-memory runs.
+const TITLE: u64 = 0x12_3450_0000;
+
+/// The page table (`emit` "Title memory") for one copy of title memory at
+/// [`TITLE`] (under 64 KiB) with its views at heap index `view`, the null
+/// pair at `null`.
+fn page_table(view: u32, null: u32) -> Vec<u32> {
+    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+    let mut t = vec![0u32; 4096];
+    t[(hi << 4 | lo >> 28) as usize] = 1;
+    for _ in 0..2 * 4096 {
+        t.extend([null, 0]);
+    }
+    let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
+    t[entry..entry + 2].copy_from_slice(&[view, lo]);
+    t
+}
+
+/// The BVH at a pointer the program has in root constants: nodes (and
+/// rays) read through title memory.
+#[test]
+fn intersections_on_nodes_in_title_memory_equal_the_reference() {
+    run_cases(false, 4, true);
+    run_cases(true, 4, true);
 }

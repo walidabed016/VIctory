@@ -113,8 +113,10 @@ impl Host {
     }
 
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow, then the view heap's records
-    /// if a stage reads them.
+    /// parameter k, root views follow (by root parameter, CBV before SRV
+    /// before UAV), then the view heap's records if a stage reads them,
+    /// then the title-memory page table and written-pages bitmap if a
+    /// stage reads or writes title memory.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -133,26 +135,41 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        // (slot, kind): 0 CBV, 1 SRV, 2 UAV.
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        let mut views: Vec<(u32, u32, u8)> = views
+            .into_iter()
+            .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
+            .collect();
+        if stages.iter().any(|(s, _)| s.memory) {
+            views.push((0, super::MEMORY_SPACE, 1));
+        }
+        if stages.iter().any(|(s, _)| s.memory_writes) {
+            views.push((0, super::MEMORY_SPACE, 2));
+        }
+        if stages.iter().any(|(s, _)| s.view_addresses) {
+            views.push((1, super::MEMORY_SPACE, 1));
+        }
+        for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                ParameterType: match kind {
+                    0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_UAV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
+                        ShaderRegister: register,
+                        RegisterSpace: space,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -539,6 +556,10 @@ pub fn position_vs() -> HostShader {
         view_strides: false,
         heap_indices: Vec::new(),
         heap_unknown: 0,
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
     }
 }
 
@@ -604,6 +625,10 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         view_strides: false,
         heap_indices: Vec::new(),
         heap_unknown: 0,
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
     }
 }
 
@@ -622,6 +647,9 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root raw UAV of this many dwords, zeroed, read back after the
+    /// heap's UAVs ([`Host::dispatch`] only).
+    Uav(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -859,7 +887,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1015,6 +1043,14 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// Title memory: a buffer holding these dwords viewed raw, as an SRV at
+    /// its index and a UAV at the next (whose entry is [`View::Pair`]),
+    /// read back like the UAVs.
+    Memory(&'a [u32]),
+    /// Null raw SRV and UAV at this index and the next ([`View::Pair`]).
+    NullPair,
+    /// The second slot of a [`View::Memory`] or [`View::NullPair`].
+    Pair,
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1461,6 +1497,67 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
+                    View::Memory(_) | View::NullPair => {
+                        let n = match *v {
+                            View::Memory(data) => data.len() as u32,
+                            _ => 0,
+                        };
+                        let b = if let View::Memory(data) = *v {
+                            let bytes = u64::from(n) * 4;
+                            let b = make(
+                                D3D12_HEAP_TYPE_DEFAULT,
+                                &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            )?;
+                            let up = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(up);
+                            Some(b)
+                        } else {
+                            None
+                        };
+                        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    NumElements: n,
+                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: n,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let mut next = at;
+                        next.ptr += view_size;
+                        dev.CreateShaderResourceView(b.as_ref(), Some(&srv), at);
+                        dev.CreateUnorderedAccessView(b.as_ref(), None, Some(&uav), next);
+                        if let Some(b) = b {
+                            let rb = make(
+                                D3D12_HEAP_TYPE_READBACK,
+                                &buffer(u64::from(n) * 4, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            )?;
+                            uavs.push((b, None, n, rb));
+                        }
+                    }
+                    View::Pair => {}
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -1497,6 +1594,21 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    &Root::Uav(n) => {
+                        let bytes = u64::from(n) * 4;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
                     }
                 }
             }

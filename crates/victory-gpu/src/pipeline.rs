@@ -137,8 +137,7 @@ pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the program intersects rays (`image_bvh*_intersect_ray`),
-    /// which the translation answers as misses of an empty acceleration
-    /// structure.
+    /// against the title's acceleration structures in title memory.
     #[cfg(feature = "diagnostics")]
     pub(crate) rays: bool,
 }
@@ -162,12 +161,11 @@ impl Shader {
                         );
                         #[cfg(feature = "diagnostics")]
                         if t.rays {
-                            tracing::warn!(
+                            tracing::info!(
                                 stage = self.stage,
                                 hash = %self.hash,
-                                "ray intersections miss: acceleration structures are taken to be \
-                                 empty (no ray-traced shadows or reflections; logged once per \
-                                 program)"
+                                "ray intersections: the title's acceleration structures are read \
+                                 through the title-memory page table (logged once per program)"
                             );
                         }
                     }
@@ -213,6 +211,10 @@ impl Shader {
                     view_strides: false,
                     heap_indices: Vec::new(),
                     heap_unknown: 0,
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
                 },
                 used: Vec::new(),
                 rays: false,

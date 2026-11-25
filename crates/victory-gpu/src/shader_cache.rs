@@ -218,7 +218,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -235,6 +235,10 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(h.write));
     }
     word(&mut out, s.heap_unknown);
+    word(
+        &mut out,
+        u32::from(s.memory) | u32::from(s.memory_writes) << 1 | u32::from(s.view_addresses) << 2,
+    );
     out
 }
 
@@ -291,6 +295,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
     let view_strides = match r.word()? {
         0 => false,
         1 => true,
@@ -319,6 +324,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         });
     }
     let heap_unknown = r.word()?;
+    let memory = r.word()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -330,6 +336,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         view_strides,
         heap_indices,
         heap_unknown,
+        root_uavs,
+        memory: memory & 1 != 0,
+        memory_writes: memory & 2 != 0,
+        view_addresses: memory & 4 != 0,
     })
 }
 
@@ -385,6 +395,10 @@ mod tests {
                 },
             ],
             heap_unknown: 3,
+            root_uavs: vec![4],
+            memory: true,
+            memory_writes: true,
+            view_addresses: true,
         }
     }
 

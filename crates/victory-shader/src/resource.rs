@@ -12,8 +12,6 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
-use std::collections::HashSet;
-
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
@@ -54,12 +52,17 @@ pub struct Linear {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
-/// [`Address::param`] of memory in an acceleration structure: at the base an
-/// `image_bvh*_intersect_ray` descriptor holds, or computed from what is
-/// read at such an address (node and instance records). The host builds no
-/// structure, so each is taken to be empty, as the intersections are (no
-/// ray hits a node): its memory reads 0.
-pub const BVH: usize = usize::MAX - 1;
+/// [`Address::param`] of title memory at an address the program computes
+/// from data (a pointer loaded from memory or passed in root constants,
+/// arithmetic on such values): lowering takes the address from the
+/// instruction's own operands (decision 0005, title memory).
+pub const MEMORY: usize = usize::MAX - 1;
+
+/// [`Address::param`] of a load from the root signature's memory: a compute
+/// program gets the root parameters past its 16 user SGPRs in memory whose
+/// 40-bit address is in user data 0-1, starting with user-data dword 16.
+/// The offset is the user-data byte offset (dword 16 at 0x40).
+pub const USER_DATA: usize = usize::MAX - 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -152,14 +155,11 @@ pub struct Resources {
     /// [`Block::preds`]: crate::ir::Block::preds
     pub joined: Vec<(Site, usize, Vec<Option<Address>>)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// User SGPRs holding root parameters: value on entry (or loaded from
+    /// the root signature's memory, [`USER_DATA`]), layout index, dword
+    /// within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
-    /// Dwords scalar loads from root parameters read that hold an
-    /// acceleration structure's base (see [`BVH`]): taken to be 0, as the
-    /// structure is empty and none of its memory is read.
-    pub bvh_bases: Vec<Value>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -202,6 +202,7 @@ pub fn track(
                 let (param, dword) = t.param_of(reg)?;
                 Some((v, param, dword))
             })
+            .chain(t.spilled.iter().map(|(&v, &(param, dword))| (v, param, dword)))
             .collect(),
         ..Resources::default()
     };
@@ -212,7 +213,6 @@ pub fn track(
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
-    let bvh = t.bvh_roots();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -254,14 +254,6 @@ pub fn track(
                 Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
-                }
-                _ if !bvh.is_empty() && t.in_bvh(inst, b, &bvh) => {
-                    let address = Address {
-                        param: BVH,
-                        offset: 0,
-                        dynamic: None,
-                    };
-                    out.scalar.push((site, address));
                 }
                 Fields::Smem {
                     base,
@@ -309,13 +301,6 @@ pub fn track(
                     loads.push(load);
                 }
             }
-        }
-    }
-    for &((b, i), a) in &out.scalar {
-        let inst = &p.blocks[b].insts[i];
-        if a.param < layout.len() && inst.name().starts_with("s_load_") {
-            let bases = inst.writes.iter().map(|w| w.1).filter(|v| bvh.contains(v));
-            out.bvh_bases.extend(bases);
         }
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
@@ -383,6 +368,15 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// Values loaded from the root signature's memory ([`USER_DATA`]): the
+    /// root parameter and dword each one is.
+    spilled: std::collections::HashMap<Value, (usize, u32)>,
+    /// The first such value of each parameter dword, which the others are
+    /// copies of.
+    first_spilled: std::collections::HashMap<(usize, u32), Value>,
+    /// The loads from that memory by code offset, with their user-data byte
+    /// offset.
+    spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -477,9 +471,105 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            spilled: Default::default(),
+            first_spilled: Default::default(),
+            spill_at: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
+        // Loads from the root signature's memory are found by their address,
+        // which copies reach; then a reload is a copy of the first load.
+        for (site, at) in t.spill_loads() {
+            t.spill_at.insert(t.inst(site).machine.offset, at);
+            let Ok(at) = at else { continue };
+            for (k, &(_, v)) in t.inst(site).writes.iter().enumerate() {
+                if let Some(pd) = t.spilled_param(at / 4 + k as u32) {
+                    t.spilled.insert(v, pd);
+                    t.first_spilled.entry(pd).or_insert(v);
+                }
+            }
+        }
+        if !t.spilled.is_empty() {
+            t.origin = t.propagate_copies(n)?;
+        }
         Ok(t)
+    }
+
+    /// The scalar loads from the root signature's memory ([`USER_DATA`])
+    /// and the user-data byte offset each reads at (an error for a computed
+    /// one). Compute programs only: they get 16 user SGPRs, and one whose
+    /// parameters do not fit reads them through the pointer in user data
+    /// 0-1 (its high dword masked to the 40-bit address).
+    fn spill_loads(&self) -> Vec<(Site, Result<u32, &'static str>)> {
+        let input = |r| self.p.inputs.iter().find(|i| i.0 == r).map(|i| i.1);
+        let (Some(lo), Some(hi)) = (input(Reg::S(0)), input(Reg::S(1))) else {
+            return Vec::new();
+        };
+        if self.stage != HwStage::Cs
+            || !self.layout.iter().any(|p| p.user_data >= 16)
+            || self.layout.iter().any(|p| p.user_data < 2 && p.sgprs > 0)
+        {
+            return Vec::new();
+        }
+        let high = |t: Term| {
+            t == Term::Value(hi)
+                || matches!(t, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                    |(_, [a, b])| matches!((a, b), (x, Term::Const(_)) | (Term::Const(_), x) if x == Term::Value(hi))
+                ))
+        };
+        let mut out = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Smem {
+                    base: Operand::Scalar { code, .. },
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    continue;
+                };
+                if !inst.name().starts_with("s_load_") {
+                    continue;
+                }
+                let word = |k| inst.read(Reg::S(code + k)).map(|v| self.origin(v));
+                if word(0) != Some(Term::Value(lo)) || !word(1).is_some_and(high) {
+                    continue;
+                }
+                let at = match self.term(inst, soffset) {
+                    Some(Term::Const(c)) => Ok((*offset as u32).wrapping_add(c).wrapping_add(64)),
+                    _ => Err("a computed offset into the root signature's memory"),
+                };
+                out.push(((b, i), at));
+            }
+        }
+        out
+    }
+
+    /// The root parameter and dword that user-data dword `index` holds,
+    /// when it is in the root signature's memory.
+    fn spilled_param(&self, index: u32) -> Option<(usize, u32)> {
+        self.layout.iter().enumerate().find_map(|(i, p)| {
+            let dword = index.checked_sub(p.user_data.into())?;
+            (p.user_data >= 16 && dword < p.sgprs).then_some((i, dword))
+        })
+    }
+
+    /// The root parameter and dword `v` holds on entry or loaded from the
+    /// root signature's memory.
+    fn param_value(&self, v: Value) -> Option<(usize, u32)> {
+        match self.inputs[v.0 as usize] {
+            Some(reg) => self.param_of(reg),
+            None => self.spilled.get(&v).copied(),
+        }
+    }
+
+    /// The value holding dword `dword` of root parameter `param`.
+    fn param_word(&self, param: usize, dword: u32) -> Option<Value> {
+        if self.layout[param].user_data >= 16 && self.stage == HwStage::Cs {
+            return self.first_spilled.get(&(param, dword)).copied();
+        }
+        let reg = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8);
+        self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1)
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -511,7 +601,16 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let reload = self
+                            .spilled
+                            .get(&v)
+                            .map(|pd| self.first_spilled[pd])
+                            .filter(|&first| first != v)
+                            .map(Moved::Value);
+                        let new = match reload
+                            .or_else(|| copy_source(inst, k))
+                            .or_else(|| self.restored(inst))
+                        {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -604,8 +703,8 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
+        if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
+            return match self.param_value(v) {
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -846,10 +945,89 @@ impl<'a> Tracer<'a> {
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
-    /// immediate and offset register).
+    /// immediate and offset register); title memory ([`MEMORY`]) when the
+    /// program computes it from data. Addresses into descriptor heaps, the
+    /// code or an SGPR the root signature does not fill are traced or
+    /// refused.
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        const DATA: &[&str] = &[
+            "an address not from a root parameter",
+            "an address loaded from memory",
+            "an address from a phi",
+            "an address with two computed terms",
+            "an address with an untracked high half",
+            "an address from a root parameter that is no address",
+            "a constant address",
+        ];
+        match self.traced_address(lo, hi, extra) {
+            // The code's table at an offset the program computes from the
+            // counter (made uniform with a first-lane read, say): lowering
+            // gives the counter the code offset, so `lo` is the byte offset.
+            Err(_) if self.reaches_pc(lo) => match (lo, extra.dynamic) {
+                (Term::Value(v), None) => Ok(Address {
+                    param: CODE,
+                    offset: extra.offset,
+                    dynamic: Some(v),
+                }),
+                _ => Err("an address relative to the program counter"),
+            },
+            Err(why) if DATA.contains(&why) => Ok(Address {
+                param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            }),
+            a => a,
+        }
+    }
+
+    /// Whether the low dword `t` of an address is the program counter's plus
+    /// offsets (a table in the code, which is not title memory on the host),
+    /// through copies, additions, lane reads and phis.
+    fn reaches_pc(&self, t: Term) -> bool {
+        const ADDITIVE: &[&str] = &[
+            "s_mov_b32",
+            "s_add_u32",
+            "s_add_i32",
+            "s_or_b32",
+            "v_mov_b32",
+            "v_add_co_u32",
+            "v_add_nc_u32",
+            "v_add3_u32",
+            "v_lshl_add_u32",
+            "v_or_b32",
+            "v_readfirstlane_b32",
+        ];
+        let Term::Value(v) = t else { return false };
+        let (mut stack, mut seen) = (vec![v], std::collections::HashSet::new());
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) || seen.len() > 256 {
+                continue;
+            }
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                stack.extend(&self.p.blocks[b].phis[i].args);
+                continue;
+            }
+            let Some(inst) = self.def(v) else { continue };
+            if inst.name() == "s_getpc_b64" {
+                return true;
+            }
+            if ADDITIVE.contains(&inst.name()) {
+                // Not through the lane mask a vector instruction runs under.
+                let operand =
+                    |r: &&(Reg, Value)| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
+                stack.extend(inst.reads.iter().filter(operand).map(|r| r.1));
+            }
+        }
+        false
+    }
+
+    /// [`Self::address`] traced to a root parameter or the code.
+    fn traced_address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
+            if s.base.is_some_and(|b| self.heap_base(b)) {
+                return Err("an address into a descriptor heap with two computed terms");
+            }
             return Err("an address with two computed terms");
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
@@ -867,17 +1045,15 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .param_value(base)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Descriptor => Some(
+                self.param_word(param, 1)
+                    .ok_or("a root descriptor without its high half")?,
+            ),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
@@ -886,12 +1062,26 @@ impl<'a> Tracer<'a> {
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
-            return Err("an address with an untracked high half");
+            return Err(if high.is_none() {
+                "an address into a descriptor heap with an untracked high half"
+            } else {
+                "an address with an untracked high half"
+            });
         }
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+        })
+    }
+
+    /// Whether `v` is a root parameter holding a descriptor heap address.
+    fn heap_base(&self, v: Value) -> bool {
+        self.param_value(v).is_some_and(|(p, _)| {
+            matches!(
+                self.layout[p].root,
+                RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+            )
         })
     }
 
@@ -933,6 +1123,9 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
+        if self.param_value(v).is_some() {
+            return "an address from a root parameter that is no address";
+        }
         if self.inputs[v.0 as usize].is_some() {
             return "an address in an SGPR that is no root parameter";
         }
@@ -1101,153 +1294,6 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    /// The values the program's `image_bvh*_intersect_ray` reach their
-    /// acceleration structures through: what each one's descriptor base
-    /// (dwords 0 and 1) and node pointer (its first address, two dwords
-    /// for `image_bvh64_intersect_ray`) are computed from, back to the
-    /// loads holding them (program inputs aside: a root parameter's address
-    /// is traced as such), and the node pointers each one returns.
-    fn bvh_roots(&self) -> HashSet<Value> {
-        let mut roots = HashSet::new();
-        let mut todo = Vec::new();
-        for inst in self.p.blocks.iter().flat_map(|b| &b.insts) {
-            let Fields::Image {
-                rsrc: Operand::Scalar { code, .. },
-                addr,
-                ..
-            } = &inst.fields
-            else {
-                continue;
-            };
-            let node = match inst.name() {
-                "image_bvh_intersect_ray" => 1,
-                "image_bvh64_intersect_ray" => 2,
-                _ => continue,
-            };
-            let base = Operand::Scalar {
-                code: *code,
-                dwords: 2,
-            };
-            todo.extend(self.reads(inst, &[base]));
-            todo.extend(self.reads(inst, addr).into_iter().take(node));
-            roots.extend(inst.writes.iter().map(|w| w.1));
-        }
-        while let Some(v) = todo.pop() {
-            if self.inputs[v.0 as usize].is_some() || !roots.insert(v) {
-                continue;
-            }
-            if let Some((b, i)) = self.phis[v.0 as usize] {
-                todo.extend(&self.p.blocks[b].phis[i].args);
-            } else if let Some(inst) = self.def(v) {
-                todo.extend(self.data(inst));
-            }
-        }
-        roots
-    }
-
-    /// Whether the scalar or global memory access `inst` is in an
-    /// acceleration structure ([`BVH`]): its address, not traced to a root
-    /// parameter, computed from `roots` (see [`Tracer::bvh_roots`]) or
-    /// from what is read in one.
-    fn in_bvh(&self, inst: &Inst, at: usize, roots: &HashSet<Value>) -> bool {
-        let traced = match &inst.fields {
-            Fields::Smem {
-                base,
-                offset,
-                soffset,
-                ..
-            } => self.smem_address(inst, at, base, *offset, soffset).is_ok(),
-            Fields::Flat {
-                addr,
-                saddr,
-                offset,
-                ..
-            } => self
-                .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                .is_ok(),
-            _ => true,
-        };
-        let mut seen = HashSet::new();
-        !traced
-            && self.address_words(inst).is_some_and(|words| {
-                self.reads(inst, &words)
-                    .into_iter()
-                    .any(|v| self.bvh_derived(v, roots, &mut seen))
-            })
-    }
-
-    fn bvh_derived(&self, v: Value, roots: &HashSet<Value>, seen: &mut HashSet<Value>) -> bool {
-        if roots.contains(&v) {
-            return true;
-        }
-        if !seen.insert(v) {
-            return false;
-        }
-        let from = match (self.phis[v.0 as usize], self.def(v)) {
-            (Some((b, i)), _) => self.p.blocks[b].phis[i].args.clone(),
-            (None, Some(inst)) => match self.address_words(inst) {
-                Some(words) => self.reads(inst, &words),
-                None => self.data(inst),
-            },
-            (None, None) => Vec::new(),
-        };
-        from.into_iter().any(|x| self.bvh_derived(x, roots, seen))
-    }
-
-    /// The address operands of a scalar (not buffer) or global memory
-    /// access.
-    fn address_words(&self, inst: &Inst) -> Option<Vec<Operand>> {
-        let name = inst.name();
-        match &inst.fields {
-            Fields::Smem { base, .. } if name.contains("_load_") || name.contains("_store_") => {
-                (!name.starts_with("s_buffer_")).then(|| vec![*base])
-            }
-            Fields::Flat { addr, saddr, .. } if name.starts_with("global_") => {
-                Some(addr.iter().chain(saddr).copied().collect())
-            }
-            _ => None,
-        }
-    }
-
-    /// The values the ALU instruction `inst` computes its results from: its
-    /// operands but lane masks, lane selects and carries; none for others.
-    fn data(&self, inst: &Inst) -> Vec<Value> {
-        let name = inst.name();
-        match &inst.fields {
-            Fields::Sop { src, .. } => self.reads(inst, src),
-            Fields::Valu(f) => {
-                let n = if name.starts_with("v_readlane")
-                    || name.starts_with("v_readfirstlane")
-                    || name.starts_with("v_writelane")
-                {
-                    1
-                } else if name.starts_with("v_cndmask") || name.contains("_co_ci_") {
-                    2
-                } else {
-                    f.src.len()
-                };
-                self.reads(inst, &f.src[..n.min(f.src.len())])
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// The values `inst` reads in the registers of `ops` (EXEC aside).
-    fn reads(&self, inst: &Inst, ops: &[Operand]) -> Vec<Value> {
-        let mut out = Vec::new();
-        for op in ops {
-            let regs: Vec<Reg> = match *op {
-                Operand::Scalar { code, dwords } if !(EXEC..=EXEC + 1).contains(&code) => {
-                    (0..dwords).map(|k| Reg::S(code + k)).collect()
-                }
-                Operand::Vector { reg, dwords } => (0..dwords).map(|k| Reg::V(reg + k)).collect(),
-                _ => Vec::new(),
-            };
-            out.extend(regs.into_iter().filter_map(|r| inst.read(r)));
-        }
-        out
-    }
-
     /// The address a scalar memory access in block `at` reads.
     fn smem_address(
         &self,
@@ -1260,6 +1306,13 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
         };
+        if let Some(&at) = self.spill_at.get(&inst.machine.offset) {
+            return at.map(|offset| Address {
+                param: USER_DATA,
+                offset,
+                dynamic: None,
+            });
+        }
         let word = |k| Some(self.seen_at(self.origin(inst.read(Reg::S(code + k))?), at));
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
@@ -1616,13 +1669,14 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: None,
         };
+        // A computed base (title memory) is read from the operand.
         match self.address(lo, hi, at) {
-            Ok(address) => Ok(Some(Source::Built {
+            Ok(address) if address.param != MEMORY => Ok(Some(Source::Built {
                 address,
                 bits: flags,
                 words: [w2, w3],
             })),
-            Err(_) => Ok(None),
+            _ => Ok(None),
         }
     }
 
@@ -2865,6 +2919,60 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    /// A compute program whose root parameters do not fit its 16 user
+    /// SGPRs loads them through the pointer in user data 0-1: the loads are
+    /// user data (dword 16 at 0x40), their values the parameters'.
+    #[test]
+    fn root_parameters_past_the_user_sgprs_load_from_the_pointer() {
+        let r = track_words(
+            &[
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, 0xff
+                0xF404_0101,
+                0xFA00_0008, // s_load_dwordx2 s[4:5], s[2:3], 0x8 (user data 18)
+                0xBE86_03C1, // s_mov_b32 s6, -1
+                0xBE87_03FF,
+                0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+                0xF420_0202,
+                0xFA00_0000, // s_buffer_load_dword s8, s[4:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 16, 2), param(Descriptor, 18, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1, at(USER_DATA, 0x48));
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(1, 0),
+                bits: 0,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+        let mut params: Vec<_> = r.params.iter().map(|p| (p.1, p.2)).collect();
+        params.sort_unstable();
+        assert_eq!(params, [(1, 0), (1, 1)]);
+    }
+
+    /// Pointers the program loads or takes from root constants address
+    /// title memory; an SGPR no root parameter fills stays refused.
+    #[test]
+    fn computed_addresses_are_title_memory() {
+        let r = track_words(
+            &[
+                0xF404_0105,
+                0xFA00_0000, // s_load_dwordx2 s[4:5], s[10:11], null (constants)
+                0xF400_0182,
+                0xFA00_0008, // s_load_dword s6, s[4:5], 0x8 (the loaded pointer)
+                S_ENDPGM,
+            ],
+            &[param(Constants, 10, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
     }
 
     #[test]

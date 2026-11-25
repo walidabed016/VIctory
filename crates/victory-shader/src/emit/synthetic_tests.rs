@@ -114,6 +114,10 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         view_strides: lowered.view_strides,
         heap_indices: Vec::new(),
         heap_unknown: 0,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
     })
 }
 

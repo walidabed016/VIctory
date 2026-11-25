@@ -206,6 +206,10 @@ mod tests {
             view_strides: false,
             heap_indices: Vec::new(),
             heap_unknown: 0,
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
         }
     }
 

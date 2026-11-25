@@ -842,6 +842,9 @@ struct Deferred {
     /// Its reads and writes of memory other resources write too
     /// ([`crate::resource::alias`]).
     aliased: crate::resource::alias::Recorded,
+    /// Work done once the list has run, before the bottom-of-pipe writes
+    /// (title memory shaders wrote at addresses they computed goes back).
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Step {
@@ -1756,6 +1759,11 @@ impl Host {
         told.clear(&unchanged);
         drop(told);
         crate::watch::disarm(slot);
+        for list in runs {
+            for work in &list.deferred().after {
+                work();
+            }
+        }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
@@ -2383,6 +2391,12 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// Runs `work` once the list has run (each submission), before its
+    /// bottom-of-pipe writes.
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.

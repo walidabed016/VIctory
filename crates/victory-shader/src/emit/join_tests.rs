@@ -547,6 +547,10 @@ fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
         view_strides: lowered.view_strides,
         heap_indices: Vec::new(),
         heap_unknown: 0,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
     })
 }
 
@@ -691,7 +695,7 @@ fn scalars_set_in_an_arm_every_storing_lane_runs_are_the_arms() {
 fn scalars_set_in_an_arm_are_refused_where_a_lane_that_skipped_it_reads_them() {
     match lower_cs(&loaded_in_an_arm(Some(8))) {
         Err(ShaderError::Unsupported { what, .. }) => {
-            assert_eq!(what, "an address with an untracked high half");
+            assert_eq!(what, "an address into a descriptor heap with an untracked high half");
         }
         other => panic!("{:?}", other.map(|_| ())),
     }

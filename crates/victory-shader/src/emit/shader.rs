@@ -43,6 +43,10 @@ pub mod view_kind {
     pub const TEXTURE_UAV: u32 = 7;
 }
 
+/// Where the title-memory page table is bound: `t0` (a raw root SRV) in
+/// this space (see `emit` "Title memory").
+pub const MEMORY_SPACE: u32 = 3;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -113,6 +117,14 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// The handle of the view heap's records, once read.
     pub view_strides: Option<V>,
+    /// Root UAVs (raw buffers) read or written, likewise.
+    pub root_uavs: Vec<(u8, V)>,
+    /// The title-memory page table's handle, once read.
+    pub memory: Option<V>,
+    /// The written-pages bitmap's handle, once title memory is written.
+    pub memory_dirty: Option<V>,
+    /// The view addresses' handle, once a descriptor's address is read.
+    pub view_addresses: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -175,6 +187,10 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             view_strides: None,
+            root_uavs: Vec::new(),
+            memory: None,
+            memory_dirty: None,
+            view_addresses: None,
             flags: 0,
             nonuniform_handles: 0,
             #[cfg(test)]
@@ -339,6 +355,106 @@ impl Shader {
         h
     }
 
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_uavs.push((slot, h));
+        h
+    }
+
+    /// The handle of the title-memory page table (`t0` in [`MEMORY_SPACE`],
+    /// a raw buffer), made in the entry block.
+    pub fn memory_handle(&mut self) -> V {
+        if let Some(h) = self.memory {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(MEMORY_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.memory = Some(h);
+        h
+    }
+
+    /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
+    /// buffer: per resource-heap index, a buffer view's title address as a
+    /// buffer descriptor's dwords 0 and 1), made in the entry block.
+    pub fn view_addresses_handle(&mut self) -> V {
+        if let Some(h) = self.view_addresses {
+            return h;
+        }
+        let r = self.m.i32(1);
+        let bind = [r, r, self.m.i32(MEMORY_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.view_addresses = Some(h);
+        h
+    }
+
+    /// The handle of the bitmap of title-memory pages written (`u0` in
+    /// [`MEMORY_SPACE`], a raw buffer), made in the entry block.
+    pub fn memory_dirty_handle(&mut self) -> V {
+        if let Some(h) = self.memory_dirty {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(MEMORY_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.memory_dirty = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -435,6 +551,10 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || self.view_strides.is_some()
+            || !self.root_uavs.is_empty()
+            || self.memory.is_some()
+            || self.memory_dirty.is_some()
+            || self.view_addresses.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -489,12 +609,15 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            // Root SRVs, then the view heap's records.
+            // Root SRVs, then the view heap's records, then title memory's
+            // page table and view addresses.
             let raw: Vec<(u32, u32)> = self
                 .root_srvs
                 .iter()
                 .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                 .chain(self.view_strides.map(|_| (VIEW_STRIDE_SPACE, 0)))
+                .chain(self.memory.map(|_| (MEMORY_SPACE, 0)))
+                .chain(self.view_addresses.map(|_| (MEMORY_SPACE, 1)))
                 .collect();
             if !raw.is_empty() {
                 let ty = self
@@ -525,6 +648,46 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let no = self.m.bool(false);
+                let no = self.m.md_value(no);
+                let mut list = Vec::new();
+                let all: Vec<(u32, u32)> = self
+                    .root_uavs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
+                    .collect();
+                for (n, (space, slot)) in all.into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, slot)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space,
+                        register: slot,
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -554,7 +717,7 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
             // PSV0 lists them as the module does: CBVs, samplers, SRVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,

@@ -634,9 +634,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
-        // tables are no root parameter.
+        // tables and title memory are no root parameter.
         if let Some(a) = a
-            && a.param != resource::CODE
+            && a.param < p.layout.len()
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap

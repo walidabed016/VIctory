@@ -80,15 +80,24 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// The title-memory page table made for this list (`crate::memory`):
+    /// view heap, table and written-pages bitmap host addresses.
+    memory: Option<(usize, u64, u64)>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+            match (heap, crate::memory::heap()) {
+                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
+                _ => crate::descriptor::release_dynamic(heap, first, n),
+            }
         }
     }
 }
+
+/// The key of our own view heap (`crate::memory::heap`) among the title's.
+const MEMORY_HEAP: usize = usize::MAX;
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
@@ -213,17 +222,21 @@ fn root_reach(srv: bool) -> u64 {
 /// The host address of a root view: its host copy
 /// ([`crate::shadow::root`]), brought up to date as far as the view may be
 /// read, or for a constant buffer not 256-byte aligned there (the console
-/// needs 16) a copy in upload memory.
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let reach = root_reach(srv);
+/// needs 16) a copy in upload memory. What shaders write through a root UAV
+/// goes back to title memory after the submission.
+fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
+    let reach = root_reach(srv || uav);
     let (shadow, len) = crate::shadow::root(address, reach)?;
     #[cfg(feature = "diagnostics")]
     crate::shadow::note_root(address, reach, &shadow, len);
     let gpu = shadow.gpu(address);
     #[cfg(feature = "diagnostics")]
-    shadow.note_reached(address, len, false, !srv && gpu % 256 != 0);
-    if srv || gpu % 256 == 0 {
+    shadow.note_reached(address, len, false, !srv && !uav && gpu % 256 != 0);
+    if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        if uav {
+            shadow.gpu_writes(list, address, len);
+        }
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -422,6 +435,33 @@ impl State {
         }
     }
 
+    /// The host addresses of the list's title-memory page table and
+    /// written-pages bitmap for the bound view heap, made on first use.
+    fn memory_map(&mut self, list: &HostList) -> Option<(u64, u64)> {
+        let heap = match self.heaps[0] {
+            0 => MEMORY_HEAP,
+            h => h,
+        };
+        if let Some((h, table, dirty)) = self.memory
+            && h == heap
+        {
+            return Some((table, dirty));
+        }
+        let host = if heap == MEMORY_HEAP {
+            crate::memory::heap()?
+        } else {
+            crate::descriptor::heap(heap as This).host()?
+        };
+        let mut slots = Vec::new();
+        let map = crate::memory::build(list, host, &mut slots);
+        if let [first, n] = slots[..] {
+            self.dynamic.push((heap, first, n));
+        }
+        let map = map?;
+        self.memory = Some((heap, map.table, map.dirty));
+        Some((map.table, map.dirty))
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -534,8 +574,10 @@ impl State {
         }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        self.bind_heaps(list);
+        // set after them. Title memory's views need a view heap: ours where
+        // the title binds none (the BVH builder's dispatches may not).
+        let memory_heap = self.heaps[0] == 0 && p.stages.iter().any(|s| s.memory.is_some());
+        self.bind_heaps(list, memory_heap);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -618,23 +660,64 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                            (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
+                            (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                        }
+                    }
+                }
+            }
+            if let Some(param) = stage.view_addresses {
+                let gpu = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.view_addresses());
+                let Some(gpu) = gpu else {
+                    once!("a shader reading a view's address dropped: no view heap");
+                    return false;
+                };
+                // SAFETY: an open list; the heap's buffer lives with the heap.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
+            if let Some(param) = stage.memory {
+                let Some((table, dirty)) = self.memory_map(list) else {
+                    once!("a shader reading title memory dropped: no view heap or dynamic slots");
+                    return false;
+                };
+                // SAFETY: an open list; list memory alive until it is reset.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, table);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, table);
+                    }
+                    if let Some(param) = stage.memory_dirty {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, dirty);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, dirty);
                         }
                     }
                 }
@@ -661,19 +744,27 @@ impl State {
     }
 
     /// Gives the host list the title's heaps if it has others.
-    fn bind_heaps(&mut self, list: &HostList) {
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+    fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
+        let want = if memory_heap {
+            [MEMORY_HEAP, self.heaps[1]]
+        } else {
+            self.heaps
+        };
+        if self.host_heaps != want {
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            if memory_heap && let Some(h) = crate::memory::heap() {
+                heaps.insert(0, Some(h.heap.clone()));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { list.list.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
     }
@@ -712,7 +803,7 @@ impl State {
             return;
         };
         readable(list, ResourceType::Uav, &view);
-        self.bind_heaps(list);
+        self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
@@ -1808,7 +1899,7 @@ void main() {
         let host = crate::host::host().unwrap();
         let (root, pso) = compute(SOURCE);
         let list = host.new_list().unwrap();
-        let at = root_view(&list, address, true).unwrap();
+        let at = root_view(&list, address, true, false).unwrap();
         let held = crate::shadow::host_end(at).map_or(0, |end| end - at);
         assert!(
             held >= ROOT_SRV_REACH || std::env::var_os("VICTORY_TEST_ROOT_PAST_COPY").is_some(),
@@ -1982,6 +2073,10 @@ void main() {
             view_strides: true,
             heap_indices: Vec::new(),
             heap_unknown: 2,
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
         };
         let (root, pso) = compute(CULL);
         let (out, data) = host.shared_buffer(256).unwrap();

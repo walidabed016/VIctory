@@ -246,11 +246,42 @@ impl Lower<'_> {
     }
 
     /// `dwords` dwords at byte `offset` past `address`, a 64-bit GPU address
-    /// (`i64`), from title memory. The seam for memory the program reaches
-    /// by raw address, which translated code cannot read yet.
+    /// (`i64`), from title memory ([`Lower::memory`]).
     fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> Result<Vec<V>, Why> {
-        let _ = (address, offset, dwords);
-        Err("a BVH node at a raw GPU address")
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let off = self.s.m.int_const(i64t, i64::from(offset));
+        let a = self.s.m.bin(c, Bin::Add, address, off);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let lo = self.s.m.cast(c, Cast::Trunc, a, self.s.t.i32);
+        let hi = self.s.m.bin(c, Bin::LShr, a, k32);
+        let hi = self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32);
+        // Address bits 32-47, as the hardware takes them.
+        let mask = self.s.m.i32(0xFFFF);
+        let hi = self.s.m.bin(c, Bin::And, hi, mask);
+        // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
+        let (h, at) = self.memory(lo, hi, 4 * dwords, false);
+        let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut out = Vec::new();
+        for k in (0..dwords).step_by(4) {
+            let m = (dwords - k).min(4);
+            let o = self.s.m.i32(4 * k);
+            let o = self.s.m.bin(c, Bin::Add, at, o);
+            let mask = self.s.m.i8((1u8 << m) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, o, u, mask, align],
+            );
+            for j in 0..m {
+                let x = self.s.m.extract(c, r, j);
+                out.push(self.as_int(x));
+            }
+        }
+        Ok(out)
     }
 
     /// The child pointers of a box node (`w`: its 28 dwords, past 16 zero

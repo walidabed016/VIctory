@@ -609,6 +609,66 @@ impl Shadow {
         (to - from == 4 && !at.is_null()).then(|| unsafe { at.cast::<u32>().read_unaligned() })
     }
 
+    /// Where the title memory it copies starts, and its length.
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
+    /// After a submission whose shaders wrote title memory at addresses they
+    /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
+    /// the bytes of the page (cut to the copy) that differ from title memory
+    /// go back into it, when the title has not written the page since the
+    /// copy took it (then title memory is the copy as it was before the
+    /// submission, and what differs is what the GPU wrote). Returns the
+    /// bytes written; a page the title wrote meanwhile keeps the title's
+    /// bytes (logged once).
+    // shortcut: a page the copy holds only in part (at its ends) has no
+    // "copied" mark and is compared without the title-write check.
+    pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (page.max(start), (page + PAGE).min(end));
+        if from >= to {
+            return 0;
+        }
+        let index = page / PAGE - start / PAGE;
+        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
+        if watched
+            && let Some((_, written)) = crate::watch::writes(page, page + PAGE, true)
+            && let Some(&(_, w)) = written.iter().find(|&&(p, _)| p == page / PAGE)
+        {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner())[index];
+            if copied != 0 && w > copied {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        page = format_args!("{page:#x}"),
+                        "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
+                    )
+                });
+                return 0;
+            }
+        }
+        let n = to - from;
+        let at = self.host_at(from - start, n);
+        if at.is_null() {
+            return 0;
+        }
+        // SAFETY: inside the copy's memory; only the submitting thread
+        // writes it.
+        let host = unsafe { std::slice::from_raw_parts(at, n) };
+        let mut title = vec![0u8; n];
+        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+            return 0;
+        }
+        crate::watch::writing(from, n);
+        crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
+        // Our write is not the title's: the copy holds the page as it is.
+        if watched && let Some((now, _)) = crate::watch::writes(page, page + PAGE, true) {
+            self.copied.lock().unwrap_or_else(|e| e.into_inner())[index] = now;
+        }
+        n
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -3527,6 +3587,15 @@ fn map_twins(m: &mut Mirror, queue: &ID3D12CommandQueue) {
             )
         };
     }
+}
+
+/// Every host copy of title memory made so far (buffers, windows and the
+/// mirror's slabs).
+pub(crate) fn all() -> Vec<Arc<Shadow>> {
+    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(mirror_state().slabs.values().cloned());
+    all
 }
 
 /// For device-removed reports: the copy of title memory whose host range

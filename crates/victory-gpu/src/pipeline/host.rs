@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDE_SPACE};
+use victory_shader::emit::{
+    MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDE_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -255,6 +257,13 @@ pub(crate) struct Stage {
     /// The root parameter of the view heap's record strides, if it reads
     /// them (a table of their one view, `t0` in `VIEW_STRIDE_SPACE`).
     pub(crate) view_strides: Option<u32>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Our root parameters of the title-memory page table and of the
+    /// written-pages bitmap (`crate::memory`), if it reads or writes there.
+    pub(crate) memory: Option<u32>,
+    pub(crate) memory_dirty: Option<u32>,
+    /// Our root parameter of the heap's view addresses (`crate::memory`).
+    pub(crate) view_addresses: Option<u32>,
 }
 
 impl Stage {
@@ -384,6 +393,10 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 view_strides: None,
+                root_uavs: Vec::new(),
+                memory: None,
+                memory_dirty: None,
+                view_addresses: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -410,6 +423,11 @@ impl HostPipeline {
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
+                ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
                 ),
             ] {
                 for &slot in slots {
@@ -439,6 +457,26 @@ impl HostPipeline {
                     },
                     ShaderVisibility: visibility,
                 });
+            }
+            for (used, kind, register, out) in [
+                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
+                (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
+                (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
+            ] {
+                if used {
+                    *out = Some(params.len() as u32);
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: kind,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: register,
+                                RegisterSpace: MEMORY_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {

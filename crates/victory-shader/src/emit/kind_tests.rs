@@ -82,6 +82,10 @@ fn build(words: &[u32]) -> (HostShader, HeapIndices) {
         view_strides: lowered.view_strides,
         heap_indices: heaps.known.clone(),
         heap_unknown: heaps.unknown.len() as u32,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

@@ -49,6 +49,11 @@ pub(crate) struct HostHeap {
     /// Slots of buffer views made from the title's writes whose data no
     /// stage has asked for since ([`HostHeap::take_unread`]).
     unread: Mutex<std::collections::BTreeSet<u32>>,
+    /// Per title slot, the title address of the buffer view it holds, as a
+    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
+    /// address as data, `crate::memory`): the buffer, its mapping and host
+    /// address, made on first use.
+    addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -173,6 +178,7 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; dynamic as usize])),
             strides,
             unread: Mutex::default(),
+            addresses: std::sync::OnceLock::new(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -410,6 +416,87 @@ impl HostHeap {
         ))
     }
 
+    /// The host address of the slots' view addresses (see the field), made
+    /// on first use from the slots made so far.
+    pub(crate) fn view_addresses(&self) -> Option<u64> {
+        let made = self.addresses.get_or_init(|| {
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            crate::host::name(&buffer, || "view addresses".into());
+            let data = data as usize;
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, &key) in made.iter().enumerate() {
+                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+                write_address(data, i, view.as_ref());
+            }
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some((buffer, data, gpu))
+        });
+        made.as_ref().map(|m| m.2)
+    }
+
+    /// Slot `index` now holds `view` (or no view): its view address.
+    fn note_address(&self, index: u32, view: Option<&View>) {
+        if let Some(Some((_, data, _))) = self.addresses.get() {
+            write_address(*data, index as usize, view);
+        }
+    }
+
+    /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
+    /// resource view and a raw unordered access view of the `bytes` (a
+    /// multiple of 4) of `buffer` from byte `offset` (likewise), which
+    /// they hold; null views for no buffer.
+    pub(crate) fn raw_pair_at(
+        &self,
+        index: u32,
+        buffer: Option<&ID3D12Resource>,
+        offset: u64,
+        bytes: u64,
+    ) {
+        let Some(host) = host() else { return };
+        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
+        // a longer copy's rest reads 0 through it.
+        let elements = (bytes / 4).min(1 << 27) as u32;
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: elements,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: offset / 4,
+                    NumElements: elements,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: slots of our heap; the buffer is live (or none: null views).
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&srv), self.cpu(index));
+            host.device
+                .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
+        }
+        let (srv, uav) = match buffer {
+            Some(_) => ([4, 0, view_kind::RAW_SRV], [4, 0, view_kind::RAW_UAV]),
+            None => ([0; 3], [0; 3]),
+        };
+        self.keep(index, buffer.cloned(), srv);
+        self.keep(index + 1, buffer.cloned(), uav);
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds; `size` bytes, not 0: an
     /// empty view is made by [`HostHeap::make_at`]).
@@ -509,10 +596,12 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 crate::resource::slot_left(heap, index);
+                self.note_address(index, None);
             }
             return None;
         };
         if made[index as usize] != key {
+            self.note_address(index, Some(&view));
             let later = !for_draw && view.placed_texture() && !bindless_textures();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -684,6 +773,16 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
+}
+
+/// Writes slot `index`'s view address into the view addresses at `data`:
+/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
+/// zeros for anything else.
+fn write_address(data: usize, index: usize, view: Option<&View>) {
+    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
+    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
+    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
+    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
