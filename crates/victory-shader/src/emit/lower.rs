@@ -2351,20 +2351,7 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
-                let word = |w: Val| match w {
-                    Val::I32(x) => Ok(x),
-                    _ => Err("an opaque lane mask"),
-                };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
-                Ok(self.lane_bit(at, lo, hi))
-            }
+            Atom::Opaque(v) if self.console_lanes => self.own_bit(v, at),
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
@@ -2373,6 +2360,23 @@ impl<'a> Lower<'a> {
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
+    }
+
+    /// With console lanes: this lane's bit of the mask whose low dword is
+    /// `v`, read from the number it holds.
+    fn own_bit(&mut self, v: Value, at: usize) -> Result<V, Why> {
+        let hi = match self.pair_high(v) {
+            Some(h) => Some(self.get(h)?),
+            None => None,
+        };
+        let lo = self.get(v)?;
+        let word = |w: Val| match w {
+            Val::I32(x) => Ok(x),
+            _ => Err("an opaque lane mask"),
+        };
+        let lo = word(lo)?;
+        let hi = hi.map(word).transpose()?;
+        Ok(self.lane_bit(at, lo, hi))
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -9323,11 +9327,15 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let x = match self.x.st.masks.get(&phi.args[n]) {
+                    Some(&m) => self.boolean(m, qb),
+                    // A mask held only as a number (as one popped off a
+                    // stack in VGPR lanes): the console's, so the lane tests
+                    // its own bit.
+                    None if self.console_lanes => self.own_bit(phi.args[n], qb),
+                    None => Err("a lane-mask join of an untracked mask"),
+                }
+                .map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

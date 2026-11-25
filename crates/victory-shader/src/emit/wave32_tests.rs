@@ -498,3 +498,12 @@ fn a_lane_mask_a_loop_carries_through_a_vgpr_keeps_its_lanes() {
     ];
     check_lanes_left(&build(&lanes_left_loop(&carry)));
 }
+
+#[test]
+fn a_lane_mask_a_loop_carries_as_a_number_keeps_its_lanes() {
+    // The lanes left go round through a VGPR lane picked at run time
+    // (`v_writelane_b32 v13, s7, s4`, `v_readlane_b32 s2, v13, s4`), as a
+    // traversal stack holds them: a number, whose bits are console lanes.
+    let carry = [0xD761_000D, 7 | 4 << 9, 0xD760_0002, v(13) as u32 | 4 << 9];
+    check_lanes_left(&build(&lanes_left_loop(&carry)));
+}
