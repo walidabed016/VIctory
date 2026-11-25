@@ -1355,9 +1355,12 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
             format!("title memory in place {start:#x}+{len:#x}")
         });
         crate::watch::title_memory_held(start, len, true);
-        let twin = (twins_on() && twin_compare_on() && in_place_twins_on())
-            .then(|| vram_buffer(len as u64))
-            .flatten();
+        let twin = (twins_on()
+            && twin_compare_on()
+            && in_place_twins_on()
+            && crate::watch::write_watched(start))
+        .then(|| vram_buffer(len as u64))
+        .flatten();
         if let Some(twin) = &twin {
             crate::host::name(twin, || {
                 format!("title memory in place twin {start:#x}+{len:#x}")
@@ -1478,17 +1481,19 @@ pub(crate) const IN_PLACE_MIN: u64 = 1 << 20;
 /// ~90 ms of GPU a frame, most of it their stores; the light clusters'
 /// bits, ~17 ms with their clear and the light proxies' atomic ORs;
 /// hair_resolve's reads, 7 ms). Buffers shaders only read get one too,
-/// since the first use cannot tell. The twin takes the pages the title
-/// writes before each submission ([`Shadow::update`]), and after it the
-/// compare stores the words shaders changed into title memory itself
-/// ([`compare_twins`]), so copy-back has nothing to write. Like a copy, a
-/// twin holds only what refreshes took: ranges no draw is known to read
-/// (heap slots only shaders index) keep what was last taken, where title
-/// memory in place showed the title's latest. Only with the compare:
-/// copied down whole ([`download_twins`]), the twin's ranges put back over
-/// title memory what the title wrote there while the submission ran, as
-/// they still do in a submission whose ranges pass [`KEEP_MAX`] or the VRAM
-/// the host gives.
+/// since the first use cannot tell; only of write-watched memory, since
+/// the kernel refuses to guard memory a heap holds and nothing else tells
+/// the title's writes there ([`crate::watch::title_memory_held`]). The
+/// twin takes the pages the title writes before each submission
+/// ([`Shadow::update`]), and after it the compare stores the words shaders
+/// changed into title memory itself ([`compare_twins`]), so copy-back has
+/// nothing to write. Like a copy, a twin holds only what refreshes took:
+/// ranges no draw is known to read (heap slots only shaders index) keep
+/// what was last taken, where title memory in place showed the title's
+/// latest. Only with the compare: copied down whole ([`download_twins`]),
+/// the twin's ranges put back over title memory what the title wrote there
+/// while the submission ran, as they still do in a submission whose ranges
+/// pass [`KEEP_MAX`] or the VRAM the host gives.
 /// `VICTORY_NO_IN_PLACE_TWINS` turns it off.
 fn in_place_twins_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3902,9 +3907,11 @@ pub(crate) mod tests {
         release(at);
     }
 
-    /// A big title buffer used in place has a twin: what shaders write in
-    /// it reaches title memory through the compare, and the twin takes the
-    /// title's writes after, not the words it wrote itself.
+    /// A big title buffer used in place, in a pool, has a twin: what
+    /// shaders write in it reaches title memory through the compare, and
+    /// the twin takes the title's writes after (the pool's write watch
+    /// tells them: the heap keeps it from being guarded), not the words it
+    /// wrote itself.
     #[test]
     fn a_buffer_used_in_place_takes_what_shaders_write_through_its_twin() {
         let _serial = crate::watch::serial();
@@ -3914,12 +3921,14 @@ pub(crate) mod tests {
         let host = host().unwrap();
         let at = title_memory(1100, 256 * MIB, 32 * MIB, 32 * MIB);
         assert_ne!(at, 0, "no free address for test memory");
+        crate::watch::title_memory_watched(at, 32 * MIB, true);
         register(usize::MAX - 23, at as u64, 32 << 20);
         let s = find(at as u64, 32 << 20).unwrap();
         if !s.in_place {
             eprintln!("no heap on title memory: skipped");
             drop(s);
             unregister(usize::MAX - 23, at as u64);
+            crate::watch::title_memory_watched(at, 32 * MIB, false);
             release(at);
             return;
         }
@@ -3929,6 +3938,10 @@ pub(crate) mod tests {
         // SAFETY: our mapped upload buffer.
         unsafe { data.cast::<u32>().write(0xfeed_f00d) };
         let up = || crate::host::TWINS[1].load(Ordering::Relaxed);
+        // What earlier tests left for twins goes up first.
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
         // The GPU writes a word of the second block.
         let list = host.new_list().unwrap();
         s.refresh(&list, at as u64, 32 << 20);
@@ -3980,6 +3993,7 @@ pub(crate) mod tests {
         assert_eq!(twin_words, [0xfeed_f00d, 0x1234_5678]);
         drop((s, list));
         unregister(usize::MAX - 23, at as u64);
+        crate::watch::title_memory_watched(at, 32 * MIB, false);
         release(at);
     }
 

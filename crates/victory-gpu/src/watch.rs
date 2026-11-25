@@ -292,7 +292,7 @@ pub(crate) fn resident(start: usize, end: usize) -> bool {
 /// title's big views to their ends, ~0.3 s per world frame. Other pages are
 /// told apart without it where they are write-watched (private memory).
 pub(crate) fn view(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_MAPPED, MEMORY_BASIC_INFORMATION};
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION};
     use windows_sys::Win32::System::ProcessStatus::{
         K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
     };
@@ -322,19 +322,7 @@ pub(crate) fn view(at: usize) -> bool {
     if flags & VALID != 0 {
         return false;
     }
-    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
-    // SAFETY: room for one answer; without the reset flag nothing changes.
-    let watched = unsafe {
-        GetWriteWatch(
-            0,
-            (at & !(KERNEL_PAGE - 1)) as *const _,
-            KERNEL_PAGE,
-            (&raw mut found).cast(),
-            &mut count,
-            &mut granularity,
-        ) == 0
-    };
-    if watched {
+    if write_watched(at) {
         return false;
     }
     // Pages of a view not committed yet (sections whose pages the runtime
@@ -504,6 +492,23 @@ impl Blocks {
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the kernel watches writes to the memory at `at`.
+pub(crate) fn write_watched(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    // SAFETY: room for one answer; without the reset flag nothing changes.
+    unsafe {
+        GetWriteWatch(
+            0,
+            (at & !(KERNEL_PAGE - 1)) as *const _,
+            KERNEL_PAGE,
+            (&raw mut found).cast(),
+            &mut count,
+            &mut granularity,
+        ) == 0
+    }
 }
 
 /// Asks the kernel which kernel pages of write-watched pages `[from, to)`
