@@ -3420,8 +3420,8 @@ impl Meter {
                          MiB; {viewed} of them heap slots view, {viewed_mib} MiB; {fewer} with \
                          fewer mips); {gone} let go of, {moved} heap slots moved to the texture \
                          placed in their memory or one with fewer mips, {reduced} given one mip \
-                         fewer, {spared} kept as one placed later took only memory their views do \
-                         not read (VICTORY_BINDLESS_TEXTURES)",
+                         fewer, {spared} kept as one placed later took only memory past their \
+                         smallest mips (VICTORY_BINDLESS_TEXTURES)",
                         first / f64::from(1 << 20),
                         bytes / f64::from(1 << 20),
                         placed[4].load(Ordering::Relaxed),

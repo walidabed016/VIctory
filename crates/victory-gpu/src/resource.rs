@@ -1553,9 +1553,9 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// A texture the title placed in its own memory, as [`PLACED_TEXTURES`]
-/// keeps it: its resource, the end of its memory, the most detailed mip its
-/// views read and the end of the memory they read, its bytes, the frame it
-/// was last asked for, the heap slots made from views of it (heap, slot,
+/// keeps it: its resource, the end of its memory and of the memory of its
+/// smallest mips ([`kept_bytes`]), its bytes, the frame it was last asked
+/// for, the heap slots made from views of it (heap, slot,
 /// the record the slot was made from), the most detailed mips its resource
 /// lacks to save memory ([`placed_budget`]) and whether it can lack more,
 /// and the resource with one mip fewer brought up to date before the slots
@@ -1564,8 +1564,7 @@ pub(crate) extern "system" fn create_at_address(
 struct Placed {
     resource: usize,
     end: u64,
-    top: u32,
-    reads: u64,
+    keeps: u64,
     bytes: u64,
     used: u64,
     slots: Vec<(usize, u32, u64)>,
@@ -1603,6 +1602,16 @@ static PLACED_DYING: std::sync::Mutex<std::collections::VecDeque<(std::time::Ins
 #[cfg(windows)]
 type PlacedKey = (u64, [u32; 14]);
 
+/// The placed texture each heap slot views, by heap and slot.
+#[cfg(windows)]
+type SlotOwners = std::collections::HashMap<(usize, u32), PlacedKey>;
+
+/// The placed texture each heap slot views, to take a slot the title
+/// writes again off the list of the texture it viewed (locked inside
+/// [`PLACED_TEXTURES`], or alone).
+#[cfg(windows)]
+static SLOT_OWNERS: std::sync::Mutex<Option<SlotOwners>> = std::sync::Mutex::new(None);
+
 /// Placed textures given a resource with one mip fewer, by the frame, until
 /// their slots move to it (locked inside [`PLACED_TEXTURES`]).
 #[cfg(windows)]
@@ -1626,7 +1635,7 @@ static STALE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Placed textures' bytes now; those let go of, heap slots moved, and
 /// resources given one mip fewer so far; the frame resources were last
 /// given one; textures kept so far though one placed later took memory of
-/// theirs, which their views do not read.
+/// theirs past their smallest mips.
 #[cfg(windows)]
 static PLACED_COUNTS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
@@ -1703,10 +1712,35 @@ pub(crate) fn placing<T>(on: bool, f: impl FnOnce() -> T) -> T {
 pub(crate) fn placed_slot(address: u64, desc: &[u32; 14], heap: usize, slot: u32, record: u64) {
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
+    let key = (address, desc);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = map.get_mut(&(address, desc)) {
+    let mut owners = SLOT_OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    let owners = owners.get_or_insert_with(Default::default);
+    if let Some(before) = owners.insert((heap, slot), key).filter(|&k| k != key)
+        && let Some(p) = map.get_mut(&before)
+    {
+        p.slots.retain(|&(h, s, _)| (h, s) != (heap, slot));
+    }
+    if let Some(p) = map.get_mut(&key) {
         p.slots.retain(|&(h, s, _)| (h, s) != (heap, slot));
         p.slots.push((heap, slot, record));
+    }
+}
+
+/// Heap slot `slot` of heap `heap` no longer views a placed texture.
+#[cfg(windows)]
+pub(crate) fn slot_left(heap: usize, slot: u32) {
+    let before = SLOT_OWNERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|owners| owners.remove(&(heap, slot)));
+    let Some(before) = before else {
+        return;
+    };
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = map.get_mut(&before) {
+        p.slots.retain(|&(h, s, _)| (h, s) != (heap, slot));
     }
 }
 
@@ -1755,7 +1789,6 @@ pub(crate) fn replacement(
         return None;
     }
     let mut view: [u32; 10] = words[..10].try_into().ok()?;
-    let mut top = first_mip(&view);
     let mips = |d: &[u32; 14]| d[7] >> 16;
     let alike = old[0] == desc[0]
         && old[4..7] == desc[4..7]
@@ -1766,9 +1799,9 @@ pub(crate) fn replacement(
         if desc[0] != TEXTURE_2D || desc[7] & 0xffff != 1 || view[1] != VIEW_2D {
             return None;
         }
-        (view[0], view[4], view[5], view[7], top) = (desc[8], 0, u32::MAX, 0, 0);
+        (view[0], view[4], view[5], view[7]) = (desc[8], 0, u32::MAX, 0);
     }
-    let (texture, dropped) = placed_at(address, desc, top)?;
+    let (texture, dropped) = placed_at(address, desc)?;
     Some((texture, fewer_mips(view, dropped)))
 }
 
@@ -1796,38 +1829,14 @@ pub(crate) fn fewer_mips(mut view: [u32; 10], dropped: u32) -> [u32; 10] {
     view
 }
 
-/// The most detailed mip a shader view (as words) reads: its most detailed
-/// mip, or its clamp where that is past it (2D, 2D array and cube views;
-/// 0 for others).
+/// The bytes from the start of the texture `d` describes to the end of its
+/// smallest mips (its tail, or its smallest mip without one). The console
+/// lays a slice's mips out smallest first, and the title packs streamed
+/// textures with only their smallest mips in memory (its shaders clamp the
+/// mips they sample, not its views), so a texture placed past those takes
+/// memory the texture does not use. `all` for other layouts and arrays.
 #[cfg(windows)]
-pub(crate) fn first_mip(view: &[u32; 10]) -> u32 {
-    const VIEW_2D: u32 = 4;
-    const VIEW_2D_ARRAY: u32 = 5;
-    const VIEW_CUBE: u32 = 9;
-    let clamp = match view[1] {
-        VIEW_2D => view[7],
-        VIEW_2D_ARRAY => view[9],
-        VIEW_CUBE => view[6],
-        _ => return 0,
-    };
-    let clamp = f32::from_bits(clamp);
-    let clamp = if clamp.is_finite() && clamp > 0.0 {
-        clamp as u32
-    } else {
-        0
-    };
-    view[4].max(clamp)
-}
-
-/// The bytes from the start of the texture `d` describes to the end of the
-/// memory views reading its mips from `top` on read: the console lays a
-/// slice's mips out smallest first (the tail, then each mip after the one
-/// smaller), so where the next more detailed mip starts; `all` for other
-/// layouts, arrays and from mip 0. The title streams a texture's detailed
-/// mips into memory of their own, and views not reading them leave that
-/// memory to other textures.
-#[cfg(windows)]
-fn read_bytes(d: &ResourceDesc, top: u32, all: u64) -> u64 {
+fn kept_bytes(d: &ResourceDesc, all: u64) -> u64 {
     let Some(texture) = texture_layout(d) else {
         return all;
     };
@@ -1837,11 +1846,15 @@ fn read_bytes(d: &ResourceDesc, top: u32, all: u64) -> u64 {
     let layout = &plane.layout;
     let solid = &layout.mips[..(layout.first_tail_mip as usize).min(layout.mips.len())];
     let smallest_first = solid.windows(2).all(|w| w[0].offset > w[1].offset);
-    let next = (top as usize).min(solid.len());
-    if !smallest_first || layout.slices != 1 || next == 0 {
+    if !smallest_first || layout.slices != 1 {
         return all;
     }
-    solid[next - 1].offset.min(all)
+    solid
+        .iter()
+        .map(|m| m.offset)
+        .filter(|&at| at > 0)
+        .min()
+        .map_or(all, |at| at.min(all))
 }
 
 /// The description (as words) of the 2D texture `desc` describes without
@@ -1895,23 +1908,22 @@ fn without_top_mip(desc: &[u32; 14]) -> Option<([u32; 14], u64)> {
 /// description `desc` (as words), made on first use (tests).
 #[cfg(all(windows, test))]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    placed_at(address, desc, 0).map(|(texture, _)| texture)
+    placed_at(address, desc).map(|(texture, _)| texture)
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use, for a view reading
-/// its mips from `top` on ([`first_mip`]), and the most detailed mips it
-/// lacks.
+/// description `desc` (as words), made on first use, and the most detailed
+/// mips it lacks.
 #[cfg(windows)]
-pub(crate) fn placed_at(address: u64, desc: &[u32; 14], top: u32) -> Option<(This, u32)> {
+pub(crate) fn placed_at(address: u64, desc: &[u32; 14]) -> Option<(This, u32)> {
     let place = PLACING.get() || !crate::descriptor::host::bindless_textures();
-    placed_in(address, desc, crate::queue::presented(), place, top)
+    placed_in(address, desc, crate::queue::presented(), place)
 }
 
 /// [`texture_at`] in frame `now`; see [`placed_in`] (tests).
 #[cfg(all(windows, test))]
 pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<This> {
-    placed_in(address, desc, now, place, 0).map(|(texture, _)| texture)
+    placed_in(address, desc, now, place).map(|(texture, _)| texture)
 }
 
 /// [`placed_at`] in frame `now`. A texture made for a descriptor the title
@@ -1929,13 +1941,7 @@ pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64, place: boo
 /// used together. One let go of that the title views again is made again
 /// from its memory.
 #[cfg(windows)]
-fn placed_in(
-    address: u64,
-    desc: &[u32; 14],
-    now: u64,
-    place: bool,
-    top: u32,
-) -> Option<(This, u32)> {
+fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(This, u32)> {
     use std::sync::atomic::Ordering::Relaxed;
     const GPU_WRITTEN: u32 = 0x7;
     const MOST_DROPPED: u32 = 2;
@@ -1972,12 +1978,6 @@ fn placed_in(
     }
     let found = map.get_mut(&(address, desc)).map(|p| {
         p.used = now;
-        if top < p.top {
-            // SAFETY: 56 bytes in the description's layout.
-            let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-            p.top = top;
-            p.reads = address + read_bytes(&d, top, p.end - address);
-        }
         match p.next {
             0 => (p.resource as This, p.dropped),
             next => (next as This, p.dropped + 1),
@@ -2013,9 +2013,8 @@ fn placed_in(
         let bytes = footprint(&d).map_or(1, |info| info.size.max(1));
         let end = address.saturating_add(bytes);
         let longest = PLACED_LONGEST.fetch_max(bytes, Relaxed).max(bytes);
-        // Only memory the views of both read: the title streams detailed
-        // mips into memory of their own, which others take when they go.
-        let reads = address + read_bytes(&d, top, bytes);
+        // Only where the smallest mips of both lie ([`kept_bytes`]).
+        let keeps = address + kept_bytes(&d, bytes);
         let reused: Vec<PlacedKey> = if place {
             let mut spared = 0;
             let reused = map
@@ -2026,9 +2025,9 @@ fn placed_in(
                         && p.used.saturating_add(2) <= now
                 })
                 .filter(|&(&(at, _), p)| {
-                    let read = p.reads > address && at < reads;
-                    spared += u64::from(!read);
-                    read
+                    let taken = p.keeps > address && at < keeps;
+                    spared += u64::from(!taken);
+                    taken
                 })
                 .map(|(&key, _)| key)
                 .collect();
@@ -2046,10 +2045,10 @@ fn placed_in(
                         std::sync::atomic::AtomicU32::new(0);
                     if !p.slots.is_empty() && LOGGED.fetch_add(1, Relaxed) < 64 {
                         tracing::info!(
-                            old = ?(key.0, &key.1[4..9], p.top, p.reads - key.0),
-                            new = ?(address, &desc[4..9], top, reads - address),
+                            old = ?(key.0, &key.1[4..9], p.keeps - key.0),
+                            new = ?(address, &desc[4..9], keeps - address),
                             slots = p.slots.len(),
-                            "placed texture let go of (address, width, height, array and mips, format, first mip read, bytes read): its heap slots move to one placed in memory they read"
+                            "placed texture let go of (address, width, height, array and mips, format, bytes of its smallest mips): its heap slots move to one placed over those"
                         );
                     }
                 }
@@ -2063,13 +2062,19 @@ fn placed_in(
                 .iter()
                 .map(|&(heap, slot, record)| (heap, slot, record, address, desc, false)),
         );
+        if !slots.is_empty() {
+            let mut owners = SLOT_OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+            let owners = owners.get_or_insert_with(Default::default);
+            for &(heap, slot, _) in &slots {
+                owners.insert((heap, slot), (address, desc));
+            }
+        }
         map.insert(
             (address, desc),
             Placed {
                 resource: out as usize,
                 end,
-                top,
-                reads,
+                keeps,
                 bytes,
                 used: now,
                 slots,
@@ -2533,12 +2538,12 @@ mod tests {
         assert_eq!(fewer_mips(view(2, 3, 0.0), 0), view(2, 3, 0.0));
     }
 
-    /// A texture whose views read its mips from the second on keeps its
-    /// copy when a texture is placed in the memory of its first, which the
-    /// console lays out last; one whose views read every mip is let go of.
+    /// A texture keeps its copy when a texture is placed in its memory past
+    /// its smallest mips, which the console lays out first (the title packs
+    /// streamed textures so); it is let go of when one is placed over those.
     #[cfg(windows)]
     #[test]
-    fn placed_textures_keep_the_memory_their_views_read() {
+    fn placed_textures_are_let_go_of_as_their_smallest_mips_are_taken() {
         if crate::host::host().is_none() {
             return; // no host GPU
         }
@@ -2556,16 +2561,13 @@ mod tests {
         // SAFETY: 56 bytes in the description's layout.
         let d = unsafe { full.as_ptr().cast::<ResourceDesc>().read_unaligned() };
         let all = footprint(&d).unwrap().size;
-        let reads = read_bytes(&d, 1, all);
-        assert!(reads > 0 && reads < all, "mip 0 last");
-        assert_eq!(read_bytes(&d, 0, all), all);
-        placed_in(at, &full, 10, true, 1).expect("a texture viewed from mip 1");
-        placed_in(at + reads, &small, 12, true, 0).expect("one in its mip 0");
-        assert!(held(at, full), "memory its views do not read");
-        let other = at + 0x10_0000;
-        placed_in(other, &full, 10, true, 0).expect("a texture viewed whole");
-        placed_in(other + reads, &small, 12, true, 0).expect("one in its mip 0");
-        assert!(!held(other, full), "memory its views read");
+        let kept = kept_bytes(&d, all);
+        assert!(kept > 0 && kept < all / 8, "the tail first");
+        placed_in(at, &full, 10, true).expect("a texture");
+        placed_in(at + kept, &small, 12, true).expect("one past its tail");
+        assert!(held(at, full), "its smallest mips are untouched");
+        placed_in(at + kept / 2, &small, 14, true).expect("one in its tail");
+        assert!(!held(at, full), "its smallest mips are taken");
     }
 
     /// A placed texture whose memory another texture takes is let go of
