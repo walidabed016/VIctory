@@ -76,8 +76,12 @@ pub enum Source {
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
     /// Chosen by control flow: one source per predecessor of `block`, in
-    /// [`crate::ir::Block::preds`] order.
-    Phi { block: usize, args: Vec<Source> },
+    /// [`crate::ir::Block::preds`] order, `None` on an edge no lane that
+    /// accesses the descriptor takes.
+    Phi {
+        block: usize,
+        args: Vec<Option<Source>>,
+    },
     /// Chosen by SCC (`scc`, the value an `s_cselect` or `s_cmov` of each
     /// dword reads): the source when it is set, then when it is clear.
     Select { scc: Value, args: Vec<Source> },
@@ -105,10 +109,10 @@ impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
-            Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
+            Source::Select { args, .. } | Source::Lanes { args, .. } => {
                 args.iter().flat_map(Source::leaves).collect()
             }
-            Source::LanePhi { args, .. } => {
+            Source::Phi { args, .. } | Source::LanePhi { args, .. } => {
                 args.iter().flatten().flat_map(Source::leaves).collect()
             }
             s => vec![s],
@@ -141,11 +145,12 @@ pub struct Resources {
     pub terms: Vec<(Site, Result<Linear, &'static str>)>,
     /// Global and scalar accesses whose address a phi joins: the phi's
     /// block and the address each of its predecessors brings, in
-    /// [`Block::preds`] order. Their [`Resources::scalar`] entry has the
-    /// least of those offsets and the phi as its dynamic term.
+    /// [`Block::preds`] order, `None` on an edge no lane reaching a scalar
+    /// access takes. Their [`Resources::scalar`] entry has the least of
+    /// those offsets and the phi as its dynamic term.
     ///
     /// [`Block::preds`]: crate::ir::Block::preds
-    pub joined: Vec<(Site, usize, Vec<Address>)>,
+    pub joined: Vec<(Site, usize, Vec<Option<Address>>)>,
     pub descriptors: Vec<Descriptor>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
@@ -243,7 +248,7 @@ pub fn track(
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
                 }
-                _ if !bvh.is_empty() && t.in_bvh(inst, &bvh) => {
+                _ if !bvh.is_empty() && t.in_bvh(inst, b, &bvh) => {
                     let address = Address {
                         param: BVH,
                         offset: 0,
@@ -257,8 +262,10 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
-                    if let Some((block, _, addresses)) = t.joined(inst).map_err(fail)? {
+                    let address = t
+                        .smem_address(inst, b, base, *offset, soffset)
+                        .map_err(fail)?;
+                    if let Some((block, _, addresses)) = t.joined(inst, Some(b)).map_err(fail)? {
                         out.joined.push((site, block, addresses));
                     }
                     if let Some(d) = address.dynamic {
@@ -275,7 +282,7 @@ pub fn track(
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
-                    if let Some((block, _, addresses)) = t.joined(inst).map_err(fail)? {
+                    if let Some((block, _, addresses)) = t.joined(inst, None).map_err(fail)? {
                         out.joined.push((site, block, addresses));
                     }
                     out.scalar.push((site, address));
@@ -353,7 +360,7 @@ struct Sum {
 
 /// A phi's block, the phi, and the address each predecessor of the block
 /// brings.
-type Joined = (usize, Value, Vec<Address>);
+type Joined = (usize, Value, Vec<Option<Address>>);
 
 struct Tracer<'a> {
     p: &'a Program,
@@ -685,7 +692,7 @@ impl<'a> Tracer<'a> {
                 self.address(lo, hi, extra)
             }
             _ => {
-                if let Some(a) = self.joined_address(inst)? {
+                if let Some(a) = self.joined_address(inst, None)? {
                     return Ok(a);
                 }
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
@@ -709,8 +716,11 @@ impl<'a> Tracer<'a> {
     /// access's VGPRs or a scalar access's SGPRs (its low dword a phi; its
     /// high one a phi of the same block, or the same on every edge): the
     /// phi's block, the phi, and per predecessor the address it brings plus
-    /// what the access adds. `None` for other addresses.
-    fn joined(&self, inst: &Inst) -> Result<Option<Joined>, &'static str> {
+    /// what the access adds. `None` for other addresses. A scalar access in
+    /// block `at` reads its SGPRs as the lanes reaching it see them
+    /// ([`Self::seen_at`]): an edge none of them can take brings `None`,
+    /// and a phi with one origin on the other edges is no join.
+    fn joined(&self, inst: &Inst, at: Option<usize>) -> Result<Option<Joined>, &'static str> {
         let (lo, hi, extra) = match inst.fields {
             Fields::Flat {
                 addr: Some(Operand::Vector { reg, .. }),
@@ -743,6 +753,10 @@ impl<'a> Tracer<'a> {
         let Some((block, i)) = self.phis[lo.0 as usize] else {
             return Ok(None);
         };
+        if at.is_some_and(|at| self.seen_at(Term::Value(lo), at) != Term::Value(lo)) {
+            return Ok(None);
+        }
+        let kept = at.and_then(|at| self.kept_edges(block, at));
         let hi_phi = match hi {
             Term::Value(v) => self.phis[v.0 as usize],
             Term::Const(_) => None,
@@ -756,11 +770,17 @@ impl<'a> Tracer<'a> {
             .iter()
             .enumerate()
             .map(|(j, &arg)| {
+                if kept.as_ref().is_some_and(|k| !k[j]) {
+                    return Ok(None);
+                }
                 let hi = hi_phi.map_or(hi, |(_, h)| self.vorigin(phis[h].args[j]));
-                self.address(self.vorigin(arg), hi, extra)
+                self.address(self.vorigin(arg), hi, extra).map(Some)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if addresses.iter().any(|a| a.param != addresses[0].param) {
+        let mut params = addresses.iter().flatten().map(|a| a.param);
+        if let Some(first) = params.next()
+            && params.any(|p| p != first)
+        {
             return Err("an address joined from two root parameters");
         }
         Ok(Some((block, lo, addresses)))
@@ -768,14 +788,19 @@ impl<'a> Tracer<'a> {
 
     /// The address of an access whose address a phi joins ([`Self::joined`]):
     /// the least of the joined offsets, the phi its computed term.
-    fn joined_address(&self, inst: &Inst) -> Result<Option<Address>, &'static str> {
-        let Some((_, phi, addresses)) = self.joined(inst)? else {
+    fn joined_address(
+        &self,
+        inst: &Inst,
+        at: Option<usize>,
+    ) -> Result<Option<Address>, &'static str> {
+        let Some((_, phi, addresses)) = self.joined(inst, at)? else {
             return Ok(None);
         };
-        let least = addresses.iter().map(|a| a.offset).min();
+        let least = addresses.iter().flatten().min_by_key(|a| a.offset);
+        let least = least.ok_or("an address from a phi")?;
         Ok(Some(Address {
-            param: addresses[0].param,
-            offset: least.ok_or("an address from a phi")?,
+            param: least.param,
+            offset: least.offset,
             dynamic: Some(phi),
         }))
     }
@@ -1084,14 +1109,14 @@ impl<'a> Tracer<'a> {
     /// acceleration structure ([`BVH`]): its address, not traced to a root
     /// parameter, computed from `roots` (see [`Tracer::bvh_roots`]) or
     /// from what is read in one.
-    fn in_bvh(&self, inst: &Inst, roots: &HashSet<Value>) -> bool {
+    fn in_bvh(&self, inst: &Inst, at: usize, roots: &HashSet<Value>) -> bool {
         let traced = match &inst.fields {
             Fields::Smem {
                 base,
                 offset,
                 soffset,
                 ..
-            } => self.smem_address(inst, base, *offset, soffset).is_ok(),
+            } => self.smem_address(inst, at, base, *offset, soffset).is_ok(),
             Fields::Flat {
                 addr,
                 saddr,
@@ -1183,9 +1208,11 @@ impl<'a> Tracer<'a> {
         out
     }
 
+    /// The address a scalar memory access in block `at` reads.
     fn smem_address(
         &self,
         inst: &Inst,
+        at: usize,
         base: &Operand,
         offset: i32,
         soffset: &Operand,
@@ -1193,11 +1220,11 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
         };
-        let word = |k| Some(self.origin(inst.read(Reg::S(code + k))?));
+        let word = |k| Some(self.seen_at(self.origin(inst.read(Reg::S(code + k))?), at));
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
-        if let Some(a) = self.joined_address(inst)? {
+        if let Some(a) = self.joined_address(inst, Some(at))? {
             // Only a load from the code reads its joined address as such.
             return if a.param == CODE {
                 Ok(a)
@@ -1310,7 +1337,11 @@ impl<'a> Tracer<'a> {
     }
 
     /// Words that phis of one block join, traced per predecessor (words
-    /// defined before the join hold on every edge).
+    /// defined before the join hold on every edge). Lanes take their own
+    /// paths ([`Structured`]), so a forward edge that no lane in `known` can
+    /// take is `None`: compiled code loads a descriptor in an arm that only
+    /// lanes using it run, and on the edge that skips the arm the registers
+    /// hold something else.
     fn phi(
         &self,
         words: &[Term],
@@ -1336,8 +1367,26 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
+        let preds = &self.p.blocks[block].preds;
+        let lanes = self
+            .lanes
+            .filter(|_| preds.iter().all(|&q| self.rpo[q] < self.rpo[block]));
+        let mut args = Vec::new();
+        for (j, &q) in preds.iter().enumerate() {
+            let n = known.len();
+            if let Some(lanes) = lanes {
+                known.push((lanes.reach[q], true));
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
+                    && taken != not_taken
+                {
+                    known.push((when, taken == block));
+                }
+            }
+            let arg = if lanes.is_none_or(|l| l.bools.meet(known)) {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -1345,11 +1394,21 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.classify(&edge, joins, known)
-            })
-            .collect::<Result<_, _>>();
+                self.classify(&edge, joins, known).map(Some)
+            } else {
+                Ok(None)
+            };
+            known.truncate(n);
+            match arg {
+                Ok(a) => args.push(a),
+                Err(e) => {
+                    joins.pop();
+                    return Err(e);
+                }
+            }
+        }
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1866,6 +1925,57 @@ impl<'a> Tracer<'a> {
         }
         joins.pop();
         Ok(Some(Source::LanePhi { block, args }))
+    }
+
+    /// `t` as the lanes that reach block `at` see it: a phi of a forward
+    /// join is the one origin it has on the edges those lanes can take
+    /// (compiled code sets a scalar in an arm that only lanes using it run,
+    /// and on the edge that skips the arm the register holds something
+    /// else). Lanes take their own paths ([`Structured`]).
+    fn seen_at(&self, t: Term, at: usize) -> Term {
+        let Term::Value(v) = t else {
+            return t;
+        };
+        let Some((block, i)) = self.phis[v.0 as usize] else {
+            return t;
+        };
+        let Some(kept) = self.kept_edges(block, at) else {
+            return t;
+        };
+        let mut seen = None;
+        for (&arg, _) in self.p.blocks[block].phis[i].args.iter().zip(kept).filter(|e| e.1) {
+            let arg = self.origin(arg);
+            if seen.is_some_and(|s| s != arg) {
+                return t;
+            }
+            seen = Some(arg);
+        }
+        seen.unwrap_or(t)
+    }
+
+    /// Per edge into block `block`, whether a lane reaching block `at` can
+    /// take it ([`Structured`]); `None` at a loop header, which keeps every
+    /// edge, or where lanes are not followed.
+    fn kept_edges(&self, block: usize, at: usize) -> Option<Vec<bool>> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let kept = preds.iter().map(|&q| {
+            let mut known = vec![(lanes.reach[at], true), (lanes.reach[q], true)];
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                known.push((when, taken == block));
+            }
+            lanes.bools.meet(&known)
+        });
+        Some(kept.collect())
     }
 
     /// Whether a path leads from block `from` to block `to` (to `from`
@@ -2389,7 +2499,7 @@ pub(crate) mod tests {
         let offsets: Vec<_> = args
             .iter()
             .map(|a| match a {
-                Source::Loaded { load, .. } => {
+                Some(Source::Loaded { load, .. }) => {
                     r.scalar.iter().find(|s| s.0 == *load).unwrap().1.offset
                 }
                 a => panic!("{a:?}"),
