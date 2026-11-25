@@ -11,6 +11,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -116,7 +118,7 @@ struct List {
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: Host,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -140,7 +142,105 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    let host = unsafe { (*this.cast::<List>()).host.0.load(Ordering::Acquire) };
+    // SAFETY: the list owns it until its own reset swaps it or it is let go.
+    unsafe { host.as_ref() }
+}
+
+/// A title list's host list, owned (null without a host GPU). Only the
+/// list's reset swaps it ([`turn`]).
+#[cfg(windows)]
+struct Host(AtomicPtr<crate::host::HostList>);
+
+#[cfg(windows)]
+impl Drop for Host {
+    fn drop(&mut self) {
+        let host = *self.0.get_mut();
+        if !host.is_null() {
+            // SAFETY: made by `Box::into_raw` and owned by this list.
+            drop(unsafe { Box::from_raw(host) });
+        }
+    }
+}
+
+/// A host list no title list records into, and the title's upload memory
+/// its last recording used (kept until it is free).
+#[cfg(windows)]
+struct Spare {
+    list: Box<crate::host::HostList>,
+    _uploads: Vec<Vec<u8>>,
+}
+
+// SAFETY: host lists are recorded and submitted from any title thread
+// already; a spare is only kept here.
+#[cfg(windows)]
+unsafe impl Send for Spare {}
+
+/// Spare host lists (WAL-17). D3D12 lets a title reset a list once its
+/// submission is queued; pipelined, that submission may still be in
+/// flight, so the list swaps its host list for a spare none in flight runs,
+/// made if there is none. There are as many as host lists swapped out
+/// were in flight at once.
+#[cfg(windows)]
+static SPARES: std::sync::Mutex<Vec<Spare>> = std::sync::Mutex::new(Vec::new());
+
+/// Before a reset: if a submission in flight runs the list's host list,
+/// swaps it for a spare (it keeps `uploads` until it is free); waits
+/// only if no spare can be made.
+#[cfg(windows)]
+fn turn(list: &List, uploads: Vec<Vec<u8>>) {
+    let at = |host: &crate::host::HostList| std::ptr::from_ref(host) as usize;
+    let current = list.host.0.load(Ordering::Relaxed);
+    // SAFETY: owned by the list, which only this reset swaps.
+    let Some(host) = (unsafe { current.as_ref() }) else {
+        return;
+    };
+    if !crate::pipelined::in_flight(at(host)) {
+        return;
+    }
+    let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+    let free = spares
+        .iter()
+        .position(|spare| !crate::pipelined::in_flight(at(&spare.list)));
+    let next = match free {
+        Some(i) => spares.swap_remove(i).list,
+        None => match spare() {
+            Some(made) => {
+                tracing::info!(spares = spares.len() + 1, "spare host command list made");
+                made
+            }
+            None => {
+                drop(spares);
+                crate::pipelined::wait_list(at(host));
+                return;
+            }
+        },
+    };
+    list.host.0.store(Box::into_raw(next), Ordering::Release);
+    // SAFETY: made by `Box::into_raw`; the list no longer names it.
+    let outgoing = unsafe { Box::from_raw(current) };
+    spares.push(Spare {
+        list: outgoing,
+        _uploads: uploads,
+    });
+}
+
+/// A new host list, closed (as a reset expects).
+#[cfg(windows)]
+fn spare() -> Option<Box<crate::host::HostList>> {
+    let list = match crate::host::host()?.new_list() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(error = %e, "no spare host command list");
+            return None;
+        }
+    };
+    // SAFETY: our new list, open and empty.
+    if let Err(e) = unsafe { list.list.Close() } {
+        tracing::warn!(error = %e, "a spare host command list did not close");
+        return None;
+    }
+    Some(Box::new(list))
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -216,13 +316,17 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: Host(AtomicPtr::new(
+            crate::host::host()
+                .and_then(|h| match h.new_list() {
+                    Ok(list) => Some(list),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no host command list");
+                        None
+                    }
+                })
+                .map_or(std::ptr::null_mut(), |list| Box::into_raw(Box::new(list))),
+        )),
         #[cfg(windows)]
         state: Default::default(),
     });
@@ -268,22 +372,21 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for;
-    // pipelined, waited for here).
-    #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        crate::pipelined::wait_list(std::ptr::from_ref(host) as usize);
-    }
     // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let list = unsafe { &*this.cast::<List>() };
+    let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+    // Pipelined, the list's last submission may still be in flight: it
+    // records into a host list none in flight runs.
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    {
+        turn(list, uploads);
+        with_state(this, |host, state| {
+            host.reset();
+            state.reset(pipeline);
+        });
+    }
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = (uploads, pipeline);
     S_OK
 }
 
