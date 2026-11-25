@@ -8892,9 +8892,13 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
+            // shortcut: stores are taken to write channels of a float format
+            // (the console converts by the view's format). A store of some
+            // channels (Belobug 81ef5a3) keeps the others as the texel holds
+            // them: the validator wants typed UAV stores to write all four,
+            // so the texel is read first. Refused again with
+            // `VICTORY_NO_BELOBUG=partial-stores`.
+            if *dmask != 0xF && !super::belobug("partial-stores") {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -8906,13 +8910,21 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
+            let mut idx = 0u8;
             for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                if dmask >> k & 1 == 0 {
+                    vals.push(None);
+                    continue;
+                }
+                // The written channels' data in consecutive VGPRs; d16: two
+                // f16 channels per VGPR, low half first.
+                let r = if *d16 { idx / 2 } else { idx };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                let high = idx % 2 == 1;
+                idx += 1;
+                vals.push(Some(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if high {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -8921,13 +8933,30 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                }));
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
+            let old = vals.contains(&None).then(|| {
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+                let iu = self.s.m.undef(self.s.t.i32);
+                let mut args = vec![h, iu];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let rt = self.s.t.res_ret;
+                self.s
+                    .op(self.cur, "textureLoad.f32", Attr::ReadOnly, rt, 66, &args)
+            });
             let mut args = vec![h];
             args.extend(cs);
-            args.extend(vals);
+            for (k, v) in vals.into_iter().enumerate() {
+                let v = match (v, old) {
+                    (Some(v), _) => v,
+                    (None, Some(old)) => self.s.m.extract(self.cur, old, k as u32),
+                    (None, None) => unreachable!(),
+                };
+                args.push(v);
+            }
             args.push(self.s.m.i8(0xF));
             let void = self.s.t.void;
             self.s.op(
@@ -9847,14 +9876,12 @@ impl<'a> Lower<'a> {
             for &x in vals {
                 args.push(self.as_float(x));
             }
-            args.push(self.s.m.i8(0xF));
-            self.s
-                .op(self.cur, "bufferStore.f32", Attr::NoUnwind, void, 69, &args);
-            return;
-        }
-        let (one, align) = (self.s.m.i8(1), self.s.m.i32(4));
-        for (k, &x) in vals.iter().enumerate() {
-            let at = match k {
+            // Fewer than four channels: the validator wants typed UAV
+            // stores to write all four, so the rest are the element's own.
+            if vals.len() < 4 {
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+                let rt = self.s.t.res_ret;
+                let old =  match k {
                 0 => off,
                 _ => {
                     let step = self.s.m.i32(4 * k as u32);
@@ -11349,5 +11376,73 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn partial_channel_image_store_lowers() {
+        use crate::native::{RootParam, RootType};
+
+        // image_store (op 0x08), dim=1 (2D), unorm=1
+        // Test 32-bit partial masks (0x1, 0x3, 0x5) and d16 partial mask (0x7).
+        for (dmask, d16) in [(0x1u32, false), (0x3, false), (0x5, false), (0x7, true)] {
+            let mimg_w0 = 0xF000_0000
+                | (0x08 << 18)
+                | (u32::from(d16) << 15)
+                | (dmask << 8)
+                | (1 << 7)
+                | (1 << 3);
+            let words = [
+                // s_mov_b32 s1, 0
+                0xBE81_0380u32,
+                // s_load_dwordx8 s[4:11], s[0:1], null
+                0xF40C_0100,
+                0xFA00_0000,
+                // v_mov_b32 v0..v3, 0 (coords v0..v1, data v2..v3)
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                // image_store v[2..], v[0..1], s[4:11]
+                mimg_w0,
+                0x0001_0200,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&structure::structure(&p).unwrap())).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+        }
     }
 }
