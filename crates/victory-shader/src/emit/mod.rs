@@ -376,6 +376,19 @@ pub fn partial_groups() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_GROUPS").is_some())
 }
 
+/// Whether the page bitmap marks of a compute program's stores to title
+/// memory are gathered per host wave: where the active lanes mark one
+/// bitmap dword, the first of them ORs in all their bits, instead of each
+/// lane doing an atomic OR of its own. XboxBvhBuilder's passes store from
+/// thousands of lanes into one 64 KiB page, so their marks all land on one
+/// dword: 8,192 a pass in CopyForBVHUpdate, which run 158 timed out in.
+/// Off unless `VICTORY_WAVE_MARKS` is set. Part of the translation, so
+/// the shader cache must key on it (`victory-gpu`'s does).
+pub fn wave_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_MARKS").is_some())
+}
+
 /// Whether a vector memory access whose address's two dwords are joined
 /// in different blocks takes it as title memory its lanes compute (their
 /// registers hold it at the access); refused otherwise. XboxBvhBuilder's

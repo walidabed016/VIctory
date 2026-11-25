@@ -119,7 +119,7 @@ fn vram_bitmap() -> bool {
         let on = std::env::var("VICTORY_VRAM_BITMAP").is_ok_and(|v| v == "1");
         if on {
             tracing::info!(
-                "page tables' bitmaps of written pages are in VRAM (VICTORY_VRAM_BITMAP)"
+                "page tables' bitmaps of written pages go in a GPU upload heap if the host has one (VICTORY_VRAM_BITMAP)"
             );
         }
         on

@@ -429,3 +429,60 @@ fn prefix_sum64_scans_each_group_s_64_values() {
         assert_eq!(r[sums + g], total, "group {g}'s sum");
     }
 }
+
+#[test]
+fn copy_for_bvh_update_copies_a_tree_once_and_ends() {
+    // CopyForBVHUpdate (cut from XboxBvhBuilder.dll at 0xb4fe0, named by
+    // `VICTORY_BVH_COPY`): each lane copies 16 bytes, 16 * (root constant 0)
+    // bytes apart, until 64 * (the source's dword 1) + 64 bytes; with root
+    // constant 1 set, lane 0 then resets the bounds at bytes 16 to 40. Run
+    // 158 timed out in its dispatches of 128 groups (4096 threads) whose
+    // source and destination were one address.
+    let n = 5000;
+    let dwords = 16 * (n + 1);
+    let mut im = Image {
+        memory: Vec::new(),
+        pages: 0,
+    };
+    let src = im.alloc(dwords);
+    let dst = im.alloc(dwords + DW);
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    for k in 0..dwords {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        im.memory[src + k] = s as u32;
+    }
+    im.memory[src + 1] = n as u32;
+    let empty = [
+        0x7f7f_ffffu32,
+        0x7f7f_ffff,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0xff7f_ffff,
+        0xff7f_ffff,
+    ];
+    for (consts, to) in [([4096, 0], dst), ([4096, 1], dst), ([4096, 0], src)] {
+        let slots = [address(src), address(to)];
+        let start = std::time::Instant::now();
+        let Some(r) = dispatch("VICTORY_BVH_COPY", &im.memory, &slots, &consts, 128) else {
+            eprintln!("VICTORY_BVH_COPY unset or no GPU: skipped");
+            return;
+        };
+        eprintln!(
+            "constants {consts:?}, in place {}: {:?}",
+            to == src,
+            start.elapsed()
+        );
+        for k in 0..dwords {
+            let want = match k {
+                4..10 if consts[1] != 0 => empty[k - 4],
+                _ => im.memory[src + k],
+            };
+            assert_eq!(r[to + k], want, "dword {k}");
+        }
+        if to == dst {
+            assert!(r[dst + dwords..].iter().all(|&d| d == 0), "past the tree");
+        }
+    }
+}

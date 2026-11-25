@@ -6361,15 +6361,50 @@ impl<'a> Lower<'a> {
         }
         let bitmap = self.s.memory_dirty_handle();
         let at = self.begin_guarded(marks);
-        let c = self.cur;
         let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
         let iu = self.s.m.undef(self.s.t.i32);
+        let gather = super::wave_marks() && matches!(self.mask_data, MaskData::Console);
+        if gather {
+            self.s.flags |= flags::WAVE_OPS;
+        }
         for n in bits {
+            let c = self.cur;
             // Byte offset of the bitmap dword; operation 2 is OR.
             let word = self.s.m.bin(c, Bin::LShr, n, k5);
             let word = self.s.m.bin(c, Bin::Shl, word, k2);
             let bit = self.s.m.bin(c, Bin::And, n, k31);
             let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
+            let (bit, by) = if gather {
+                let same = self.s.op(
+                    c,
+                    "waveActiveAllEqual.i32",
+                    Attr::NoUnwind,
+                    i1,
+                    115,
+                    &[word],
+                );
+                let or = self.s.m.i8(1);
+                let all = self.s.op(
+                    c,
+                    "waveActiveBit.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    120,
+                    &[bit, or],
+                );
+                let first = self
+                    .s
+                    .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+                let yes = self.s.m.bool(true);
+                let alone = self.s.m.bin(c, Bin::Xor, same, yes);
+                let by = self.s.m.bin(c, Bin::Or, first, alone);
+                (self.s.m.select(c, same, all, bit), Some(by))
+            } else {
+                (bit, None)
+            };
+            let marking = self.begin_guarded(by);
+            let c = self.cur;
             self.s.op(
                 c,
                 "atomicBinOp.i32",
@@ -6378,6 +6413,7 @@ impl<'a> Lower<'a> {
                 78,
                 &[bitmap, k2, word, iu, iu, bit],
             );
+            self.end_guarded(marking, &[]);
         }
         self.end_guarded(at, &[]);
         (e.handle, e.offset)

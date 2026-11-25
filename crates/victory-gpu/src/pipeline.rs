@@ -490,6 +490,34 @@ pub(crate) fn is_builder(this: This) -> bool {
             .any(|shader| BVH_BUILDERS.contains(&shader.hash.as_str()))
 }
 
+/// XboxBvhBuilder's CopyForBVHUpdate (at 0xb4fe0): copies the BVH at root
+/// view 0 over the one at root view 1, a lane 16 bytes at a time and root
+/// constant 0 (the dispatch's threads) times 16 bytes apart, through 64
+/// bytes a node (the source's dword 1 counts them) and a 64-byte header.
+/// With root constant 1 set, lane 0 then resets the root's bounds.
+const BVH_COPY: &str = "c42a31951201f9a0";
+
+/// Whether `this` holds CopyForBVHUpdate ([`BVH_COPY`]).
+#[cfg(windows)]
+pub(crate) fn is_bvh_copy(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this)
+            .shaders
+            .iter()
+            .any(|shader| shader.hash == BVH_COPY)
+}
+
+/// `VICTORY_SKIP_SELF_COPIES`: a CopyForBVHUpdate dispatch that copies a
+/// BVH onto itself and leaves its bounds is dropped, since it changes
+/// nothing. Run 158 timed out in one: its lanes copied 16 bytes onto
+/// themselves through the page table for as many passes as the source's
+/// header asked. Off unless set.
+#[cfg(windows)]
+pub(crate) fn skip_self_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_SELF_COPIES").is_some())
+}
+
 /// `VICTORY_WAIT_BUILDER`: the BVH builders' host pipelines are started when
 /// the title creates them, and a dispatch whose pipeline is not made yet
 /// waits for it however long that takes instead of being dropped

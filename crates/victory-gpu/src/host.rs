@@ -3786,14 +3786,19 @@ impl Host {
         let upload_heaps = *UPLOAD_HEAPS.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             // SAFETY: the query writes the structure of the given size.
-            unsafe {
+            let supported = unsafe {
                 self.device.CheckFeatureSupport(
                     D3D12_FEATURE_D3D12_OPTIONS16,
                     (&raw mut options).cast(),
                     size_of_val(&options) as u32,
                 )
             }
-            .is_ok_and(|()| options.GPUUploadHeapSupported.as_bool())
+            .is_ok_and(|()| options.GPUUploadHeapSupported.as_bool());
+            tracing::info!(
+                supported,
+                "GPU upload heaps: VRAM the CPU maps (where unsupported, system memory instead)"
+            );
+            supported
         });
         let vram = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_GPU_UPLOAD,

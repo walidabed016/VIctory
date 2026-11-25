@@ -222,6 +222,37 @@ fn root_reach(srv: bool) -> u64 {
     if srv { ROOT_SRV_REACH } else { ROOT_CBV_REACH }
 }
 
+/// Logs (diagnostics), once per source and node count and at most 256
+/// times, what a CopyForBVHUpdate dispatch's source header asks of it:
+/// the node count in the host copy and in title memory, then the bytes
+/// and passes the program computes from the copy's, as it does: `(nodes
+/// << 6) + 64` bytes in 32 bits, `16 * threads` bytes a pass. Where the
+/// last pass's offsets pass 2^32, a lane's offset starts over below the end,
+/// so the copy only ends at the loop limit.
+#[cfg(feature = "diagnostics")]
+fn log_bvh_copy(from: u64, to: u64, threads: u32, reset: bool) {
+    static SEEN: std::sync::Mutex<Vec<(u64, Option<u32>)>> = std::sync::Mutex::new(Vec::new());
+    let copy = crate::shadow::root(from, 8).and_then(|(s, _)| s.peek(from + 4));
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 256 || seen.contains(&(from, copy)) {
+        return;
+    }
+    seen.push((from, copy));
+    let mut raw = [0u8; 4];
+    let title =
+        crate::host::read_into((from + 4) as *const u8, &mut raw).then(|| u32::from_le_bytes(raw));
+    let bytes = u64::from(copy.unwrap_or(0).wrapping_shl(6).wrapping_add(64));
+    let step = 16 * u64::from(threads);
+    let wraps = step == 0 || bytes + step > 1 << 32;
+    let passes = (step > 0).then(|| bytes.div_ceil(step));
+    let text = "a BVH update copy (CopyForBVHUpdate): what its source's header asks";
+    if wraps || bytes >= 1 << 28 {
+        tracing::warn!(frame = crate::frame::current(), source = format_args!("{from:#x}"), in_place = from == to, reset, nodes_in_copy = ?copy, nodes_in_title = ?title, bytes, threads, ?passes, never_ends = wraps, "{text}");
+    } else {
+        tracing::info!(frame = crate::frame::current(), source = format_args!("{from:#x}"), in_place = from == to, reset, nodes_in_copy = ?copy, nodes_in_title = ?title, bytes, threads, ?passes, "{text}");
+    }
+}
+
 /// The host address of a root view: its host copy
 /// ([`crate::shadow::root`]), brought up to date as far as the view may be
 /// read, or for a constant buffer not 256-byte aligned there (the console
@@ -913,6 +944,10 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if crate::pipeline::is_bvh_copy(self.pipeline as This) && self.self_copy() {
+            once!("a copy of a BVH onto itself skipped (VICTORY_SKIP_SELF_COPIES)");
+            return;
+        }
         if crate::pipeline::hangs(self.pipeline as This) {
             once!("a dispatch of a program that hangs the host GPU dropped (VICTORY_RUN_HANGING=1 runs it)");
             crate::pipeline::builder_dropped(self.pipeline as This, "VICTORY_DROP_HANGING");
@@ -1006,6 +1041,25 @@ impl State {
             }
         }
         recorded
+    }
+
+    /// A CopyForBVHUpdate dispatch ([`crate::pipeline::is_bvh_copy`]):
+    /// whether it copies a BVH onto itself and leaves its bounds, which
+    /// `VICTORY_SKIP_SELF_COPIES` skips. With diagnostics it logs, once per
+    /// source and node count, the passes its source's header asks for.
+    fn self_copy(&self) -> bool {
+        let roots = self.roots_ref(true);
+        let (Some(&Root::View(from)), Some(&Root::View(to))) = (roots.first(), roots.get(1)) else {
+            return false;
+        };
+        let constants = match roots.get(2) {
+            Some(Root::Constants(c)) => c.as_slice(),
+            _ => &[],
+        };
+        let reset = constants.get(1).is_some_and(|&c| c != 0);
+        #[cfg(feature = "diagnostics")]
+        log_bvh_copy(from, to, constants.first().copied().unwrap_or(0), reset);
+        from == to && !reset && crate::pipeline::skip_self_copies()
     }
 
     /// What a draw or dispatch runs, for the device-removed report
