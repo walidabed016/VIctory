@@ -1229,6 +1229,16 @@ impl Host {
             }
         }
         crate::shadow::snapshot_untold(&back, compares.as_deref());
+        // Pipelined: refreshes deferred to copy-backs in flight are done
+        // when those complete (`crate::pipelined::defer`); the GPU waits
+        // for them before the copies into twins.
+        if let Some(seq) = crate::pipelined::gpu_wait() {
+            // SAFETY: our queue and fence.
+            if let Err(e) = unsafe { self.queue.Wait(&self.copied, seq) } {
+                tracing::warn!(error = %e, "refreshes wait for copy-backs on the CPU");
+                crate::pipelined::wait_completed(seq);
+            }
+        }
         for list in &twins_before {
             // SAFETY: a closed list, run before the submission's.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list.clone())]) };

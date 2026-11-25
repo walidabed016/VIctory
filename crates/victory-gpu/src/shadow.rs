@@ -1447,7 +1447,7 @@ impl Shadow {
     /// write-watched), waiting for the submissions in flight whose shaders
     /// write the pages it copies (`crate::pipelined::wait_writes`).
     /// Returns the bytes copied.
-    pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn update(self: &Arc<Self>, address: usize, len: usize) -> usize {
         if self.in_place && self.twin.is_none() {
             return 0;
         }
@@ -1472,7 +1472,7 @@ impl Shadow {
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer).
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(self: &Arc<Self>, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some(copied) = self.update_watched(from, to) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -1485,7 +1485,7 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` the watch says changed since they
     /// were copied; `None` if it cannot tell for the range.
-    fn update_watched(&self, from: usize, to: usize) -> Option<usize> {
+    fn update_watched(self: &Arc<Self>, from: usize, to: usize) -> Option<usize> {
         #[cfg(feature = "diagnostics")]
         let mut started = None;
         let stale = {
@@ -1521,7 +1521,7 @@ impl Shadow {
     /// committed regions it cannot watch are copied whole and others are
     /// left as they are (zeros, unless the title freed memory copied
     /// there). Nothing is ever taken as unwatched for the whole slab.
-    fn update_mirror(&self, from: usize, to: usize) -> usize {
+    fn update_mirror(self: &Arc<Self>, from: usize, to: usize) -> usize {
         if let Some(copied) = self.update_watched(from, to) {
             return copied;
         }
@@ -1597,7 +1597,7 @@ impl Shadow {
     }
 
     /// [`Shadow::copy`] of memory nothing can tell the changes of.
-    fn copy_whole(&self, from: usize, to: usize) -> usize {
+    fn copy_whole(self: &Arc<Self>, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let n = self.copy(from, to);
@@ -1608,20 +1608,53 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy
     /// (giving mirror windows host memory), and into the snapshots of
-    /// ranges shaders write where they have them.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// ranges shaders write where they have them. Pipelined, bytes a
+    /// submission in flight has left to copy back are taken after its
+    /// copy-back, on the completion thread, and the submission being
+    /// prepared waits on the GPU for it
+    /// (`crate::pipelined::deferred_refreshes`).
+    fn copy(self: &Arc<Self>, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
             return 0;
         }
-        // Pipelined: the copy and the snapshots would take bytes a
-        // submission in flight writes, or be overwritten by what it wrote,
-        // before its copy-back. Pages the title wrote elsewhere in the
-        // range do not wait for it.
-        crate::pipelined::wait_writes(from, to, crate::pipelined::Writer::Refresh);
         #[cfg(feature = "diagnostics")]
         crate::pipelining::touch(crate::pipelining::Touch::Refresh, from, to - from);
+        // Its twin takes it before the submission being prepared runs.
+        if self.twin.is_some() {
+            self.dirty
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((from, to));
+        }
+        let slot = prep_slot();
+        if crate::pipelined::deferred_refreshes() {
+            // Mirror windows get their memory now, to be mapped before the
+            // submission runs.
+            if !self.in_place {
+                self.pieces(from - start, to - start, true);
+            }
+            let copy = self.clone();
+            if crate::pipelined::defer(from, to, move || copy.take(from, to, slot)) {
+                return to - from;
+            }
+        } else {
+            // Pipelined: the copy and the snapshots would take bytes a
+            // submission in flight writes, or be overwritten by what it
+            // wrote, before its copy-back. Pages the title wrote elsewhere
+            // in the range do not wait for it.
+            crate::pipelined::wait_writes(from, to, crate::pipelined::Writer::Refresh);
+        }
+        self.take(from, to, slot);
+        to - from
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer) for the
+    /// submission in `slot`, which takes it, once no submission in flight
+    /// has it left to write.
+    fn take(&self, from: usize, to: usize, slot: usize) {
+        let start = self.start as usize;
         // Title memory used in place is the copy: only its twin takes it.
         if !self.in_place {
             for (at, host, n) in self.pieces(from - start, to - start, true) {
@@ -1630,15 +1663,6 @@ impl Shadow {
                 }
             }
         }
-        if self.twin.is_some() {
-            self.dirty
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((from, to));
-        }
-        // The submission being prepared takes it; those in flight do not
-        // write it (above).
-        let slot = prep_slot();
         let mut before = self.before[slot].lock().unwrap_or_else(|e| e.into_inner());
         for (taken, bytes) in before.iter_mut() {
             let (a, b) = (
@@ -1678,7 +1702,6 @@ impl Shadow {
                 }
             }
         }
-        to - from
     }
 }
 
@@ -5022,7 +5045,9 @@ pub(crate) mod tests {
     }
 
     /// Pipelined: a refresh waits for a submission in flight only to copy
-    /// pages its shaders write, not for every range that overlaps them.
+    /// pages its shaders write, not for every range that overlaps them;
+    /// deferred (`crate::pipelined::deferred_refreshes`), it does not wait,
+    /// and those pages are copied once the submission's copy-back is done.
     #[test]
     fn a_refresh_waits_only_to_copy_pages_shaders_in_flight_write() {
         use std::time::Duration;
@@ -5076,16 +5101,38 @@ pub(crate) mod tests {
         // SAFETY: as above.
         unsafe { (y as *mut u32).write(0xbeef) };
         let done = refresh();
-        assert!(
-            done.recv_timeout(Duration::from_millis(300)).is_err(),
-            "copied a page the submission in flight writes"
-        );
-        drop(go);
-        let copied = done
-            .recv_timeout(Duration::from_secs(5))
-            .expect("still waiting after the submission completed");
-        assert_eq!(copied, PAGE);
-        assert_eq!(held(&s, y), Some(0xbeef));
+        if crate::pipelined::deferred_refreshes() {
+            let copied = done
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waited for the submission in flight");
+            assert_eq!(copied, PAGE);
+            std::thread::sleep(Duration::from_millis(300));
+            assert_ne!(
+                held(&s, y),
+                Some(0xbeef),
+                "copied a page the submission in flight writes"
+            );
+            drop(go);
+            let started = std::time::Instant::now();
+            while held(&s, y) != Some(0xbeef) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "not copied after the submission completed"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        } else {
+            assert!(
+                done.recv_timeout(Duration::from_millis(300)).is_err(),
+                "copied a page the submission in flight writes"
+            );
+            drop(go);
+            let copied = done
+                .recv_timeout(Duration::from_secs(5))
+                .expect("still waiting after the submission completed");
+            assert_eq!(copied, PAGE);
+            assert_eq!(held(&s, y), Some(0xbeef));
+        }
         drop(s);
         unregister(usize::MAX - 25, at as u64);
         release(at);
