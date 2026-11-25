@@ -4,13 +4,15 @@
 //! by tracing rays, which do not run here yet: its program that resolves
 //! them (`CS_ScreenProbes_TemporalResolve_*`) leaves next to nothing, and
 //! whatever the sun does not reach directly is black. Right after that
-//! program, pixels darker than a soft floor are raised to it. The floor is a
-//! constant: the light in these images does not go with the title's exposure
+//! program, its output is replaced by a constant (Belobug 4f45ab8: a floor
+//! under what the program wrote kept garbage, see the shader). The
+//! constant is the same everywhere: the light in these images does not go with the title's exposure
 //! (well-lit surfaces hold about the same in a shot at -5.5 EV and in one at
 //! -9.75). The title's own lighting then applies it with the surfaces'
-//! colors. Raised, not added: the result is the next frame's history.
+//! colors. Replaced, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` turns it on (0.6, say); off by default.
+//! `VICTORY_AMBIENT=<level>` turns it on (0.6, say; 0 is no indirect diffuse
+//! light at all); off by default, the title's own output.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
 use std::sync::OnceLock;
@@ -30,20 +32,17 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// Off: the title's own light only (0.6 looked balanced in run a2).
-const DEFAULT: f32 = 0.0;
-
-/// The floor; `None` if off.
+/// The constant (0.6 looked balanced in run a2); `None` if off.
 pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
         std::env::var("VICTORY_AMBIENT")
+            .ok()?
+            .trim()
+            .parse()
             .ok()
-            .and_then(|v| v.trim().parse().ok())
             .filter(|l: &f32| l.is_finite() && *l >= 0.0)
-            .unwrap_or(DEFAULT)
-    });
-    (level > 0.0).then_some(level)
+    })
 }
 
 const SOURCE: &str = r#"
@@ -68,11 +67,10 @@ void main(uint3 at : SV_DispatchThreadID) {
     uint w, h;
     light.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
-    float3 least = tint * level;
-    float3 c = unpack(light[at.xy]);
-    const float3 weights = float3(0.2126, 0.7152, 0.0722);
-    float missing = saturate(1.0 - dot(c, weights) / dot(least, weights));
-    if (missing > 0.0) light[at.xy] = pack(c + least * missing);
+    // What the resolve left is not kept: without rays its inputs are never
+    // written and it holds whatever their memory did (bright magenta on
+    // translucent surfaces, blocks of colours indoors: Belobug run v6).
+    light[at.xy] = pack(tint * level);
 }
 "#;
 
@@ -159,7 +157,7 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
-/// Raises what `light` holds to the floor, in `list`, after the program that
+/// Replaces what `light` holds by the constant, in `list`, after the program that
 /// wrote it as an image. Whether it recorded anything (the list's bindings
 /// are then ours).
 pub(crate) fn raise(list: &HostList, light: This) -> bool {
