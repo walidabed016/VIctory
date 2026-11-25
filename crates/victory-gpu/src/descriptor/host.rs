@@ -460,12 +460,18 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        // Slots viewing placed textures let go of as the title placed
-        // another in their memory, if not written again since: they view
-        // that texture, as the title's descriptors view the memory.
+        // Slots viewing placed textures whose resources changed, if not
+        // written again since: brought up to date for the next stage that
+        // may read them, or viewing the texture now in their memory, as the
+        // title's descriptors view the memory.
         let heap = std::ptr::from_ref(self) as usize;
-        for (slot, record, address, desc) in crate::resource::stale_slots(heap) {
+        for (slot, record, address, desc, upload) in crate::resource::stale_slots(heap) {
             if made.get(slot as usize) != Some(&record) {
+                continue;
+            }
+            if upload {
+                let mut unread = self.unread.lock().unwrap_or_else(|e| e.into_inner());
+                unread.insert(slot);
                 continue;
             }
             let view = match view_at(record as u32, (record >> 32) as u32) {
@@ -1418,7 +1424,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     // The description's flags, after its alignment, size and format words.
     let writable = resource[12] & UNORDERED != 0;
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource);
+    let (texture, dropped) = crate::resource::placed_at(address, resource).unzip();
     #[cfg(feature = "diagnostics")]
     if *unordered || texture.is_none() || resource[12] & 0x7 != 0 {
         let program = crate::pipeline::host_pipeline(BINDING.get() as crate::object::This)
@@ -1430,7 +1436,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         };
         crate::resource::census(what, address, resource, texture.is_some(), program);
     }
-    let words = desc[..10].try_into().ok();
+    let words = desc[..10]
+        .try_into()
+        .ok()
+        .map(|w| crate::resource::fewer_mips(w, dropped.unwrap_or(0)));
     match (*unordered, texture) {
         (false, Some(texture)) => Some(View::Shader(texture as usize, words)),
         (true, Some(texture)) if writable => Some(View::Unordered(texture as usize, 0, words)),

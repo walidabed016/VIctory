@@ -1554,8 +1554,11 @@ pub(crate) extern "system" fn create_at_address(
 
 /// A texture the title placed in its own memory, as [`PLACED_TEXTURES`]
 /// keeps it: its resource, the end of its memory, its bytes, the frame it
-/// was last asked for, and the heap slots made from views of it (heap, slot,
-/// the record the slot was made from).
+/// was last asked for, the heap slots made from views of it (heap, slot,
+/// the record the slot was made from), the most detailed mips its resource
+/// lacks to save memory ([`placed_budget`]) and whether it can lack more,
+/// and the resource with one mip fewer brought up to date before the slots
+/// move to it.
 #[cfg(windows)]
 struct Placed {
     resource: usize,
@@ -1563,6 +1566,9 @@ struct Placed {
     bytes: u64,
     used: u64,
     slots: Vec<(usize, u32, u64)>,
+    dropped: u32,
+    fixed: bool,
+    next: usize,
 }
 
 /// Textures the title placed in its own memory and views without a
@@ -1589,23 +1595,37 @@ static PLACED_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static PLACED_DYING: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
-/// Heap slots that view placed textures let go of as the title placed
-/// another in their memory, for their heaps to move to that texture
-/// ([`stale_slots`]): heap, slot, record, and the texture's address and
-/// description.
+/// A placed texture's address and description, as [`PLACED_TEXTURES`]
+/// keys it.
 #[cfg(windows)]
-#[allow(clippy::type_complexity)]
-static STALE_SLOTS: std::sync::Mutex<Vec<(usize, u32, u64, u64, [u32; 14])>> =
-    std::sync::Mutex::new(Vec::new());
+type PlacedKey = (u64, [u32; 14]);
+
+/// Placed textures given a resource with one mip fewer, by the frame, until
+/// their slots move to it (locked inside [`PLACED_TEXTURES`]).
+#[cfg(windows)]
+static PLACED_REDUCING: std::sync::Mutex<std::collections::VecDeque<(u64, PlacedKey)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// A heap slot to bring up to date (`true`) or move to the texture now at
+/// an address and description: heap, slot, record, address, description.
+#[cfg(windows)]
+type Stale = (usize, u32, u64, u64, [u32; 14], bool);
+
+/// Heap slots that view placed textures whose resources changed, for their
+/// heaps to bring up to date or move ([`stale_slots`]).
+#[cfg(windows)]
+static STALE_SLOTS: std::sync::Mutex<Vec<Stale>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether [`STALE_SLOTS`] holds any.
 #[cfg(windows)]
 static STALE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Placed textures' bytes now, those let go of and heap slots moved so far.
+/// Placed textures' bytes now; those let go of, heap slots moved, and
+/// resources given one mip fewer so far; the frame resources were last
+/// given one.
 #[cfg(windows)]
-static PLACED_COUNTS: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static PLACED_COUNTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 std::thread_local! {
     /// Whether this thread makes the view of a descriptor the title wrote
@@ -1614,9 +1634,10 @@ std::thread_local! {
     static PLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The bytes of placed textures past which those asked for longest ago that
-/// no heap slot views are let go of: `VICTORY_PLACED_TEXTURE_MIB` MiB
-/// (12288).
+/// The bytes of placed textures past which, down to nine tenths, the
+/// read-only ones asked for longest ago that no heap slot views are let go
+/// of, and then those heap slots view get resources without their most
+/// detailed mip: `VICTORY_PLACED_TEXTURE_MIB` MiB (12288).
 #[cfg(windows)]
 fn placed_budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1630,19 +1651,32 @@ fn placed_budget() -> u64 {
 }
 
 /// Placed textures and their MiB; those heap slots view and their MiB;
-/// those let go of and heap slots moved so far.
+/// those with fewer mips now; those let go of, heap slots moved and
+/// resources given one mip fewer so far.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn placed_textures() -> [u64; 6] {
+pub(crate) fn placed_textures() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut viewed, mut viewed_bytes) = (0, 0);
-    for p in map.values().filter(|p| !p.slots.is_empty()) {
-        (viewed, viewed_bytes) = (viewed + 1, viewed_bytes + p.bytes);
+    let (mut viewed, mut viewed_bytes, mut fewer) = (0, 0, 0);
+    for p in map.values() {
+        if !p.slots.is_empty() {
+            (viewed, viewed_bytes) = (viewed + 1, viewed_bytes + p.bytes);
+        }
+        fewer += u64::from(p.dropped != 0);
     }
     let live = map.len() as u64;
     drop(map);
-    let [bytes, gone, moved] = PLACED_COUNTS.each_ref().map(|n| n.load(Relaxed));
-    [live, bytes >> 20, viewed, viewed_bytes >> 20, gone, moved]
+    let [bytes, gone, moved, reduced, _] = PLACED_COUNTS.each_ref().map(|n| n.load(Relaxed));
+    [
+        live,
+        bytes >> 20,
+        viewed,
+        viewed_bytes >> 20,
+        fewer,
+        gone,
+        moved,
+        reduced,
+    ]
 }
 
 /// Runs `f`, in which views of textures placed in memory are made for a
@@ -1669,35 +1703,37 @@ pub(crate) fn placed_slot(address: u64, desc: &[u32; 14], heap: usize, slot: u32
     }
 }
 
-/// Of heap `heap`'s slots, those viewing placed textures let go of as the
-/// title placed another in their memory, with the records they were made
-/// from and that texture's address and description: to move to it where
-/// the title has not written them again since.
+/// Of heap `heap`'s slots, those viewing placed textures whose resources
+/// changed, with the records they were made from, the address and
+/// description of the texture to view, and whether only to bring it up to
+/// date: where the title has not written them again since.
 #[cfg(windows)]
-pub(crate) fn stale_slots(heap: usize) -> Vec<(u32, u64, u64, [u32; 14])> {
+pub(crate) fn stale_slots(heap: usize) -> Vec<(u32, u64, u64, [u32; 14], bool)> {
     use std::sync::atomic::Ordering::Relaxed;
     if !STALE_ANY.load(Relaxed) {
         return Vec::new();
     }
     let mut stale = STALE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut mine = Vec::new();
-    stale.retain(|&(h, slot, record, address, desc)| {
+    stale.retain(|&(h, slot, record, address, desc, upload)| {
         let other = h != heap;
         if !other {
-            mine.push((slot, record, address, desc));
+            mine.push((slot, record, address, desc, upload));
         }
         other
     });
     STALE_ANY.store(!stale.is_empty(), Relaxed);
-    PLACED_COUNTS[2].fetch_add(mine.len() as u64, Relaxed);
+    let moved = mine.iter().filter(|s| !s.4).count();
+    PLACED_COUNTS[2].fetch_add(moved as u64, Relaxed);
     mine
 }
 
-/// For a view `words` of a texture `old` let go of as the title placed the
-/// texture `desc` at `address` in its memory: that texture and the words
-/// to view it with. Those words where both describe the same texture but
-/// for more mips; a view of every mip where both are 2D textures of one
-/// slice; none otherwise, or where the GPU writes the new texture.
+/// For a view `words` of a texture `old` whose resource changed (let go
+/// of as the title placed the texture `desc` at `address` in its memory, or
+/// given fewer mips): the resource for `desc` and the words to view it
+/// with. Those words where both describe the same texture but for more
+/// mips; a view of every mip where both are 2D textures of one slice; none
+/// otherwise, or where the GPU writes the new texture.
 #[cfg(windows)]
 pub(crate) fn replacement(
     old: &[u32; 14],
@@ -1724,123 +1760,325 @@ pub(crate) fn replacement(
         }
         (view[0], view[4], view[5]) = (desc[8], 0, u32::MAX);
     }
-    Some((texture_at(address, desc)?, view))
+    let (texture, dropped) = placed_at(address, desc)?;
+    Some((texture, fewer_mips(view, dropped)))
+}
+
+/// Shader view words `view` for a resource lacking the `dropped` most
+/// detailed mips of the texture they view: the same mips, but those it
+/// lacks (2D and 2D array views; others as they are).
+#[cfg(windows)]
+pub(crate) fn fewer_mips(mut view: [u32; 10], dropped: u32) -> [u32; 10] {
+    const VIEW_2D: u32 = 4;
+    const VIEW_2D_ARRAY: u32 = 5;
+    let clamp = match view[1] {
+        _ if dropped == 0 => return view,
+        VIEW_2D => 7,
+        VIEW_2D_ARRAY => 9,
+        _ => return view,
+    };
+    let most = view[4];
+    view[4] = most.saturating_sub(dropped);
+    if view[5] != u32::MAX {
+        view[5] = view[5].saturating_sub(dropped.saturating_sub(most)).max(1);
+    }
+    view[clamp] = (f32::from_bits(view[clamp]) - dropped as f32)
+        .max(0.0)
+        .to_bits();
+    view
+}
+
+/// The description (as words) of the 2D texture `desc` describes without
+/// its most detailed mip, and the bytes from its start to the rest of its
+/// mips, which the console lays out as that description does; none for
+/// other textures, one mip, or where the console lays them out otherwise.
+#[cfg(windows)]
+fn without_top_mip(desc: &[u32; 14]) -> Option<([u32; 14], u64)> {
+    const TEXTURE_2D: u32 = 3;
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension != TEXTURE_2D || d.depth_or_array_size != 1 || d.sample_count > 1 {
+        return None;
+    }
+    let full = texture_layout(&d)?;
+    let [plane] = full.planes.as_slice() else {
+        return None;
+    };
+    let mips = &plane.layout.mips;
+    let rest = u32::try_from(mips.len())
+        .ok()?
+        .checked_sub(1)
+        .filter(|&n| n > 0)?;
+    let width = (d.width >> 1).max(1);
+    let mut half = *desc;
+    (half[2], half[3]) = (0, 0);
+    (half[4], half[5]) = (width as u32, (width >> 32) as u32);
+    half[6] = (d.height >> 1).max(1);
+    half[7] = rest << 16 | 1;
+    // SAFETY: as above.
+    let h = unsafe { half.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let layout = texture_layout(&h)?;
+    let [h] = layout.planes.as_slice() else {
+        return None;
+    };
+    let shift = mips[1].offset.checked_sub(h.layout.mips.first()?.offset)?;
+    let same = h.layout.mips.len() + 1 == mips.len()
+        && h.layout.block == plane.layout.block
+        && h.layout.alignment == plane.layout.alignment
+        && shift % h.layout.alignment == 0
+        && mips[1..].iter().zip(&h.layout.mips).all(|(a, b)| {
+            *a == texture::Mip {
+                offset: b.offset + shift,
+                ..*b
+            }
+        });
+    same.then_some((half, shift))
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
-#[cfg(windows)]
+/// description `desc` (as words), made on first use (tests).
+#[cfg(all(windows, test))]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let place = PLACING.get() || !crate::descriptor::host::bindless_textures();
-    texture_at_in(address, desc, crate::queue::presented(), place)
+    placed_at(address, desc).map(|(texture, _)| texture)
 }
 
-/// [`texture_at`] in frame `now`. A texture made for a descriptor the title
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use, and the most detailed
+/// mips it lacks.
+#[cfg(windows)]
+pub(crate) fn placed_at(address: u64, desc: &[u32; 14]) -> Option<(This, u32)> {
+    let place = PLACING.get() || !crate::descriptor::host::bindless_textures();
+    placed_in(address, desc, crate::queue::presented(), place)
+}
+
+/// [`texture_at`] in frame `now`; see [`placed_in`] (tests).
+#[cfg(all(windows, test))]
+pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<This> {
+    placed_in(address, desc, now, place).map(|(texture, _)| texture)
+}
+
+/// [`placed_at`] in frame `now`. A texture made for a descriptor the title
 /// wrote (`place`) lets go of the read-only ones its memory overlaps that
 /// were not asked for in this frame or the one before: the title reused
 /// their memory (streaming); the heap slots that view them move to it.
 /// Others made (views made again for a stage or a draw) let go of none.
 /// Past [`placed_budget`], it lets go of the read-only ones asked for
-/// longest ago that no heap slot views. Textures the GPU writes (render
-/// targets, depth, unordered) hold contents of their own and are kept, as
-/// are views of one memory used together. One let go of that the title
-/// views again is made again from its memory.
+/// longest ago that no heap slot views, then gives those heap slots view
+/// resources with one mip fewer: made at the memory of their second mip,
+/// brought up to date by the next stage that may read their slots, which
+/// move to them some frames later, when lists made before can no longer
+/// run. Textures the GPU writes (render targets, depth, unordered) hold
+/// contents of their own and are kept whole, as are views of one memory
+/// used together. One let go of that the title views again is made again
+/// from its memory.
 #[cfg(windows)]
-pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<This> {
+fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(This, u32)> {
     use std::sync::atomic::Ordering::Relaxed;
     const GPU_WRITTEN: u32 = 0x7;
+    const MOST_DROPPED: u32 = 2;
+    const SMALLEST: u64 = 256 << 10;
+    const PER_FRAME: usize = 64;
+    const SETTLE_FRAMES: u64 = 4;
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
+    let mut gone = Vec::new();
+    let mut stale: Vec<Stale> = Vec::new();
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(placed) = map.get_mut(&(address, desc)) {
-        placed.used = now;
-        return Some(placed.resource as This);
-    }
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
-        return None;
-    }
-    if target_views()
-        && let Some(target) = target_at(address, &d)
     {
-        return Some(target);
-    }
-    let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
-    if made != S_OK {
-        return None;
-    }
-    let bytes = footprint(&d).map_or(1, |info| info.size.max(1));
-    let end = address.saturating_add(bytes);
-    let longest = PLACED_LONGEST.fetch_max(bytes, Relaxed).max(bytes);
-    let reused: Vec<(u64, [u32; 14])> = if place {
-        map.range((address.saturating_sub(longest), [0; 14])..(end, [0; 14]))
-            .filter(|&(&(_, words), p)| {
-                p.end > address && words[12] & GPU_WRITTEN == 0 && p.used.saturating_add(2) <= now
-            })
-            .map(|(&key, _)| key)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut gone = Vec::with_capacity(reused.len());
-    let mut slots = Vec::new();
-    for key in reused {
-        if let Some(p) = map.remove(&key) {
-            PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
-            gone.push(p.resource);
-            slots.extend(p.slots);
+        let mut reducing = PLACED_REDUCING.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(&(frame, key)) = reducing.front()
+            && frame.saturating_add(SETTLE_FRAMES) <= now
+        {
+            reducing.pop_front();
+            let Some(p) = map.get_mut(&key).filter(|p| p.next != 0) else {
+                continue;
+            };
+            gone.push(std::mem::replace(
+                &mut p.resource,
+                std::mem::take(&mut p.next),
+            ));
+            p.dropped += 1;
+            PLACED_COUNTS[3].fetch_add(1, Relaxed);
+            stale.extend(
+                p.slots
+                    .iter()
+                    .map(|&(h, s, r)| (h, s, r, key.0, key.1, false)),
+            );
         }
     }
-    let stale: Vec<_> = slots
-        .iter()
-        .map(|&(heap, slot, record)| (heap, slot, record, address, desc))
-        .collect();
-    map.insert(
-        (address, desc),
-        Placed {
-            resource: out as usize,
-            end,
-            bytes,
-            used: now,
-            slots,
-        },
-    );
-    PLACED_COUNTS[0].fetch_add(bytes, Relaxed);
-    // Past the budget: the read-only ones asked for longest ago that no heap
-    // slot holds go, down to nine tenths of it.
-    let budget = placed_budget();
-    if PLACED_COUNTS[0].load(Relaxed) > budget {
-        let mut old: Vec<(u64, (u64, [u32; 14]))> = map
-            .iter()
-            .filter(|&(&(_, words), p)| {
-                p.slots.is_empty()
-                    && words[12] & GPU_WRITTEN == 0
-                    && p.used.saturating_add(2) <= now
-            })
-            .map(|(&key, p)| (p.used, key))
-            .collect();
-        old.sort_unstable_by_key(|&(used, _)| used);
-        for (_, key) in old {
-            if PLACED_COUNTS[0].load(Relaxed) <= budget / 10 * 9 {
-                break;
-            }
+    let found = map.get_mut(&(address, desc)).map(|p| {
+        p.used = now;
+        match p.next {
+            0 => (p.resource as This, p.dropped),
+            next => (next as This, p.dropped + 1),
+        }
+    });
+    let out = 'made: {
+        if found.is_some() {
+            break 'made found;
+        }
+        // SAFETY: 56 bytes in the description's layout.
+        let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        if d.dimension == BUFFER {
+            break 'made None;
+        }
+        if target_views()
+            && let Some(target) = target_at(address, &d)
+        {
+            break 'made Some((target, 0));
+        }
+        let mut out = std::ptr::null();
+        let made = create_at_address(
+            std::ptr::null(),
+            address,
+            &d,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        );
+        if made != S_OK {
+            break 'made None;
+        }
+        let bytes = footprint(&d).map_or(1, |info| info.size.max(1));
+        let end = address.saturating_add(bytes);
+        let longest = PLACED_LONGEST.fetch_max(bytes, Relaxed).max(bytes);
+        let reused: Vec<(u64, [u32; 14])> = if place {
+            map.range((address.saturating_sub(longest), [0; 14])..(end, [0; 14]))
+                .filter(|&(&(_, words), p)| {
+                    p.end > address
+                        && words[12] & GPU_WRITTEN == 0
+                        && p.used.saturating_add(2) <= now
+                })
+                .map(|(&key, _)| key)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut slots = Vec::new();
+        for key in reused {
             if let Some(p) = map.remove(&key) {
                 PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
-                gone.push(p.resource);
+                gone.extend([p.resource, p.next].into_iter().filter(|&r| r != 0));
+                slots.extend(p.slots);
             }
         }
-    }
+        stale.extend(
+            slots
+                .iter()
+                .map(|&(heap, slot, record)| (heap, slot, record, address, desc, false)),
+        );
+        map.insert(
+            (address, desc),
+            Placed {
+                resource: out as usize,
+                end,
+                bytes,
+                used: now,
+                slots,
+                dropped: 0,
+                fixed: false,
+                next: 0,
+            },
+        );
+        PLACED_COUNTS[0].fetch_add(bytes, Relaxed);
+        let budget = placed_budget();
+        let goal = budget / 10 * 9;
+        if PLACED_COUNTS[0].load(Relaxed) > budget {
+            // Past the budget: the read-only ones asked for longest ago that
+            // no heap slot views go, down to nine tenths of it.
+            let mut old: Vec<(u64, (u64, [u32; 14]))> = map
+                .iter()
+                .filter(|&(&(_, words), p)| {
+                    p.slots.is_empty()
+                        && words[12] & GPU_WRITTEN == 0
+                        && p.used.saturating_add(2) <= now
+                })
+                .map(|(&key, p)| (p.used, key))
+                .collect();
+            old.sort_unstable_by_key(|&(used, _)| used);
+            for (_, key) in old {
+                if PLACED_COUNTS[0].load(Relaxed) <= goal {
+                    break;
+                }
+                if let Some(p) = map.remove(&key) {
+                    PLACED_COUNTS[0].fetch_sub(p.bytes, Relaxed);
+                    gone.extend([p.resource, p.next].into_iter().filter(|&r| r != 0));
+                }
+            }
+        }
+        // Still past nine tenths, once a frame: those asked for longest ago
+        // with the fewest mips dropped get a resource with one mip fewer.
+        if PLACED_COUNTS[0].load(Relaxed) > goal && PLACED_COUNTS[4].swap(now, Relaxed) != now {
+            let mut old: Vec<((u32, u64), PlacedKey)> = map
+                .iter()
+                .filter(|&(&(_, words), p)| {
+                    !p.fixed
+                        && p.next == 0
+                        && p.dropped < MOST_DROPPED
+                        && p.bytes >= SMALLEST
+                        && words[12] & GPU_WRITTEN == 0
+                        && p.used.saturating_add(2) <= now
+                })
+                .map(|(&key, p)| ((p.dropped, p.used), key))
+                .collect();
+            old.sort_unstable_by_key(|&(order, _)| order);
+            let mut reducing = PLACED_REDUCING.lock().unwrap_or_else(|e| e.into_inner());
+            let mut given = 0;
+            for (_, key) in old {
+                if given == PER_FRAME || PLACED_COUNTS[0].load(Relaxed) <= goal {
+                    break;
+                }
+                let Some(p) = map.get_mut(&key) else {
+                    continue;
+                };
+                let fewer = (0..=p.dropped).try_fold((key.0, key.1), |(at, words), _| {
+                    without_top_mip(&words).map(|(half, shift)| (at + shift, half))
+                });
+                let Some((at, half)) = fewer else {
+                    p.fixed = true;
+                    continue;
+                };
+                // SAFETY: as above.
+                let h = unsafe { half.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+                let mut next = std::ptr::null();
+                let made = create_at_address(
+                    std::ptr::null(),
+                    at,
+                    &h,
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut next,
+                );
+                if made != S_OK {
+                    p.fixed = true;
+                    continue;
+                }
+                if resource(next).host.is_none() {
+                    p.fixed = true;
+                    gone.push(next as usize);
+                    continue;
+                }
+                let bytes = footprint(&h).map_or(p.bytes, |info| info.size.min(p.bytes));
+                PLACED_COUNTS[0].fetch_sub(p.bytes - bytes, Relaxed);
+                (p.bytes, p.next, p.used) = (bytes, next as usize, now);
+                stale.extend(
+                    p.slots
+                        .iter()
+                        .map(|&(h, s, r)| (h, s, r, key.0, key.1, true)),
+                );
+                reducing.push_back((now, key));
+                given += 1;
+            }
+        }
+        if resource(out).host.is_some() {
+            Some((out, 0))
+        } else {
+            None
+        }
+    };
     PLACED_COUNTS[1].fetch_add(gone.len() as u64, Relaxed);
     drop(map);
     if !stale.is_empty() {
@@ -1861,7 +2099,7 @@ pub(crate) fn texture_at_in(address: u64, desc: &[u32; 14], now: u64, place: boo
     for r in released {
         object::release_boxed::<Resource>(r as This);
     }
-    resource(out).host.is_some().then_some(out)
+    out
 }
 
 /// A title buffer over the `len` bytes at `address` (tests).
@@ -2130,6 +2368,73 @@ mod tests {
         assert!(!read_as(&hdr, &texture(960, 1080, SHARED_EXPONENT, 1)));
         let color = texture(1920, 1080, 28, 1);
         assert!(!read_as(&color, &texture(1920, 1080, SHARED_EXPONENT, 1)));
+    }
+
+    /// A 2D texture's mips past its most detailed one lie at its second
+    /// mip's memory as the console lays out a texture half its size: BC7
+    /// and 32-bit color, in 4 KiB and 64 KiB modes; arrays have no such
+    /// texture.
+    #[cfg(windows)]
+    #[test]
+    fn textures_without_their_top_mip_lie_inside_them() {
+        let desc = |width: u32, height: u32, mips: u32, format: u32, layout: u32| {
+            [
+                3,
+                0,
+                0,
+                0,
+                width,
+                0,
+                height,
+                mips << 16 | 1,
+                format,
+                1,
+                0,
+                layout,
+                0,
+                0,
+            ]
+        };
+        for (full, layout) in [
+            (desc(1024, 1024, 11, 98, 0), 0),
+            (desc(1024, 1024, 11, 98, 0x109), 0x109),
+            (desc(512, 256, 10, 28, 0), 0),
+            (desc(2048, 1024, 12, 71, 0x109), 0x109),
+        ] {
+            let (half, shift) = without_top_mip(&full).expect("a texture with one mip fewer");
+            assert_eq!(
+                half[4..8],
+                [full[4] / 2, 0, full[6] / 2, ((full[7] >> 16) - 1) << 16 | 1]
+            );
+            assert_eq!((half[8], half[11]), (full[8], layout));
+            // SAFETY: 56 bytes in the description's layout.
+            let [d, h] =
+                [full, half].map(|w| unsafe { w.as_ptr().cast::<ResourceDesc>().read_unaligned() });
+            let (d, h) = (footprint(&d).unwrap().size, footprint(&h).unwrap().size);
+            assert!(shift + h <= d && h <= d / 3, "inside it, a quarter of it");
+        }
+        let mut array = desc(256, 256, 9, 28, 0);
+        array[7] |= 6;
+        assert_eq!(without_top_mip(&array), None);
+        assert_eq!(without_top_mip(&desc(256, 256, 1, 28, 0)), None);
+    }
+
+    /// Views of a resource lacking mips keep their mips: the most detailed
+    /// one and the clamp move up, a count stays whole.
+    #[cfg(windows)]
+    #[test]
+    fn views_of_textures_with_fewer_mips_keep_their_mips() {
+        let view = |most: u32, count: u32, clamp: f32| {
+            [28, 4, 0x1688, 0, most, count, 0, clamp.to_bits(), 0, 0]
+        };
+        assert_eq!(
+            fewer_mips(view(0, u32::MAX, 0.0), 1),
+            view(0, u32::MAX, 0.0)
+        );
+        assert_eq!(fewer_mips(view(0, 5, 0.0), 1), view(0, 4, 0.0));
+        assert_eq!(fewer_mips(view(2, 3, 1.5), 1), view(1, 3, 0.5));
+        assert_eq!(fewer_mips(view(1, 3, 0.0), 2), view(0, 2, 0.0));
+        assert_eq!(fewer_mips(view(2, 3, 0.0), 0), view(2, 3, 0.0));
     }
 
     /// A placed texture whose memory another texture takes is let go of
