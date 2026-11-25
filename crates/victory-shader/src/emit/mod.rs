@@ -289,6 +289,17 @@ pub fn a16_bias() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_A16_BIAS").is_none())
 }
 
+/// Whether whole-wave sums of doubles (the console's `v_add_f64` tree over
+/// a section, upstream in DexNom 570a941 and Belobug d3a5f2d) and
+/// `v_cvt_f32_f64` translate, the sum through DXIL's double wave sum; refused
+/// otherwise. On unless `VICTORY_NO_F64_SUMS` is set. The value is part of
+/// the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn f64_sums() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_F64_SUMS").is_none())
+}
+
 /// Whether a join's value with no DXIL form on an edge (a stale lane mask)
 /// may stand where every read of it a lane from that edge could reach lies
 /// behind a flag that edge clears, when a later loop takes the value back

@@ -49,8 +49,8 @@ pub(crate) fn counts() -> (u64, u64) {
 /// uniform choice of immediate samplers translates, whether biased samples
 /// with 16-bit coordinates do, whether values joined from loads are data,
 /// whether a stale lane mask a loop takes back round to its header may stand
-/// where no lane bringing it reads it, and how mesh programs take wave
-/// operations).
+/// where no lane bringing it reads it, whether whole-wave sums of doubles
+/// translate, and how mesh programs take wave operations).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -74,6 +74,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::a16_bias()),
             u8::from(victory_shader::emit::loaded_joins()),
             u8::from(victory_shader::emit::unread_loops()),
+            u8::from(victory_shader::emit::f64_sums()),
         ];
         let mesh = victory_shader::emit::mesh_wave_ops();
         if mesh != victory_shader::emit::MeshWaveOps::Lane {

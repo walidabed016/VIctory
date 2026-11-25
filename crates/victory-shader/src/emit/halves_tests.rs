@@ -1350,3 +1350,110 @@ fn whole_wave_f16_sums_round_each_step_of_the_consoles_tree() {
         }
     }
 }
+
+/// `v_mov_b32 vdst, vsrc` with DPP8 lane selects `sel`.
+const fn mov_dpp8(vdst: u8, vsrc: u8, sel: [u32; 8]) -> [u32; 2] {
+    let mut s = 0;
+    let mut i = 0;
+    while i < 8 {
+        s |= sel[i] << (3 * i);
+        i += 1;
+    }
+    [vop1(0x001, vdst, 0xE9), vsrc as u32 | s << 8]
+}
+
+/// Whole-wave double sums (`v_add_f64` of register pairs) as the console
+/// compiler expands a `WaveActiveSum` of a double: lanes whose index in
+/// their console wave is at least 24 times the wave's go in (`v_cmpx`,
+/// `s_cbranch_execz`); there each stores the low and high dwords of the
+/// sum over the lanes of a mask (index bit 1 clear) and the saved EXEC of
+/// 1 + f / 2^8 + f / 2^28, which every order adds exactly, and that sum as
+/// a float (`v_cvt_f32_f64` of the scalar copy of lane 0's).
+fn f64_sums(threads: [u32; 3]) -> Vec<u32> {
+    let mut w = prologue(threads);
+    w.extend([vop2(0x1A, 11, inline(24), 3), vop2(0x1A, 12, inline(12), 3)]);
+    w.extend([vop2(0x1C, 12, 255, 12), 0x3FF0_0000]);
+    w.extend([
+        vop2(0x1B, 13, inline(2), 3),
+        vopc(0xC2, ZERO, 13),
+        sop1(0x04, 24, VCC_LO),
+    ]);
+    for r in [5, 6, 7] {
+        w.extend(mov_k(r, DEAD));
+    }
+    w.extend([
+        vop2(0x16, 8, inline(6), 3),
+        vop2(0x0B, 8, inline(24), 8),
+        vop2(0x1B, 9, inline(63), 3),
+        SAVE_EXEC,
+        vopc(0xD3, v(8), 9),
+    ]);
+    let mut region = vec![
+        sop1(0x25, 20, ONES as u8),
+        vop1(0x001, 2, ZERO),
+        vop1(0x001, 3, ZERO),
+        sop2(0x0F, 22, 24, 20),
+    ];
+    region.extend(vop3_3(0x101, 2, v(2), v(11), 22));
+    region.extend(vop3_3(0x101, 3, v(3), v(12), 22));
+    let add = vop3(0x164, 2, v(16), v(2));
+    for sel in [
+        [1, 0, 3, 2, 5, 4, 7, 6],
+        [2, 2, 0, 0, 6, 6, 4, 4],
+        [4, 4, 4, 4, 0, 0, 0, 0],
+    ] {
+        region.extend(mov_dpp8(16, 2, sel));
+        region.extend(mov_dpp8(17, 3, sel));
+        region.extend(add);
+    }
+    // row_mirror, then the other row of the half, then the other half.
+    for (d, s) in [(16, 2), (17, 3)] {
+        region.extend([vop1(0x001, d, 0xFA), s | 0x140 << 8 | 1 << 19 | 0xFF << 24]);
+    }
+    region.extend(add);
+    region.extend(vop3_3(0x378, 16, v(2), ZERO, ZERO));
+    region.extend(vop3_3(0x378, 17, v(3), ZERO, ZERO));
+    region.extend(add);
+    region.extend(vop3(0x360, 14, v(2), inline(32)));
+    region.extend(vop3(0x360, 15, v(3), inline(32)));
+    region.extend(vop3(0x164, 2, 14, v(2)));
+    region.extend(vop3(0x360, 14, v(2), ZERO));
+    region.extend(vop3(0x360, 15, v(3), ZERO));
+    region.extend([sop1(0x03, 26, 14), sop1(0x03, 27, 15)]);
+    region.push(sop1(0x04, EXEC_LO, 20));
+    region.extend([vop1(0x001, 5, 26), vop1(0x001, 6, 27), vop1(0x00F, 7, 26)]);
+    w.extend(skip(EXECZ, region));
+    w.push(RESTORE_EXEC);
+    for (k, r) in [5u8, 6, 7].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn whole_wave_f64_sums_are_the_console_waves() {
+    for threads in [[64, 1, 1], [32, 1, 1], [16, 16, 1]] {
+        let total: u32 = threads.iter().product();
+        let (shader, _, _) = build(&f64_sums(threads), threads, 0);
+        let inside = |f: u32| f < total && f % 64 >= 24 * (f / 64);
+        let counted = |f: u32| inside(f) && f & 2 == 0;
+        let want = |f: u32| {
+            let wave = f / 64 * 64;
+            let sum: f64 = (wave..wave + 64)
+                .filter(|&g| counted(g))
+                .map(|g| {
+                    f64::from_bits(u64::from(0x3FF0_0000 | g << 12) << 32 | u64::from(g << 24))
+                })
+                .sum();
+            let bits = sum.to_bits();
+            [bits as u32, (bits >> 32) as u32, (sum as f32).to_bits()]
+        };
+        for (label, got) in run(&shader, total * SLOTS) {
+            for f in 0..total {
+                let w = if inside(f) { want(f) } else { [DEAD; 3] };
+                assert_eq!(slots(&got, f, 3), w, "{label} {threads:?}: thread {f}");
+            }
+        }
+    }
+}

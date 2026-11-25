@@ -101,6 +101,15 @@ pub(crate) enum Sym {
         lanes: u64,
         high: u32,
     },
+    /// The low (`!high`) or high (`high`) dword of the double sum over
+    /// `lanes` of `mask ? f64(lo, hi) : +0.0` (`v_add_f64`).
+    Red64F {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+        high: bool,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -116,6 +125,8 @@ pub(crate) enum Shape {
     Prefix(Op, Value, Value, u32, bool),
     /// [`Sym::F16Sum`] over every lane: `src`, `mask`, `ident`, `high`.
     F16Sum(Value, Value, u32, u32),
+    /// [`Sym::Red64F`] over every lane: `lo`, `hi`, `mask`, `high`.
+    ActiveF64(Value, Value, Value, bool),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -340,6 +351,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             {
                 masked.push(w);
             }
+            // A scalar copy (of a sum read from a lane, say).
+            if name == "s_mov_b32"
+                && super::f64_sums()
+                && let Some(&Operand::Scalar { code, .. }) = src.first()
+                && code != NULL
+                && let (Some(x), Some(&(_, w))) = (inst.read(Reg::S(code)), inst.writes.first())
+            {
+                uni.insert(w, uni.get(&x).copied().unwrap_or(Sym::Uni(x)));
+            }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
             }
@@ -391,6 +411,110 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .and_then(|l| x.get(l as usize).copied())
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
+            }
+            continue;
+        }
+        if name == "v_add_f64"
+            && super::f64_sums()
+            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst
+        {
+            // Each operand pair's dwords, per lane.
+            let pair = |op: Option<&Operand>| -> Option<[Vec<Sym>; 2]> {
+                let (lo, hi) = match *op? {
+                    Operand::Vector { reg, .. } => (
+                        Operand::Vector { reg, dwords: 1 },
+                        Operand::Vector {
+                            reg: reg + 1,
+                            dwords: 1,
+                        },
+                    ),
+                    Operand::Scalar { code, .. } if code != NULL => (
+                        Operand::Scalar { code, dwords: 1 },
+                        Operand::Scalar {
+                            code: code + 1,
+                            dwords: 1,
+                        },
+                    ),
+                    _ => return None,
+                };
+                Some([lanes(&lo, &vec, &uni), lanes(&hi, &vec, &uni)])
+            };
+            // A lane's term: one lane's masked double (+0.0 outside the
+            // mask), or a sum over some lanes.
+            let term = |lo: Sym, hi: Sym| match (lo, hi) {
+                (
+                    Sym::Red {
+                        op: None,
+                        src: a,
+                        mask,
+                        ident: 0,
+                        lanes,
+                    },
+                    Sym::Red {
+                        op: None,
+                        src: b,
+                        mask: m,
+                        ident: 0,
+                        lanes: l,
+                    },
+                ) if (mask, lanes) == (m, l) => Some((a, b, mask, lanes)),
+                (
+                    Sym::Red64F {
+                        lo: a,
+                        hi: b,
+                        mask,
+                        lanes,
+                        high: false,
+                    },
+                    Sym::Red64F {
+                        lo,
+                        hi,
+                        mask: m,
+                        lanes: l,
+                        high: true,
+                    },
+                ) if (a, b, mask, lanes) == (lo, hi, m, l) => Some((a, b, mask, lanes)),
+                _ => None,
+            };
+            let old = |r: u8| lanes(&Operand::Vector { reg: r, dwords: 1 }, &vec, &uni);
+            let old = [old(dreg), old(dreg + 1)];
+            let mut out = [
+                vec![Sym::Unknown; wave as usize],
+                vec![Sym::Unknown; wave as usize],
+            ];
+            if !modifiers
+                && v.dpp.is_none()
+                && let (Some([alo, ahi]), Some([blo, bhi])) =
+                    (pair(v.src.first()), pair(v.src.get(1)))
+            {
+                for l in 0..wave as usize {
+                    let sum = match (term(alo[l], ahi[l]), term(blo[l], bhi[l])) {
+                        (Some((lo, hi, mask, a)), Some((lo2, hi2, mask2, b)))
+                            if (lo, hi, mask) == (lo2, hi2, mask2) && a & b == 0 =>
+                        {
+                            Some((lo, hi, mask, a | b))
+                        }
+                        _ => None,
+                    };
+                    for (k, high) in [(0, false), (1, true)] {
+                        out[k][l] = if exec >> l & 1 == 0 {
+                            old[k][l]
+                        } else {
+                            sum.map_or(Sym::Unknown, |(lo, hi, mask, lanes)| Sym::Red64F {
+                                lo,
+                                hi,
+                                mask,
+                                lanes,
+                                high,
+                            })
+                        };
+                    }
+                }
+            }
+            for (r, o) in [dreg, dreg + 1].into_iter().zip(out) {
+                if let Some(w) = inst.write(Reg::V(r)) {
+                    vec.insert(w, o);
+                }
             }
             continue;
         }
@@ -605,6 +729,13 @@ fn shapes(
             lanes,
             high,
         } if lanes == all => Some(Shape::F16Sum(src, mask, ident, high)),
+        Sym::Red64F {
+            lo,
+            hi,
+            mask,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -655,6 +786,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 lanes,
                 high,
             } if lanes == all => Some(Shape::F16Sum(src, mask, ident, high)),
+            Sym::Red64F {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
             _ => None,
         };
     }

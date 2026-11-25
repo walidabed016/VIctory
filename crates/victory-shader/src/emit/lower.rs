@@ -1271,15 +1271,20 @@ impl<'a> Lower<'a> {
         if inside.is_empty() {
             return;
         }
+        let lockstep = self.lockstep();
         for (b, block) in p.blocks.iter().enumerate() {
             for phi in &block.phis {
                 self.section_out
                     .extend(phi.args.iter().filter(|a| inside.contains_key(a)));
             }
             for (i, inst) in block.insts.iter().enumerate() {
+                // In lockstep a section's scalar instructions run as anywhere
+                // ([`Lower::section_inst`]): what they read leaves it.
+                let runs =
+                    lockstep && matches!(inst.fields, Fields::Sop { .. }) && super::f64_sums();
                 for &(_, r) in &inst.reads {
                     if let Some(&(sb, start, end)) = inside.get(&r)
-                        && !(sb == b && i > start && i < end)
+                        && (runs || !(sb == b && i > start && i < end))
                     {
                         self.section_out.insert(r);
                     }
@@ -1337,6 +1342,9 @@ impl<'a> Lower<'a> {
                 (op, src, mask, ident, Some(inclusive))
             }
             Shape::F16Sum(src, mask, ident, high) => return self.f16_sum(src, mask, ident, high),
+            Shape::ActiveF64(lo, hi, mask, high) => {
+                return self.active_f64_sum(lo, hi, mask, high);
+            }
         };
         // Mesh programs run on the host's waves: a minimum, maximum, AND or
         // OR over them is one the console's could give a subset of its
@@ -1413,6 +1421,80 @@ impl<'a> Lower<'a> {
         let upper = self.s.m.cmp(c, pred::NE, ids.half, z);
         let below = self.s.m.select(c, upper, low, none);
         Ok(self.combine(op, r, below))
+    }
+
+    /// [`Shape::ActiveF64`](super::wave::Shape::ActiveF64): the double sum
+    /// over the host's active lanes of `mask ? f64(lo, hi) : +0.0`, with
+    /// halves the lower half's plus the upper's; its low or `high` dword.
+    /// The host adds in its own order, which may round the last bit of the
+    /// double otherwise than the console's tree.
+    fn active_f64_sum(&mut self, lo: Value, hi: Value, mask: Value, high: bool) -> Result<V, Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        let c = self.cur;
+        let on = self.mask_bit(mask, "a wave reduction's untracked mask")?;
+        let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+        let z = self.s.m.i32(0);
+        let lo = self.s.m.select(c, on, lo, z);
+        let hi = self.s.m.select(c, on, hi, z);
+        self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let f64t = self.s.m.double();
+        let x = self.make_double(lo, hi);
+        let (k0, u0) = (self.s.m.i8(0), self.s.m.i8(0));
+        let sum = self.s.op(
+            c,
+            "waveActiveOp.f64",
+            Attr::NoUnwind,
+            f64t,
+            119,
+            &[x, k0, u0],
+        );
+        let (lo, hi) = self.split_double(sum);
+        let Some(ids) = self.halves.as_ref().map(|h| h.ids) else {
+            return Ok(if high { hi } else { lo });
+        };
+        let ids = ids.ok_or(APART)?;
+        let [(lo0, lo1), (hi0, hi1)] = self.exchange([lo, hi], APART)?;
+        let (lo1, hi1) = match ids.upper {
+            Some(u) => {
+                let (c, z) = (self.cur, self.s.m.i32(0));
+                (self.s.m.select(c, u, lo1, z), self.s.m.select(c, u, hi1, z))
+            }
+            None => (lo1, hi1),
+        };
+        let (a, b) = (self.make_double(lo0, hi0), self.make_double(lo1, hi1));
+        let sum = self.s.m.bin(self.cur, Bin::Add, a, b);
+        let (lo, hi) = self.split_double(sum);
+        Ok(if high { hi } else { lo })
+    }
+
+    /// The double of dwords `lo` and `hi`.
+    fn make_double(&mut self, lo: V, hi: V) -> V {
+        self.s.flags |= flags::DOUBLES;
+        let f64t = self.s.m.double();
+        self.s.op(
+            self.cur,
+            "makeDouble.f64",
+            Attr::ReadNone,
+            f64t,
+            101,
+            &[lo, hi],
+        )
+    }
+
+    /// The low and high dwords of double `x`.
+    fn split_double(&mut self, x: V) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let pair = self
+            .s
+            .m
+            .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let c = self.cur;
+        let split = self
+            .s
+            .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[x]);
+        (self.s.m.extract(c, split, 0), self.s.m.extract(c, split, 1))
     }
 
     /// `op` over the host wave's active lanes (`arg` a float for float
@@ -6954,6 +7036,13 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_f32_f64" if super::f64_sums() => {
+                // Rounded to nearest even, as the console's default mode.
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let x = self.make_double(lo, hi);
+                let r = self.s.m.cast(c, Cast::FpTrunc, x, self.s.t.f32);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -7233,6 +7322,51 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
+    }
+
+    /// A double source's dwords: a register pair, `0`, an inline float
+    /// constant (a double), or a literal (its high dword), with `abs` and
+    /// `neg` on the sign.
+    fn f64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let (lo, mut hi) = match *v.src.get(k).ok_or("a missing operand")? {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(c @ 240..=248) => {
+                let bits = match c {
+                    248 => 0x3FC4_5F30_6DC9_C882,
+                    _ => f64::to_bits(
+                        [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][usize::from(c - 240)],
+                    ),
+                };
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
+            _ => return Err("a double operand"),
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, m);
+        }
+        Ok((lo, hi))
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
