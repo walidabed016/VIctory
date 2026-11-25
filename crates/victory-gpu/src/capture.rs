@@ -159,28 +159,18 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// Records a copy of `texture` (in the copy-source state) into a
-/// readback buffer.
+/// Records a copy of `texture`'s first subresource (in the copy-source
+/// state) into a readback buffer: of a 3D texture, every slice.
 pub(crate) fn read_back(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-    let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
     unsafe {
         let desc = texture.GetDesc();
-        device.GetCopyableFootprints(
-            &desc,
-            0,
-            1,
-            0,
-            Some(&mut footprint),
-            None,
-            None,
-            Some(&mut total),
-        );
+        device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut footprint), None, None, None);
     }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
@@ -188,7 +178,7 @@ pub(crate) fn read_back(
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: total,
+        Width: rows_bytes(&footprint.Footprint),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -232,6 +222,13 @@ pub(crate) fn read_back(
     }
 }
 
+/// The bytes of a footprint's rows: `Height` rows `RowPitch` apart per
+/// slice, `Depth` slices one after the other, the last row's padding
+/// included (GetCopyableFootprints' total leaves it out).
+fn rows_bytes(f: &D3D12_SUBRESOURCE_FOOTPRINT) -> u64 {
+    u64::from(f.RowPitch) * u64::from(f.Height) * u64::from(f.Depth)
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
@@ -263,7 +260,8 @@ pub(crate) fn save_read_back(
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
-/// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
+/// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`,
+/// `<w>x<h>x<d>` for 3D textures, whose `d` slices show one under the other
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
@@ -337,7 +335,7 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -382,13 +380,27 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        // A 3D texture's slices follow each other, so they show one under
+        // the other.
+        let height = f.Height * f.Depth;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), rows_bytes(&f) as usize);
+        if let Some(rgba) = to_rgba(
+            f.Format.0 as u32,
+            f.Width as usize,
+            height as usize,
+            pitch,
+            rows,
+        ) {
+            let depth = if f.Depth > 1 {
+                format!("x{}", f.Depth)
+            } else {
+                String::new()
+            };
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}{depth}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -486,12 +498,51 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    let (above_zero, [p50, p90, p99]) = spread(&values);
+    tracing::info!(
+        format,
+        low,
+        high,
+        above_zero,
+        p50,
+        p90,
+        p99,
+        "target values"
+    );
+    if values.len() <= 8 {
+        tracing::info!(?values, "target texels");
+    }
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+/// The share of pixels with a channel above zero, in percent, and the 50th,
+/// 90th and 99th percentiles of each pixel's largest channel: what an 8-bit
+/// picture scaled to the brightest pixel cannot show.
+fn spread(values: &[[f32; 3]]) -> (f32, [f32; 3]) {
+    let mut peaks: Vec<f32> = values
+        .iter()
+        .map(|v| {
+            v.iter()
+                .copied()
+                .filter(|c| c.is_finite())
+                .fold(f32::MIN, f32::max)
+        })
+        .collect();
+    let above = peaks.iter().filter(|&&p| p > 0.0).count();
+    let last = peaks.len().saturating_sub(1);
+    let mut at = |q: usize| {
+        *peaks
+            .select_nth_unstable_by(last * q / 100, f32::total_cmp)
+            .1
+    };
+    (
+        100.0 * above as f32 / values.len() as f32,
+        [at(50), at(90), at(99)],
+    )
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -652,5 +703,165 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn spread_counts_pixels_above_zero_and_takes_percentiles_of_their_peaks() {
+        let mut values: Vec<[f32; 3]> = (0..99).map(|i| [-1.0, i as f32, 0.0]).collect();
+        values.push([f32::NAN, f32::INFINITY, 1000.0]);
+        let (above, peaks) = super::spread(&values);
+        assert_eq!(above, 99.0);
+        assert_eq!(peaks, [49.0, 89.0, 98.0]);
+    }
+
+    /// A 3D readback holds the slices one after the other, rows `RowPitch`
+    /// apart: the buffer spans them all, and they decode as one picture,
+    /// slice under slice.
+    #[test]
+    fn a_3d_footprint_reads_back_as_its_slices_one_under_the_other() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        // A 65x65x65 half-float LUT: 520-byte rows, padded to 768.
+        let lut = D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            Width: 65,
+            Height: 65,
+            Depth: 65,
+            RowPitch: 768,
+        };
+        assert_eq!(super::rows_bytes(&lut), 768 * 65 * 65);
+        let f = D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Width: 2,
+            Height: 2,
+            Depth: 3,
+            RowPitch: 256,
+        };
+        let mut rows = vec![0u8; super::rows_bytes(&f) as usize];
+        let mut picture = Vec::new();
+        for z in 0..3u8 {
+            for y in 0..2u8 {
+                for x in 0..2u8 {
+                    let at = usize::from(z * 2 + y) * 256 + usize::from(x) * 4;
+                    rows[at..at + 4].copy_from_slice(&[x, y, z, 9]);
+                    picture.extend([x, y, z, 255]);
+                }
+            }
+        }
+        assert_eq!(super::to_rgba(28, 2, 2 * 3, 256, &rows), Some(picture));
+    }
+
+    /// On the host GPU: a 3D texture reads back every slice and a 1D one
+    /// its row (65 texels wide, so rows end in padding), with nothing for
+    /// the debug layer to report.
+    #[test]
+    fn read_back_takes_every_slice_of_a_3d_texture_and_the_row_of_a_1d_one() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let _serial = crate::watch::serial();
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU: skipped");
+            return;
+        };
+        for (dimension, height, depth) in [
+            (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 3, 4),
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1),
+        ] {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: dimension,
+                Width: 65,
+                Height: height,
+                DepthOrArraySize: depth,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            let mut up = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: plain creation; outputs for one subresource.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                host.device
+                    .GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut up), None, None, None);
+            }
+            let texture = texture.unwrap();
+            let pitch = up.Footprint.RowPitch as usize;
+            let rows = (height * u32::from(depth)) as usize;
+            let (upload, data) = host
+                .upload_buffer(super::rows_bytes(&up.Footprint))
+                .unwrap();
+            let mut picture = Vec::new();
+            for (r, x) in (0..rows).flat_map(|r| (0..65).map(move |x| (r, x))) {
+                let texel = [x as u8, r as u8, 7, 255];
+                // SAFETY: inside the mapped upload buffer.
+                unsafe {
+                    data.add(r * pitch + x * 4)
+                        .copy_from_nonoverlapping(texel.as_ptr(), 4)
+                };
+                picture.extend(texel);
+            }
+            let list = host.new_list().unwrap();
+            let mut read = None;
+            let errors = crate::host::errors_of(|| {
+                // SAFETY: an open list of ours; locations naming live resources.
+                unsafe {
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&upload),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: up,
+                        },
+                    };
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        &texture,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                read = super::read_back(&host.device, &list.list, &texture);
+                list.close();
+                host.execute(&[&list]);
+            });
+            assert_eq!(errors.unwrap_or_default(), Vec::<String>::new());
+            let (buffer, footprint) = read.unwrap();
+            let f = footprint.Footprint;
+            assert_eq!((f.Width, f.Height, f.Depth), (65, height, u32::from(depth)));
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished; the mapping spans the footprint's rows.
+            let back = unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let bytes =
+                    std::slice::from_raw_parts(mapped.cast::<u8>(), super::rows_bytes(&f) as usize);
+                let back = super::to_rgba(28, 65, rows, f.RowPitch as usize, bytes);
+                buffer.Unmap(0, None);
+                back
+            };
+            assert_eq!(back, Some(picture));
+        }
     }
 }
