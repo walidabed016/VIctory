@@ -1485,7 +1485,7 @@ impl Shadow {
         from: usize,
         to: usize,
         now: u64,
-        written: std::collections::btree_map::Range<'_, usize, u64>,
+        written: crate::watch::Written<'_>,
     ) -> Vec<(usize, usize)> {
         let base = self.start as usize / PAGE;
         let mut writes = written.peekable();
@@ -1493,7 +1493,7 @@ impl Shadow {
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
-                Some(&(&p, &w)) if p == page => {
+                Some(&(p, w)) if p == page => {
                     writes.next();
                     w
                 }

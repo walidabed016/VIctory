@@ -40,7 +40,7 @@ struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Pages,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked about since [`forget_asked`] (in order, apart),
@@ -57,11 +57,82 @@ struct Journal {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Pages(BTreeMap::new()),
     found: Vec::new(),
     fresh: Vec::new(),
     ours: Vec::new(),
 });
+
+/// Pages' last writes (the asking that found each written; 0 is never),
+/// by page number in chunks of [`CHUNK`] pages, so that a range's pages
+/// are walked as memory: walking them as a tree's nodes cost run 99's
+/// refreshes ~6 ms a frame.
+struct Pages(BTreeMap<usize, Box<[u64]>>);
+
+/// The pages of a chunk: 256 MiB of title memory, 32 KiB of writes.
+const CHUNK: usize = 4096;
+
+impl Pages {
+    fn get(&self, page: usize) -> Option<u64> {
+        let asking = self.0.get(&(page / CHUNK))?[page % CHUNK];
+        (asking != 0).then_some(asking)
+    }
+
+    fn insert(&mut self, page: usize, asking: u64) {
+        self.0
+            .entry(page / CHUNK)
+            .or_insert_with(|| vec![0; CHUNK].into_boxed_slice())[page % CHUNK] = asking;
+    }
+
+    /// The pages of `pages` written.
+    fn range(&self, pages: std::ops::Range<usize>) -> Written<'_> {
+        let first = pages.start / CHUNK;
+        Written {
+            chunks: self.0.range(first..pages.end.div_ceil(CHUNK).max(first)),
+            chunk: None,
+            page: pages.start,
+            end: pages.end,
+        }
+    }
+}
+
+/// The pages of a range written, in page order: (page number, asking).
+pub(crate) struct Written<'a> {
+    chunks: std::collections::btree_map::Range<'a, usize, Box<[u64]>>,
+    /// The chunk walked: its first page, and its pages' writes.
+    chunk: Option<(usize, &'a [u64])>,
+    /// The next page to look at.
+    page: usize,
+    end: usize,
+}
+
+impl Iterator for Written<'_> {
+    type Item = (usize, u64);
+
+    fn next(&mut self) -> Option<(usize, u64)> {
+        loop {
+            let (first, writes) = match self.chunk {
+                Some(chunk) => chunk,
+                None => {
+                    let (&n, writes) = self.chunks.next()?;
+                    let chunk = (n * CHUNK, &writes[..]);
+                    self.page = self.page.max(chunk.0);
+                    self.chunk = Some(chunk);
+                    chunk
+                }
+            };
+            let end = self.end.min(first + CHUNK);
+            while self.page < end {
+                let (page, asking) = (self.page, writes[self.page - first]);
+                self.page += 1;
+                if asking != 0 {
+                    return Some((page, asking));
+                }
+            }
+            self.chunk = None;
+        }
+    }
+}
 
 /// The title may have written its memory since (a submission begins, its
 /// copies into title memory ran, or its shaders' writes go back): every
@@ -122,9 +193,7 @@ pub(crate) fn wrote(start: usize, end: usize) -> u64 {
 /// asked about since [`forget_asked`] are not asked about again). `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_with(start, end, guarded, |now, written| {
-        (now, written.map(|(&p, &w)| (p, w)).collect())
-    })
+    writes_with(start, end, guarded, |now, written| (now, written.collect()))
 }
 
 /// [`writes`] of guarded and write-watched memory for copy-back, which may
@@ -133,7 +202,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// (whose own asking must still take what the title writes until then).
 pub(crate) fn writes_now(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     asked_writes(start, end, true, false, |now, written| {
-        (now, written.map(|(&p, &w)| (p, w)).collect())
+        (now, written.collect())
     })
 }
 
@@ -145,7 +214,7 @@ pub(crate) fn writes_with<T>(
     start: usize,
     end: usize,
     guarded: bool,
-    visit: impl FnOnce(u64, std::collections::btree_map::Range<'_, usize, u64>) -> T,
+    visit: impl FnOnce(u64, Written<'_>) -> T,
 ) -> Option<T> {
     asked_writes(start, end, guarded, true, visit)
 }
@@ -157,7 +226,7 @@ fn asked_writes<T>(
     end: usize,
     guarded: bool,
     fresh: bool,
-    visit: impl FnOnce(u64, std::collections::btree_map::Range<'_, usize, u64>) -> T,
+    visit: impl FnOnce(u64, Written<'_>) -> T,
 ) -> Option<T> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -875,7 +944,7 @@ pub(crate) fn arm(
             for block in a..=b {
                 let page = block * BLOCK / PAGE;
                 let mut written = 0;
-                while let Some(&(&p, &w)) = pages.peek()
+                while let Some(&(p, w)) = pages.peek()
                     && p <= page
                 {
                     if p == page {
@@ -963,7 +1032,7 @@ pub(crate) fn before(block: usize, asked: u64) -> Option<Vec<u8>> {
     let kept = g.armed.contains(block)
         && g.protected.contains(block)
         && g.clean.contains(block)
-        && j.written.get(&page).is_none_or(|&w| w <= asked);
+        && j.written.get(page).is_none_or(|w| w <= asked);
     kept.then(|| {
         // SAFETY: an armed guarded block: mapped, and held still by the
         // lock (a write to it waits for it in our handler, a remapping too).
@@ -984,7 +1053,7 @@ pub(crate) fn describe(block: usize, asked: u64) -> String {
         g.armed.contains(block),
         g.protected.contains(block),
         g.clean.contains(block),
-        j.written.get(&page),
+        j.written.get(page),
         g.shown.as_ref().and_then(|s| s.page.get(&block)),
     )
 }
@@ -1328,6 +1397,73 @@ mod tests {
     thread_local! {
         /// Write-watch askings made on this thread ([`ask`]).
         pub(super) static ASKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    impl<'a> Extend<(&'a usize, &'a u64)> for Pages {
+        fn extend<I: IntoIterator<Item = (&'a usize, &'a u64)>>(&mut self, pages: I) {
+            for (&page, &asking) in pages {
+                self.insert(page, asking);
+            }
+        }
+    }
+
+    impl Pages {
+        fn retain(&mut self, mut keep: impl FnMut(&usize, &mut u64) -> bool) {
+            for (&n, writes) in &mut self.0 {
+                for (i, asking) in writes.iter_mut().enumerate() {
+                    if *asking != 0 && !keep(&(n * CHUNK + i), asking) {
+                        *asking = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The journal's pages of a range are those a tree of them holds, in
+    /// order, whichever chunks the range starts, ends and skips in.
+    #[test]
+    fn journal_pages_are_walked_as_a_tree_held_them() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        let (mut pages, mut tree) = (Pages(BTreeMap::new()), BTreeMap::new());
+        // Chunks 3, 4 and 9 written, those between never.
+        let base = 3 * CHUNK;
+        for asking in 1..2000u64 {
+            let page = match next(3) {
+                0 => base + next(CHUNK as u64),
+                1 => base + CHUNK + next(CHUNK as u64),
+                _ => base + 6 * CHUNK + next(CHUNK as u64),
+            };
+            pages.insert(page, asking);
+            tree.insert(page, asking);
+        }
+        // Chunks' first and last pages.
+        for (i, page) in [base, base + CHUNK - 1, base + CHUNK, base + 2 * CHUNK - 1]
+            .into_iter()
+            .chain([base + 6 * CHUNK, base + 7 * CHUNK - 1])
+            .enumerate()
+        {
+            pages.insert(page, 3000 + i as u64);
+            tree.insert(page, 3000 + i as u64);
+        }
+        for page in [0, base - 1, base, base + 2 * CHUNK, base + 6 * CHUNK + 5] {
+            assert_eq!(pages.get(page), tree.get(&page).copied(), "page {page:#x}");
+        }
+        for _ in 0..500 {
+            let a = next(9 * CHUNK as u64);
+            let b = a + next(9 * CHUNK as u64);
+            let walked: Vec<(usize, u64)> = pages.range(a..b).collect();
+            let held: Vec<(usize, u64)> = tree.range(a..b).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(walked, held, "pages {a:#x}..{b:#x}");
+        }
+        assert_eq!(pages.range(base + 5..base + 5).count(), 0);
+        let whole: Vec<(usize, u64)> = pages.range(0..usize::MAX / 2).collect();
+        assert_eq!(whole, tree.into_iter().collect::<Vec<_>>());
     }
 
     #[test]
