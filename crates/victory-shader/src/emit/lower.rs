@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_RECORD_BYTES, flags, view_kind};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Cache, Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -386,6 +386,21 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 /// XboxBvhBuilder's refit, compute 5552dac6a2b7a1fd).
 // shortcut: a genuine wait or traversal of more passes than this is cut short too.
 pub(super) const SPIN_LIMIT: u32 = 1 << 13;
+
+/// DXIL resource property (dword 0 bit 14): a UAV whose accesses are
+/// device coherent (HLSL `globallycoherent`).
+const GLOBALLY_COHERENT: u32 = 0x4000;
+
+/// Whether a load or store with these cache bits is device coherent, as
+/// `glc` (and `dlc`) make it on the console: it reads past the caches of
+/// one compute unit, so it sees what other waves stored and fenced. Only
+/// with [`super::coherent_memory`]; otherwise host loads go through the
+/// copy's SRV, which may serve data other waves have since replaced
+/// (XboxBvhBuilder's FindTreelets and ConstructBVH4 read their siblings'
+/// results so).
+fn coherent(cache: &Cache) -> bool {
+    (cache.glc || cache.dlc) && super::coherent_memory()
+}
 
 /// Whether a wave can wait on another through `i` in a loop: an atomic, a
 /// coherent `glc` or `dlc` access, a cache invalidation.
@@ -1228,7 +1243,7 @@ impl<'a> Lower<'a> {
     /// from title memory at an address the program computes; stores and
     /// atomics through a root view.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, .. } = &inst.fields else {
+        let Fields::Flat { dst, cache, .. } = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
@@ -1259,7 +1274,7 @@ impl<'a> Lower<'a> {
         let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
         let (h, off) = if a.param == MEMORY {
             let (lo, hi) = self.global_address(inst)?;
-            let (h, off) = self.memory(lo, hi, bytes, false, guard);
+            let (h, off) = self.memory(lo, hi, bytes, false, coherent(cache), guard);
             (Some(h), off)
         } else {
             let mut off = self.s.m.i32(a.offset);
@@ -1446,7 +1461,10 @@ impl<'a> Lower<'a> {
         // the lanes that write.
         let at = self.begin_guarded(guard);
         let (h, off) = match (memory, root) {
-            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
+            (Some((lo, hi)), _) => {
+                let coherent = ops.is_none() && coherent(cache);
+                self.memory(lo, hi, 4 * u32::from(n), true, coherent, None)
+            }
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
@@ -2405,7 +2423,8 @@ impl<'a> Lower<'a> {
         let (lo, hi) = self.add64(lo, hi, off, false);
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
-        Ok(self.memory(lo, hi, bytes, write, active))
+        let coherent = props.0 & GLOBALLY_COHERENT != 0;
+        Ok(self.memory(lo, hi, bytes, write, coherent, active))
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -4406,6 +4425,20 @@ impl<'a> Lower<'a> {
             .as_ref()
             .map_err(|&w| w)
             .and_then(|_| match &inst.fields {
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code: NULL, .. }),
+                    imm: Some(0),
+                    ..
+                } if name == "s_waitcnt_vscnt" && super::coherent_memory() => {
+                    // Every store done before what follows (the console's
+                    // release before an atomic that hands results to
+                    // another wave): a device memory fence.
+                    let mode = self.s.m.i32(2);
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                    Ok(())
+                }
                 Fields::Sop { .. } => self.sop(inst),
                 Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => {
                     Ok(())
@@ -6082,7 +6115,7 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
-        let (h, off) = self.memory(lo, hi, 4 * count, false, None);
+        let (h, off) = self.memory(lo, hi, 4 * count, false, false, None);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
@@ -6139,7 +6172,9 @@ impl<'a> Lower<'a> {
     /// memory"): a page table in the root SRV `t0` of
     /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
     /// per page written and per page or 256 MiB region missed. May end in a
-    /// new block: callers take [`Lower::cur`] afresh.
+    /// new block: callers take [`Lower::cur`] afresh. A `coherent` access
+    /// (`glc` or `dlc` with [`super::coherent_memory`]) goes through the
+    /// copy's UAV marked globally coherent, reads too.
     // shortcut: one lookup per access, so its bytes are taken to lie in one
     // host copy of title memory (any access within a 64 KiB page does).
     pub(crate) fn memory(
@@ -6148,9 +6183,10 @@ impl<'a> Lower<'a> {
         hi: V,
         bytes: u32,
         write: bool,
+        coherent: bool,
         active: Option<V>,
     ) -> (V, V) {
-        let e = self.memory_entry(lo, hi, write);
+        let e = self.memory_entry(lo, hi, write, coherent);
         let c = self.cur;
         // Writes always mark (written or missed pages), reads only misses.
         let marks = match (write, active) {
@@ -6202,7 +6238,7 @@ impl<'a> Lower<'a> {
     }
 
     /// [`Self::memory`]'s lookup in the page table.
-    fn memory_entry(&mut self, lo: V, hi: V, write: bool) -> MemoryEntry {
+    fn memory_entry(&mut self, lo: V, hi: V, write: bool, coherent: bool) -> MemoryEntry {
         let c = self.cur;
         let map = self.s.memory_handle();
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
@@ -6235,9 +6271,14 @@ impl<'a> Lower<'a> {
         let null = self.raw_dword(map, first);
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if write {
+        let (view, props) = if write || coherent {
             let one = k(self, 1);
-            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))
+            let props = if coherent {
+                11 | 0x1000 | GLOBALLY_COHERENT
+            } else {
+                11 | 0x1000
+            };
+            (self.s.m.bin(c, Bin::Add, view, one), (props, 0))
         } else {
             (view, (11, 0))
         };
@@ -10377,6 +10418,7 @@ impl<'a> Lower<'a> {
             format,
             lds,
             tfe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -10527,7 +10569,11 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let u = match (uav, atomic.is_none() && coherent(cache)) {
+            (true, true) => 0x1000 | GLOBALLY_COHERENT,
+            (true, false) => 0x1000,
+            (false, _) => 0,
+        };
         // Dword accesses go through the raw view the host makes of every
         // untyped buffer view; indexed ones address the record themselves,
         // index * stride + offset, with the used-resource entry's stride or,

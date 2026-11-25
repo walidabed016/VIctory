@@ -156,6 +156,8 @@
 mod atomic64_tests;
 mod bitcode;
 #[cfg(all(test, windows))]
+mod builder_probe_tests;
+#[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
@@ -268,6 +270,20 @@ fn belobug_off(value: &str, name: &str) -> bool {
 pub fn small_groups_on_halves() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_GROUPS_WAVE64").is_none())
+}
+
+/// Whether memory accesses the console makes device coherent (`glc` or
+/// `dlc` loads and stores) are so on the host too, through UAVs marked
+/// globally coherent, and `s_waitcnt_vscnt` waits for every store as a
+/// device memory fence. XboxBvhBuilder's passes hand results from wave to
+/// wave so (an atomic counter, then the other wave reads); without it the
+/// host's caches serve stale bounds and topology, and ConstructBVH4
+/// (compute 5552dac6a2b7a1fd) climbs a broken tree until its loop limit.
+/// Off unless `VICTORY_COHERENT` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn coherent_memory() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT").is_some())
 }
 
 /// Whether buffer loads of a byte or short (`buffer_load_ubyte`,
