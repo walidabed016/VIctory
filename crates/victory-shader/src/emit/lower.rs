@@ -217,6 +217,18 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// The coordinates `calculateLOD` takes for a texture of DXIL resource
+/// kind `kind` (DXC's `GetNumDimensionsForCalcLOD`): the size's dimensions,
+/// without an array slice. The validator wants the rest undef ("out of
+/// bound coord must be undef"). From Belobug's fec4d02.
+fn lod_dims(kind: u32) -> usize {
+    match kind {
+        1 | 6 => 1,
+        2 | 7 => 2,
+        _ => 3,
+    }
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -9091,6 +9103,11 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // The size's dimensions only: an array slice is undef.
+                let fu = self.s.m.undef(f32t);
+                let mut lc = [fu; 3];
+                let n = lod_dims(kind);
+                lc[..n].copy_from_slice(&cs[..n]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -9099,7 +9116,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lc[0], lc[1], lc[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -11400,6 +11417,16 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// `calculateLOD` takes the size's dimensions only, as DXC's
+    /// `GetNumDimensionsForCalcLOD` counts them: an array's slice
+    /// coordinate is left undef.
+    #[test]
+    fn level_queries_leave_the_array_slice_undef() {
+        // 1D, 2D, 3D, cube, 1D array, 2D array.
+        let dims: Vec<usize> = [1, 2, 4, 5, 6, 7].map(super::lod_dims).to_vec();
+        assert_eq!(dims, [1, 2, 3, 3, 1, 2]);
     }
 
     #[test]
