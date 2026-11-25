@@ -190,11 +190,6 @@ impl Pipeline {
         s.next
     }
 
-    /// Whether a submission in flight runs `list`.
-    fn runs(&self, list: usize) -> bool {
-        self.lock().flying.iter().any(|f| f.lists.contains(&list))
-    }
-
     /// Queues a submission's completion.
     fn launch(
         &'static self,
@@ -365,11 +360,6 @@ pub(crate) fn wait_list(list: usize) {
     if on() {
         PIPELINE.wait_for(Why::List, |f| f.lists.contains(&list));
     }
-}
-
-/// Whether a submission in flight runs host list `list`.
-pub(crate) fn in_flight(list: usize) -> bool {
-    on() && PIPELINE.runs(list)
 }
 
 /// A queue signals `fence`: deferred until the submissions queued before
@@ -578,18 +568,6 @@ mod tests {
         );
         drop(gos);
         p.wait_for(Why::All, |_| true);
-    }
-
-    #[test]
-    fn a_list_runs_until_its_submission_completes() {
-        let p = pipeline();
-        let (go, job) = held();
-        p.launch(Vec::new(), Vec::new(), vec![5, 6], job);
-        assert!(p.runs(5) && p.runs(6));
-        assert!(!p.runs(7));
-        go.send(()).unwrap();
-        p.wait_for(Why::All, |_| true);
-        assert!(!p.runs(5) && !p.runs(6));
     }
 
     #[test]
