@@ -1122,6 +1122,26 @@ impl Host {
         })
     }
 
+    /// Whether the host has the depth bounds test; logged once.
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static BOUNDS: OnceLock<bool> = OnceLock::new();
+        *BOUNDS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS2,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            let bounds = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(bounds, "host depth bounds test");
+            bounds
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.

@@ -1022,8 +1022,8 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// the pipeline; depth order and shading rate hints): any arguments,
+/// nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
@@ -1070,6 +1070,11 @@ mod state {
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         if let Some(list) = host_list(this) {
             crate::draw::stencil_ref(list, reference);
+        }
+    }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        if let Some(list) = host_list(this) {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
@@ -1239,6 +1244,7 @@ mod state {
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -1446,7 +1452,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits

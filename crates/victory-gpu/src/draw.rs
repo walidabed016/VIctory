@@ -1656,6 +1656,20 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
+/// The title's depth bounds, for the pipelines that test them
+/// (`pipeline::host`); kept from the host where those pipelines do not.
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if !crate::pipeline::depth_bounds_test()
+        || !crate::host::host().is_some_and(|h| h.depth_bounds())
+    {
+        return;
+    }
+    if let Ok(l) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { l.OMSetDepthBounds(min, max) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

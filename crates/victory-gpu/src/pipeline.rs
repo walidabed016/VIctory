@@ -114,6 +114,16 @@ fn integer_blend_bypass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_INTEGER_BLEND_BYPASS").is_none())
 }
 
+/// Whether pipelines that enable the depth bounds test get it on the host
+/// and the title's bounds reach the host list (fxceless c96b4f2, #82 by
+/// Kaivyyy, in DexNom 570a941): without it their draws pass at every depth.
+/// On unless `VICTORY_NO_DEPTH_BOUNDS` is set.
+#[cfg(windows)]
+pub(crate) fn depth_bounds_test() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_DEPTH_BOUNDS").is_none())
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
