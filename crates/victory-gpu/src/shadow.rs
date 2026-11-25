@@ -769,8 +769,10 @@ impl Shadow {
                     .as_ref()
                     .and_then(|_| crate::watch::writes(a, b, true));
                 crate::watch::wrote(a, b);
-                let (Some((_, title)), Some((_, ours))) = (title, crate::watch::writes(a, b, true))
-                else {
+                let Some((_, title)) = title else {
+                    continue;
+                };
+                let Some((_, ours)) = crate::watch::writes(a, b, true) else {
                     continue;
                 };
                 let Some(at) = ours.iter().map(|w| w.1).min() else {
