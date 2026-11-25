@@ -513,17 +513,24 @@ fn reads_console_lanes(x: &Parts) -> bool {
         return true;
     }
     // A mask operation's SCC read as data ([`super::mask_scc`]) by an
-    // instruction other than a branch on it.
-    if super::mask_scc()
-        && !x.native.wave64
-        && insts().any(|i| {
-            !matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
-                && i.reads
-                    .iter()
-                    .any(|(r, v)| *r == Reg::Scc && x.st.scc_some.contains_key(v))
-        })
-    {
-        return true;
+    // instruction other than a branch on it; a mask joined with numbers
+    // ([`super::mask_joins`]).
+    if !x.native.wave64 {
+        let scc = super::mask_scc()
+            && insts().any(|i| {
+                !matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                    && i.reads
+                        .iter()
+                        .any(|(r, v)| *r == Reg::Scc && x.st.scc_some.contains_key(v))
+            });
+        let joins = super::mask_joins()
+            && x.p.blocks.iter().flat_map(|b| &b.phis).any(|phi| {
+                !x.st.masks.contains_key(&phi.value)
+                    && phi.args.iter().any(|a| x.st.masks.contains_key(a))
+            });
+        if scc || joins {
+            return true;
+        }
     }
     let whens = x.st.exits.iter().filter_map(|e| match *e {
         LaneExit::Branch { when, .. } => Some(when),
@@ -11939,6 +11946,23 @@ impl<'a> Lower<'a> {
                 };
                 let x = match (got, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    // A lane mask joined with numbers ([`super::mask_joins`]):
+                    // the mask comes as the number it is, its ballot where it
+                    // is written (DexNom 570a941).
+                    (Some(Val::Missing(_)) | None, false)
+                        if super::mask_joins()
+                            && self.console_lanes
+                            && self.halves.is_none()
+                            && self.mask_data == MaskData::Console
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg))
+                            && read(self) =>
+                    {
+                        match self.mask_dword(arg) {
+                            Ok(x) => x,
+                            Err(why) => return Err(Stop::Retry(phi.value, why)),
+                        }
+                    }
                     (Some(Val::Bit(_)), false) if read(self) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
