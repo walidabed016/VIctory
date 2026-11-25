@@ -1448,7 +1448,6 @@ impl HostList {
         t.untimed += notes.len().saturating_sub(NOTED) as u64;
         let (&start, &end) = (stamps.first()?, stamps.last()?);
         let first = prelude.map_or(start, |p| p[0]);
-        t.inside += ms(end.saturating_sub(first));
         t.prelude += prelude.map_or(0.0, |[from, to]| ms(to.saturating_sub(from)));
         t.lead += ms(stamps[1].saturating_sub(start));
         for (s, (note, _)) in stamps
