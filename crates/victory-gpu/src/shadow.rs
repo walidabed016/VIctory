@@ -168,6 +168,8 @@ struct Was<'a> {
     kept: &'a BTreeMap<usize, Vec<u8>>,
     armed: &'a [(usize, usize, u64)],
     start: usize,
+    /// Title blocks in which shaders changed no word ([`unchanged`]).
+    unchanged: &'a std::collections::HashSet<usize>,
 }
 
 enum Before<'a> {
@@ -696,9 +698,14 @@ impl Shadow {
     /// shares the big GPU heap with what shaders write), and putting back the
     /// copy's older bytes there broke the title's own records (a fence list
     /// read as -1, title+0x4e9b54a). Each byte is compared once however many
-    /// declared ranges hold it (the world's overlap dozens of times).
-    /// Returns the bytes written.
-    pub(crate) fn copy_back(&self, declared: &[(usize, usize)]) -> usize {
+    /// declared ranges hold it (the world's overlap dozens of times), except
+    /// in the title blocks a compare on the GPU found `unchanged`. Returns
+    /// the bytes written.
+    pub(crate) fn copy_back(
+        &self,
+        declared: &[(usize, usize)],
+        unchanged: &std::collections::HashSet<usize>,
+    ) -> usize {
         let merged = self.merged(declared);
         let start = self.start as usize;
         if self.in_place {
@@ -717,6 +724,7 @@ impl Shadow {
             kept: &kept,
             armed: &armed,
             start,
+            unchanged,
         };
         let mut written = 0;
         for (from, to) in merged {
@@ -773,6 +781,10 @@ impl Shadow {
             let mut seen = None;
             part.filter(|&i| {
                 let (at, host, n) = pieces[i];
+                if was.unchanged.contains(&((start + at) / PAGE)) {
+                    crate::host::TWINS[4].fetch_add(n as u64, Ordering::Relaxed);
+                    return false;
+                }
                 // SAFETY: inside the copy's memory, which the GPU is done
                 // with; only this thread writes it.
                 let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
@@ -2045,6 +2057,23 @@ pub(crate) fn twin_compare_on() -> bool {
     })
 }
 
+/// Whether copy-back skips the 64 KiB blocks of title memory in which
+/// [`compare_twins`] found no word shaders changed: the compare notes each
+/// block where one changed ([`unchanged`]). `VICTORY_NO_TWIN_SKIP` turns it
+/// off.
+pub(crate) fn twin_skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_TWIN_SKIP").is_none();
+        if !on {
+            tracing::info!(
+                "copy-back compares every block shaders may write (VICTORY_NO_TWIN_SKIP)"
+            );
+        }
+        on
+    })
+}
+
 /// A twin's range a submission's shaders write, kept before it runs
 /// ([`snapshot_twins`]): the GPU addresses of the twin's bytes, of the
 /// kept bytes and of the host copy's, and the length, a multiple of 4.
@@ -2053,7 +2082,25 @@ pub(crate) struct Compare {
     kept: u64,
     host: u64,
     bytes: u64,
+    /// The title address of the range's first byte.
+    title: usize,
+    /// The copy of `back` the range is in.
+    of: usize,
+    /// Where the compare notes the range's blocks in [`NOTES`]: the GPU
+    /// address and index of the first one's word.
+    notes: Option<(u64, usize)>,
 }
+
+/// System memory where the compare notes the 64 KiB blocks of title memory
+/// it found a changed word in, a word per block: the buffer, its GPU
+/// address, its mapping and its words.
+struct Notes(Option<(ID3D12Resource, u64, usize, usize)>);
+
+// SAFETY: D3D12 resources are free-threaded; the mapping is written and
+// read only by the submitting thread, around the submission.
+unsafe impl Send for Notes {}
+
+static NOTES: Mutex<Notes> = Mutex::new(Notes(None));
 
 /// VRAM the twins' ranges are kept in before a submission: the buffer,
 /// its GPU address and size.
@@ -2085,11 +2132,11 @@ pub(crate) fn snapshot_twins(
         return None;
     }
     // The buffer and offset of each range's twin bytes, its twin's and host
-    // copy's GPU addresses, and its length.
-    let mut ranges: Vec<(ID3D12Resource, u64, u64, u64, u64)> = Vec::new();
+    // copy's GPU addresses, its length, title address and copy.
+    let mut ranges: Vec<(ID3D12Resource, u64, u64, u64, u64, usize, usize)> = Vec::new();
     let m = mirror_state();
     let w = WINDOW as usize;
-    for (s, declared) in back {
+    for (of, (s, declared)) in back.iter().enumerate() {
         let Some(twin) = &s.twin else {
             continue;
         };
@@ -2108,8 +2155,9 @@ pub(crate) fn snapshot_twins(
                 if to as u64 > width {
                     return None;
                 }
+                let title = start + from;
                 let (from, len) = (from as u64, (to - from) as u64);
-                ranges.push((twin.clone(), from, gpu + from, host + from, len));
+                ranges.push((twin.clone(), from, gpu + from, host + from, len, title, of));
                 continue;
             }
             let (mut at, end) = (start + from, start + to);
@@ -2128,7 +2176,8 @@ pub(crate) fn snapshot_twins(
                             m.heaps[h].1.GetGPUVirtualAddress(),
                         )
                     };
-                    ranges.push((vram.clone(), o, gpu + o, host + to, (next - at) as u64));
+                    let len = (next - at) as u64;
+                    ranges.push((vram.clone(), o, gpu + o, host + to, len, at, of));
                 }
                 at = next;
             }
@@ -2157,9 +2206,12 @@ pub(crate) fn snapshot_twins(
         keep.0 = Some((buffer, gpu, size));
     }
     let (kept, gpu, _) = keep.0.as_ref()?;
-    let mut at = 0;
+    let blocks = |title: usize, bytes: u64| (title + bytes as usize - 1) / PAGE - title / PAGE + 1;
+    let words: usize = ranges.iter().map(|r| blocks(r.5, r.4)).sum();
+    let notes = twin_skip_on().then(|| notes(words)).flatten();
+    let (mut at, mut word) = (0, 0);
     let mut compares = Vec::with_capacity(ranges.len());
-    for (source, offset, twin, host, bytes) in ranges {
+    for (source, offset, twin, host, bytes, title, of) in ranges {
         // SAFETY: an open list; both buffers hold the range.
         unsafe { list.CopyBufferRegion(kept, at, &source, offset, bytes) };
         compares.push(Compare {
@@ -2167,10 +2219,67 @@ pub(crate) fn snapshot_twins(
             kept: gpu + at,
             host,
             bytes,
+            title,
+            of,
+            notes: notes.map(|gpu| (gpu + 4 * word as u64, word)),
         });
         at += bytes.next_multiple_of(256);
+        word += blocks(title, bytes);
     }
     Some(compares)
+}
+
+/// The GPU address of [`NOTES`] with `words` words cleared, made or grown
+/// first if needed; none if the host gives no memory for them.
+fn notes(words: usize) -> Option<u64> {
+    let mut notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if notes.0.as_ref().is_none_or(|n| n.3 < words) {
+        // The last submission has run: the smaller buffer can go.
+        notes.0 = None;
+        let len = (4 * words as u64).next_multiple_of(64 << 10);
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || "blocks the twin compare found changed".into());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        notes.0 = Some((buffer, gpu, data as usize, len as usize / 4));
+    }
+    let &(_, gpu, data, _) = notes.0.as_ref()?;
+    // SAFETY: the mapping holds the words; no submission runs.
+    unsafe { std::ptr::write_bytes(data as *mut u32, 0, words) };
+    Some(gpu)
+}
+
+/// After the submission ran with its compare: by copy of `back` (indexed
+/// as [`snapshot_twins`] took it), the 64 KiB blocks of title memory the
+/// compare covered and found no word shaders changed in, which copy-back
+/// skips.
+pub(crate) fn unchanged(
+    compares: &[Compare],
+    copies: usize,
+) -> Vec<std::collections::HashSet<usize>> {
+    let mut covered = vec![std::collections::HashSet::new(); copies];
+    let mut changed = vec![std::collections::HashSet::new(); copies];
+    let notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, data, _)) = notes.0.as_ref() else {
+        return covered;
+    };
+    for c in compares {
+        let Some((_, word)) = c.notes else {
+            continue;
+        };
+        let first = c.title / PAGE;
+        for (k, block) in (first..=(c.title + c.bytes as usize - 1) / PAGE).enumerate() {
+            covered[c.of].insert(block);
+            // SAFETY: the notes' mapping, which the finished compare wrote.
+            if unsafe { (data as *const u32).add(word + k).read_volatile() } != 0 {
+                changed[c.of].insert(block);
+            }
+        }
+    }
+    for (covered, changed) in covered.iter_mut().zip(&changed) {
+        covered.retain(|b| !changed.contains(b));
+    }
+    covered
 }
 
 /// After a submission ran: records into `list` the compares of the twins'
@@ -2192,14 +2301,16 @@ pub(crate) fn compare_twins(list: &ID3D12GraphicsCommandList, compares: &[Compar
     let mut bytes = 0;
     for c in compares {
         let groups = c.bytes.div_ceil(16 * 64).min(65535) as u32;
-        let constants = [c.bytes as u32, 64 * groups];
+        let first = (c.title % PAGE) as u32;
+        let constants = [c.bytes as u32, 64 * groups, first, c.notes.is_some().into()];
         // SAFETY: an open list; the addresses hold the range, the twin's and
-        // the kept bytes in VRAM.
+        // the kept bytes in VRAM, and its blocks' notes (unused without).
         unsafe {
             list.SetComputeRootShaderResourceView(0, c.twin);
             list.SetComputeRootShaderResourceView(1, c.kept);
             list.SetComputeRootUnorderedAccessView(2, c.host);
-            list.SetComputeRoot32BitConstants(3, 2, constants.as_ptr().cast(), 0);
+            list.SetComputeRootUnorderedAccessView(3, c.notes.map_or(c.host, |n| n.0));
+            list.SetComputeRoot32BitConstants(4, 4, constants.as_ptr().cast(), 0);
             list.Dispatch(groups, 1, 1);
         }
         bytes += c.bytes;
@@ -2209,29 +2320,38 @@ pub(crate) fn compare_twins(list: &ID3D12GraphicsCommandList, compares: &[Compar
 
 /// The compare of [`compare_twins`]: each thread takes 16 bytes at a time,
 /// and stores only the words that changed, one at a time (16-byte stores
-/// to system memory run at ~0.08 GB/s, 4-byte ones at ~13).
+/// to system memory run at ~0.08 GB/s, 4-byte ones at ~13). With `noting`
+/// it notes the 64 KiB blocks of title memory (`first`: the range's offset
+/// in its first) the 16 bytes lie in where one changed.
 const COMPARE: &str = r#"
-#define RS "SRV(t0), SRV(t1), UAV(u0), RootConstants(num32BitConstants=2, b0)"
-cbuffer Range : register(b0) { uint bytes; uint threads; };
+#define RS "SRV(t0), SRV(t1), UAV(u0), UAV(u1), RootConstants(num32BitConstants=4, b0)"
+cbuffer Range : register(b0) { uint bytes; uint threads; uint first; uint noting; };
 ByteAddressBuffer twin : register(t0);
 ByteAddressBuffer kept : register(t1);
 RWByteAddressBuffer host : register(u0);
+RWByteAddressBuffer notes : register(u1);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     for (uint at = id.x * 16; at < bytes; at += threads * 16) {
+        bool changed = false;
         if (at + 16 <= bytes) {
             uint4 now = twin.Load4(at);
             uint4 was = kept.Load4(at);
-            if (now.x != was.x) host.Store(at, now.x);
-            if (now.y != was.y) host.Store(at + 4, now.y);
-            if (now.z != was.z) host.Store(at + 8, now.z);
-            if (now.w != was.w) host.Store(at + 12, now.w);
+            if (now.x != was.x) { host.Store(at, now.x); changed = true; }
+            if (now.y != was.y) { host.Store(at + 4, now.y); changed = true; }
+            if (now.z != was.z) { host.Store(at + 8, now.z); changed = true; }
+            if (now.w != was.w) { host.Store(at + 12, now.w); changed = true; }
         } else {
             for (uint w = at; w < bytes; w += 4) {
                 uint now = twin.Load(w);
-                if (now != kept.Load(w)) host.Store(w, now);
+                if (now != kept.Load(w)) { host.Store(w, now); changed = true; }
             }
+        }
+        if (changed && noting != 0) {
+            uint a = (first + at) >> 16, b = (first + min(at + 16, bytes) - 1) >> 16;
+            notes.Store(a * 4, 1);
+            if (b != a) notes.Store(b * 4, 1);
         }
     }
 }
@@ -2904,7 +3024,7 @@ pub(crate) mod tests {
             // SAFETY: inside the copy's memory.
             unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
         }
-        assert_eq!(s.copy_back(&declared), 2 * (64 << 10));
+        assert_eq!(s.copy_back(&declared, &Default::default()), 2 * (64 << 10));
         for w in written_at {
             // SAFETY: our test memory.
             assert_eq!(unsafe { (w as *const u32).read() }, 0xfeed);
@@ -2958,7 +3078,7 @@ pub(crate) mod tests {
             // SAFETY: as above.
             unsafe { (w as *mut u32).write(7) };
         }
-        assert_eq!(s.copy_back(&declared), 4 * (64 << 10));
+        assert_eq!(s.copy_back(&declared, &Default::default()), 4 * (64 << 10));
         crate::watch::disarm();
         // SAFETY: our views.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -3046,7 +3166,7 @@ pub(crate) mod tests {
             ((title - x + y) as *mut u32).write(7);
             s.host_at(gpu - x, 4).cast::<u32>().write(0xfeed);
         }
-        s.copy_back(&declared);
+        s.copy_back(&declared, &Default::default());
         crate::watch::disarm();
         // SAFETY: our view.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -3107,9 +3227,9 @@ pub(crate) mod tests {
             };
         }
         crate::watch::forget_asked();
-        a.copy_back(&da);
+        a.copy_back(&da, &Default::default());
         crate::watch::forget_asked();
-        b.copy_back(&db);
+        b.copy_back(&db, &Default::default());
         crate::watch::disarm();
         // SAFETY: our view.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -3156,7 +3276,7 @@ pub(crate) mod tests {
         *BEFORE_ASKING.lock().unwrap() =
             Some(Box::new(move || unsafe { ((x + 8) as *mut u32).write(7) }));
         crate::watch::forget_asked();
-        s.copy_back(&declared);
+        s.copy_back(&declared, &Default::default());
         crate::watch::disarm();
         // The next submission: the GPU writes elsewhere.
         crate::watch::forget_asked();
@@ -3170,7 +3290,7 @@ pub(crate) mod tests {
         // SAFETY: inside the copy's memory.
         unsafe { s.host_at(y - at, 4).cast::<u32>().write(0xbeef) };
         crate::watch::forget_asked();
-        s.copy_back(&declared);
+        s.copy_back(&declared, &Default::default());
         crate::watch::disarm();
         assert_eq!(read(x + 8), 7, "the title's write was undone");
         assert_eq!((read(x), read(y)), (0xfeed, 0xbeef));
@@ -3218,7 +3338,7 @@ pub(crate) mod tests {
         *BEFORE_WRITING.lock().unwrap() =
             Some(Box::new(move || unsafe { ((x + 64) as *mut u32).write(7) }));
         crate::watch::forget_asked();
-        assert_eq!(s.copy_back(&declared), 64 << 10);
+        assert_eq!(s.copy_back(&declared, &Default::default()), 64 << 10);
         // SAFETY: as above.
         let read = |w: usize| unsafe { (w as *const u32).read() };
         assert_eq!(read(x + 64), 7, "the title's write was undone");
@@ -3254,7 +3374,7 @@ pub(crate) mod tests {
             unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
         }
         crate::watch::forget_asked();
-        assert_eq!(s.copy_back(&declared), 64 << 10);
+        assert_eq!(s.copy_back(&declared, &Default::default()), 64 << 10);
         crate::watch::disarm();
         // SAFETY: our views.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -3344,6 +3464,82 @@ pub(crate) mod tests {
         }
         drop((buffer, slab));
         unregister(usize::MAX - 14, at as u64);
+        release(at);
+    }
+
+    /// With the compare's notes, copy-back skips the title blocks in which
+    /// shaders changed no word, and not one whose only changed word lies in
+    /// 16 bytes the compare read with the block before it.
+    #[test]
+    fn copy_back_skips_blocks_the_compare_found_unchanged() {
+        let _serial = crate::watch::serial();
+        if !gpu() || !twins_on() {
+            return;
+        }
+        let host = host().unwrap();
+        let at = title_memory(506, 256 * MIB, 32 * MIB, 32 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 19, at as u64, 512 << 10);
+        let s = find(at as u64, 512 << 10).unwrap();
+        assert!(s.twin.is_some() && !s.mirror() && at.is_multiple_of(PAGE));
+        let scratch = vram_buffer(64 << 10).unwrap();
+        let list = host.new_list().unwrap();
+        // Shaders may write 256 KiB from 4 bytes into the first block: the
+        // compare's 16-byte reads straddle the blocks' ends.
+        s.refresh(&list, at as u64, (256 << 10) + 4);
+        s.gpu_writes(&list, at as u64 + 4, 256 << 10);
+        let (twin, o) = (s.resource(), s.offset(at as u64));
+        // The GPU writes the first word of the second block, and 4 KiB of
+        // the third, with the first block's words.
+        let (one, two) = (at + PAGE, at + 2 * PAGE + 4096);
+        // SAFETY: an open list; our buffers, the ranges inside them.
+        unsafe {
+            list.list.CopyBufferRegion(&scratch, 0, twin, o, 4096);
+            list.list.ResourceBarrier(&[
+                crate::host::transition(
+                    twin,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+                crate::host::transition(
+                    &scratch,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+            ]);
+            list.list
+                .CopyBufferRegion(twin, o + PAGE as u64, &scratch, 0, 4);
+            list.list
+                .CopyBufferRegion(twin, s.offset(two as u64), &scratch, 0, 4096);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &scratch,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+        }
+        list.close();
+        let skipped = || crate::host::TWINS[4].load(Ordering::Relaxed);
+        let before = skipped();
+        host.execute(&[&list]);
+        list.reset();
+        let skipped = skipped() - before;
+        // The fourth block, and the fifth's 4 bytes.
+        if twin_compare_on() && twin_skip_on() {
+            assert!(skipped >= PAGE as u64, "{skipped} bytes skipped");
+        } else {
+            assert_eq!(skipped, 0);
+        }
+        // SAFETY: our test memory.
+        let read = |w: usize| unsafe { (w as *const u32).read() };
+        assert_eq!(read(one), word(at), "the second block's first word");
+        for w in (0..4096).step_by(4) {
+            assert_eq!(read(two + w), word(at + w), "at {:#x}", two + w);
+        }
+        for w in (at + 3 * PAGE..at + 4 * PAGE).step_by(4) {
+            assert_eq!(read(w), word(w), "at {w:#x}");
+        }
+        drop(s);
+        unregister(usize::MAX - 19, at as u64);
         release(at);
     }
 
@@ -3460,7 +3656,7 @@ pub(crate) mod tests {
         let host = s.host_at(at - s.start as usize, 4);
         // SAFETY: a placed window of the copy.
         unsafe { host.cast::<u32>().write(0xfeed) };
-        let written = s.copy_back(&ranges);
+        let written = s.copy_back(&ranges, &Default::default());
         assert_eq!(written, 64 << 10);
         // SAFETY: committed test memory.
         assert_eq!(unsafe { (at as *const u32).read() }, 0xfeed);

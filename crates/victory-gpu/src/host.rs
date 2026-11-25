@@ -80,10 +80,10 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 
 /// With VRAM twins ([`crate::shadow::twins_on`]): microseconds recording
 /// the copies around submissions, bytes copied into the twins, bytes
-/// compared on the GPU and bytes copied out of them whole, since the last
-/// frame-rate line.
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// compared on the GPU, bytes copied out of them whole and bytes copy-back
+/// skipped as unchanged, since the last frame-rate line.
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -1006,6 +1006,7 @@ impl Host {
         // In the submission's run: what the CPU wrote into host copies goes
         // to their twins first, and what shaders wrote comes down after.
         let (mut twins_before, mut twins_after) = (Vec::new(), None);
+        let mut compares = None;
         if crate::shadow::twins_on() && !runs.is_empty() {
             let recording = std::time::Instant::now();
             for list in runs {
@@ -1015,7 +1016,7 @@ impl Host {
                     }
                 }
             }
-            let (mut up, mut compares, mut compared, mut down) = (0, None, 0, 0);
+            let (mut up, mut compared, mut down) = (0, 0, 0);
             twins_before.extend(self.twin_list(0, |l| {
                 up = crate::shadow::upload_twins(l);
                 up
@@ -1038,6 +1039,8 @@ impl Host {
                     down
                 }
             });
+            // Copy-back skips blocks only by a compare that runs.
+            compares = compares.filter(|_| twins_after.is_some());
             let spent = recording.elapsed().as_micros() as u64;
             for (n, counter) in [spent, up, compared, down].into_iter().zip(&TWINS) {
                 counter.fetch_add(n, Ordering::Relaxed);
@@ -1137,9 +1140,13 @@ impl Host {
         let copying = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let _charged = crate::copystat::charge(crate::copystat::Caller::CopyBack);
-        for (shadow, declared) in &back {
+        let unchanged = match &compares {
+            Some(compares) => crate::shadow::unchanged(compares, back.len()),
+            None => vec![std::collections::HashSet::new(); back.len()],
+        };
+        for ((shadow, declared), unchanged) in back.iter().zip(&unchanged) {
             crate::watch::forget_asked();
-            let written = shadow.copy_back(declared);
+            let written = shadow.copy_back(declared, unchanged);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             crate::shadow::touched(shadow);
         }
@@ -2361,13 +2368,14 @@ impl Meter {
                  {waited:.1} ms/frame waiting for them) and {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
-            let [ms, up, compared, down] = [0, 1, 2, 3].map(|i| {
+            let [ms, up, compared, down, skipped] = [0, 1, 2, 3, 4].map(|i| {
                 TWINS[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i.min(1)] / frames
             });
             if crate::shadow::twins_on() {
                 tracing::info!(
                     "VRAM twins per frame: {ms:.1} ms recording; {up:.1} MB copied up, \
-                     {compared:.1} MB compared on the GPU, {down:.1} MB copied down whole"
+                     {compared:.1} MB compared on the GPU, {down:.1} MB copied down whole; \
+                     copy-back skipped {skipped:.1} MB unchanged"
                 );
             }
             #[cfg(feature = "diagnostics")]
