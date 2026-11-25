@@ -782,23 +782,24 @@ impl Step {
     /// do after them, also what they read. Refreshes wait in
     /// [`Batch::flush`]; host work writes the list's own memory.
     fn wait_in_flight(&self) {
+        use crate::pipelined::Writer;
         if !crate::pipelined::on() {
             return;
         }
         match self {
             &Step::Copy(dst, src, len) => {
-                crate::pipelined::wait_writes(src, src + len);
+                crate::pipelined::wait_writes(src, src + len, Writer::TitleCopy);
                 crate::pipelined::wait_reads(dst, dst + len);
             }
-            &Step::Fill(_, src, len) => crate::pipelined::wait_writes(src, src + len),
+            &Step::Fill(_, src, len) => crate::pipelined::wait_writes(src, src + len, Writer::Fill),
             Step::Run(_) => crate::pipelined::wait_all(),
             &Step::GpuWrite(_, address, len) => {
                 // Its snapshot is taken now, on the CPU.
-                crate::pipelined::wait_writes(address, address + len);
+                crate::pipelined::wait_writes(address, address + len, Writer::Snapshot);
             }
             Step::Texture(staging) => {
                 let (from, to) = staging.memory();
-                crate::pipelined::wait_writes(from, to);
+                crate::pipelined::wait_writes(from, to, Writer::Texture);
             }
             Step::Refresh(..) | Step::Host(_) => {}
         }
@@ -2281,7 +2282,7 @@ impl Batch {
             let asking = crate::watch::asking();
             let mut copied = 0;
             for (a, b) in self.stale(&shadow, from, to) {
-                crate::pipelined::wait_writes(a, b);
+                crate::pipelined::wait_writes(a, b, crate::pipelined::Writer::Refresh);
                 let n = shadow.update(a, b - a);
                 #[cfg(feature = "diagnostics")]
                 if n > 0 {

@@ -67,10 +67,41 @@ struct Flight {
 enum Why {
     Depth,
     List,
-    Writes,
+    Writes(Writer),
     Reads,
     All,
     Signal,
+}
+
+impl Why {
+    /// Its waits in [`State::waits`]: those for memory shaders write by
+    /// the step that waited, after the others.
+    fn index(self) -> usize {
+        match self {
+            Why::Depth => 0,
+            Why::List => 1,
+            Why::Reads => 2,
+            Why::All => 3,
+            Why::Signal => 4,
+            Why::Writes(by) => 5 + by as usize,
+        }
+    }
+}
+
+/// The step of a submission's preparation that waits for memory shaders
+/// write ([`wait_writes`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Writer {
+    /// A refresh of a host copy.
+    Refresh,
+    /// A snapshot of a host copy its shaders write.
+    Snapshot,
+    /// A fill of upload memory.
+    Fill,
+    /// A title copy's source.
+    TitleCopy,
+    /// A texture's detiling.
+    Texture,
 }
 
 struct State {
@@ -80,8 +111,8 @@ struct State {
     done: u64,
     launched: u64,
     deferred: u64,
-    /// Per [`Why`]: waits and time waited.
-    waits: [(u64, Duration); 6],
+    /// Per [`Why::index`]: waits and time waited.
+    waits: [(u64, Duration); 10],
 }
 
 /// Completes a submission, given when the one before it completed.
@@ -106,7 +137,7 @@ impl Pipeline {
                 done: 0,
                 launched: 0,
                 deferred: 0,
-                waits: [(0, Duration::ZERO); 6],
+                waits: [(0, Duration::ZERO); 10],
             }),
             completed: Condvar::new(),
             jobs: OnceLock::new(),
@@ -129,7 +160,7 @@ impl Pipeline {
             .completed
             .wait_while(s, |s| s.done < seq)
             .unwrap_or_else(|e| e.into_inner());
-        let w = &mut s.waits[why as usize];
+        let w = &mut s.waits[why.index()];
         (w.0, w.1) = (w.0 + 1, w.1 + started.elapsed());
         s
     }
@@ -300,9 +331,9 @@ pub(crate) fn launch(
 
 /// Before preparation reads or writes title memory `[from, to)`: waits
 /// until no submission in flight writes it (its copy-back is done).
-pub(crate) fn wait_writes(from: usize, to: usize) {
+pub(crate) fn wait_writes(from: usize, to: usize, by: Writer) {
     if on() {
-        PIPELINE.wait_for(Why::Writes, |f| overlaps(&f.writes, from, to));
+        PIPELINE.wait_for(Why::Writes(by), |f| overlaps(&f.writes, from, to));
     }
 }
 
@@ -352,30 +383,53 @@ pub(crate) fn log(frames: f64) {
     let (launched, deferred, waits) = {
         let mut s = PIPELINE.lock();
         let counts = (s.launched, s.deferred, s.waits);
-        (s.launched, s.deferred, s.waits) = (0, 0, [(0, Duration::ZERO); 6]);
+        (s.launched, s.deferred, s.waits) = (0, 0, [(0, Duration::ZERO); 10]);
         counts
     };
     let f = frames.max(1.0);
     let w = waits.map(|(n, t)| (n as f64 / f, t.as_secs_f64() * 1e3 / f));
+    let by = |writer: Writer| w[Why::Writes(writer).index()];
+    let writes = [
+        Writer::Refresh,
+        Writer::Snapshot,
+        Writer::Fill,
+        Writer::TitleCopy,
+        Writer::Texture,
+    ]
+    .map(by);
+    let all_writes = writes
+        .iter()
+        .fold((0.0, 0.0), |a, w| (a.0 + w.0, a.1 + w.1));
     tracing::info!(
         "pipelined submissions per frame: {:.1}, {:.1} fence signals deferred; title threads \
          waited (times, ms) for room {:.1} {:.1}, for their lists {:.1} {:.1}, for memory \
-         shaders write {:.1} {:.1}, for memory read {:.1} {:.1}, for all {:.1} {:.1}, for \
-         fences {:.1} {:.1}",
+         shaders write {:.1} {:.1} (refreshes {:.1} {:.1}, snapshots {:.1} {:.1}, fills {:.1} \
+         {:.1}, title copies {:.1} {:.1}, textures {:.1} {:.1}), for memory read {:.1} {:.1}, \
+         for all {:.1} {:.1}, for fences {:.1} {:.1}",
         launched as f64 / f,
         deferred as f64 / f,
-        w[Why::Depth as usize].0,
-        w[Why::Depth as usize].1,
-        w[Why::List as usize].0,
-        w[Why::List as usize].1,
-        w[Why::Writes as usize].0,
-        w[Why::Writes as usize].1,
-        w[Why::Reads as usize].0,
-        w[Why::Reads as usize].1,
-        w[Why::All as usize].0,
-        w[Why::All as usize].1,
-        w[Why::Signal as usize].0,
-        w[Why::Signal as usize].1,
+        w[Why::Depth.index()].0,
+        w[Why::Depth.index()].1,
+        w[Why::List.index()].0,
+        w[Why::List.index()].1,
+        all_writes.0,
+        all_writes.1,
+        writes[0].0,
+        writes[0].1,
+        writes[1].0,
+        writes[1].1,
+        writes[2].0,
+        writes[2].1,
+        writes[3].0,
+        writes[3].1,
+        writes[4].0,
+        writes[4].1,
+        w[Why::Reads.index()].0,
+        w[Why::Reads.index()].1,
+        w[Why::All.index()].0,
+        w[Why::All.index()].1,
+        w[Why::Signal.index()].0,
+        w[Why::Signal.index()].1,
     );
 }
 
@@ -486,11 +540,12 @@ mod tests {
         let (go, job) = held();
         p.launch(vec![(100, 200)], vec![(300, 400)], vec![7], job);
         let writes = |from, to| move |f: &Flight| overlaps(&f.writes, from, to);
-        p.wait_for(Why::Writes, writes(0, 100));
-        p.wait_for(Why::Writes, writes(300, 400));
+        let why = Why::Writes(Writer::Refresh);
+        p.wait_for(why, writes(0, 100));
+        p.wait_for(why, writes(300, 400));
         p.wait_for(Why::List, |f| f.lists.contains(&8));
-        blocks_until(move || p.wait_for(Why::Writes, writes(150, 160)), go);
-        p.wait_for(Why::Writes, writes(150, 160));
+        blocks_until(move || p.wait_for(why, writes(150, 160)), go);
+        p.wait_for(why, writes(150, 160));
     }
 
     #[test]
