@@ -8,16 +8,16 @@
 //! the title's threads").
 //!
 //! A first use queues the pipeline ahead of those started early and waits
-//! for it within a budget per frame, so the cheap ones (menus, one-off
-//! passes such as a colour-grading bake) are there at once as before; past
-//! the budget, or when no worker takes it at once (all are busy, so it
-//! would not be made in time anyway), a draw or dispatch whose pipeline is
-//! not ready is dropped, as an untranslated one is. Waiting for pipelines
-//! no worker had taken kept run 70's start screen at 1.9 fps for minutes.
+//! for it within a budget of a few milliseconds per frame, so the cheapest
+//! ones are there at once; past the budget a draw or dispatch whose
+//! pipeline is not ready is dropped, as an untranslated one is. A longer
+//! wait is a hitch in the world, and the half second this waited before
+//! kept run 70's start screen at 1.9 fps for minutes.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! shortcut: a pass the title runs only once (a colour-grading bake) whose
+//! pipeline is not made within the budget is lost in a run that has to
+//! compile it. A warm run started it when the title created it and loads it
+//! from the library, and a warm run is what is played.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,7 +110,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+const BUDGET: Duration = Duration::from_millis(4);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -119,9 +119,6 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
-
-/// How long a frame waits for a pipeline no worker has taken.
-const TAKE: Duration = Duration::from_millis(10);
 
 /// Time title threads waited for pipelines, over all frames.
 static WAITED_US: AtomicU64 = AtomicU64::new(0);
@@ -170,8 +167,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left, and past `TAKE` only
-/// while a worker is making it.
+/// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static FRAME_US: AtomicU64 = AtomicU64::new(0);
@@ -183,13 +179,10 @@ fn wait(p: &Pending, frame: u64) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let waited = started.elapsed();
-        let taken = p.taken.load(Ordering::Relaxed);
-        let rest = left.saturating_sub(waited);
-        if rest.is_zero() || (!taken && waited >= TAKE) {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
             break;
         }
-        let rest = if taken { rest } else { rest.min(TAKE - waited) };
         held = done
             .wait_timeout(held, rest)
             .unwrap_or_else(|e| e.into_inner())
@@ -303,15 +296,17 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
-    /// A frame does not spend its budget on a pipeline no worker takes (all
-    /// are busy: it would not be made in time).
+    /// A frame waits for pipelines no longer than its budget, over all its
+    /// waits.
     #[test]
-    fn frames_do_not_wait_for_pipelines_no_worker_takes() {
+    fn frames_wait_at_most_their_budget() {
         let p = Pending::new(Vec::new(), None);
         let started = Instant::now();
-        wait(&p, u64::MAX - 1);
+        for _ in 0..10 {
+            wait(&p, u64::MAX - 1);
+        }
         let waited = started.elapsed();
-        assert!(waited < BUDGET / 2, "waited {waited:?}");
+        assert!(waited < Duration::from_millis(100), "waited {waited:?}");
         assert!(p.made.get().is_none());
     }
 }
