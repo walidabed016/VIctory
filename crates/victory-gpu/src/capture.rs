@@ -426,17 +426,30 @@ type SlotKey = (&'static str, u32, u8, u32, usize);
 static SLOTS: std::sync::Mutex<std::collections::BTreeMap<SlotKey, SlotSeen>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// The lighting family of a pipeline named with its shaders' names
-/// ([`crate::host::named`]): TL_PS or SkyMain.
+/// The family of a pipeline named with its shaders' names
+/// ([`crate::host::named`]): TL_PS, SkyMain, the material tiles' OR, the
+/// first V-buffer resolve, or a deferred textured pixel shader.
 #[cfg(feature = "diagnostics")]
 fn lighting_family(named: &str) -> Option<&'static str> {
     if named.contains("\"TL_PS") {
         Some("TL_PS")
     } else if named.contains("CS_SkyMain") {
         Some("SkyMain")
+    } else if named.contains("CS_MaterialTiles_") {
+        Some("MaterialTiles")
+    } else if named.contains("CS_ResolveToGBufferTiled_0_") {
+        Some("Resolve")
+    } else if named.contains("PS_DeferredTextured") {
+        Some("DeferredTextured")
     } else {
         None
     }
+}
+
+/// Families whose textures are read back after the lighting ones.
+#[cfg(feature = "diagnostics")]
+fn material_family(family: &str) -> bool {
+    matches!(family, "Resolve" | "DeferredTextured")
 }
 
 /// Notes the texture slot `u` a table gives the pipeline being bound
@@ -457,11 +470,19 @@ pub(crate) fn note_slot(view: Option<&crate::descriptor::View>, u: &victory_shad
     let pipeline = crate::descriptor::host::BINDING.get();
     let mut families = FAMILIES.lock().unwrap_or_else(|e| e.into_inner());
     let families = families.get_or_insert_with(Default::default);
-    if let std::collections::hash_map::Entry::Vacant(entry) = families.entry(pipeline) {
+    if !families.contains_key(&pipeline) {
         let Some(p) = crate::pipeline::host_pipeline(pipeline as crate::object::This) else {
             return;
         };
-        entry.insert(lighting_family(&crate::host::named(&p.name)).map(|f| (f, p.name.clone())));
+        let family = lighting_family(&crate::host::named(&p.name));
+        let taken = family == Some("DeferredTextured")
+            && families
+                .values()
+                .any(|f| matches!(f, Some(("DeferredTextured", _))));
+        families.insert(
+            pipeline,
+            family.filter(|_| !taken).map(|f| (f, p.name.clone())),
+        );
     }
     let Some(Some((family, name))) = families.get(&pipeline).cloned() else {
         return;
@@ -488,6 +509,44 @@ pub(crate) fn note_slot(view: Option<&crate::descriptor::View>, u: &victory_shad
         })
         .programs
         .insert(name);
+}
+
+/// (program, depth texture, whether it has an unordered twin, description)
+/// of the unordered views of depth textures in a listed frame.
+#[cfg(feature = "diagnostics")]
+static DEPTH_UAVS: std::sync::Mutex<std::collections::BTreeSet<(String, usize, bool, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Notes the unordered view of a depth texture the bound draw or dispatch
+/// writes in a listed frame, and whether the texture has an unordered twin
+/// (without one, the host view goes to the depth texture itself).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_depth_unordered(resource: crate::object::This) {
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    const ALLOW_DEPTH_STENCIL: i32 = 0x2;
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Flags.0 & ALLOW_DEPTH_STENCIL == 0 {
+        return;
+    }
+    let twin = crate::resource::unordered_twin(resource).is_some();
+    let pipeline = crate::descriptor::host::BINDING.get();
+    let program = crate::pipeline::host_pipeline(pipeline as crate::object::This)
+        .map(|p| crate::host::named(&p.name).to_string())
+        .unwrap_or_default();
+    let description = format!(
+        "{}x{} f{} flags {:#x}",
+        d.Width, d.Height, d.Format.0, d.Flags.0
+    );
+    DEPTH_UAVS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((program, resource as usize, twin, description));
 }
 
 /// Who last wrote a texture: the host GPU in `frame` (`this_frame`, or
@@ -690,6 +749,98 @@ fn texel_hex(w: usize, h: usize, pitch: usize, n: usize, rows: &[u8]) -> Option<
     Some(out.join(" / "))
 }
 
+/// Per `tile` x `tile` square of a texture of 4-byte RGBA8 texels, its
+/// three commonest alpha bytes with their percent ("a:p,a:p", "-" for an
+/// empty square), rows split by " / ".
+#[cfg(feature = "diagnostics")]
+fn alpha_grid(w: usize, h: usize, pitch: usize, rows: &[u8], tile: usize) -> String {
+    let across = w.div_ceil(tile);
+    let mut counts = vec![[0u32; 256]; across * h.div_ceil(tile)];
+    for y in 0..h {
+        let Some(row) = rows.get(y * pitch..y * pitch + w * 4) else {
+            break;
+        };
+        for (x, texel) in row.as_chunks::<4>().0.iter().enumerate() {
+            counts[y / tile * across + x / tile][usize::from(texel[3])] += 1;
+        }
+    }
+    let cell = |c: &[u32; 256]| {
+        let n: u32 = c.iter().sum();
+        let mut top: Vec<(usize, u32)> =
+            c.iter().copied().enumerate().filter(|e| e.1 > 0).collect();
+        top.sort_by_key(|e| std::cmp::Reverse(e.1));
+        if top.is_empty() {
+            return "-".to_owned();
+        }
+        top.iter()
+            .take(3)
+            .map(|(a, k)| format!("{a}:{}", 100 * k / n))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    counts
+        .chunks(across.max(1))
+        .map(|row| row.iter().map(cell).collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// For a texture of `n`-byte unsigned texels: each bit set in any texel,
+/// with where it is set as one hex string per row (the first digit's top
+/// bit is x 0), rows split by " / ".
+#[cfg(feature = "diagnostics")]
+fn bit_rows(w: usize, h: usize, pitch: usize, n: usize, rows: &[u8]) -> Vec<(u32, String)> {
+    let texel = |y: usize, x: usize| {
+        rows.get(y * pitch + x * n..y * pitch + x * n + n)
+            .map_or(0, |b| {
+                b.iter().rev().fold(0u32, |v, &b| v << 8 | u32::from(b))
+            })
+    };
+    let any = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (y, x)))
+        .fold(0, |a, (y, x)| a | texel(y, x));
+    (0..32)
+        .filter(|b| any >> b & 1 == 1)
+        .map(|b| {
+            let row = |y: usize| {
+                (0..w)
+                    .step_by(4)
+                    .map(|x| {
+                        let digit = (0..4).fold(0u32, |d, i| {
+                            d << 1 | u32::from(x + i < w && texel(y, x + i) >> b & 1 == 1)
+                        });
+                        char::from_digit(digit, 16).unwrap_or('?')
+                    })
+                    .collect::<String>()
+            };
+            (b, (0..h).map(row).collect::<Vec<_>>().join(" / "))
+        })
+        .collect()
+}
+
+/// Of a block-compressed texture of `w` x `h` texels: its 4x4 blocks and
+/// how many are all zero bytes; `None` for other formats.
+#[cfg(feature = "diagnostics")]
+fn zero_blocks(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<(u64, u64)> {
+    let size = match format {
+        70..=72 | 79..=81 => 8,
+        73..=78 | 82..=84 | 94..=99 => 16,
+        _ => return None,
+    };
+    let across = w.div_ceil(4);
+    let mut counts = (0, 0);
+    for y in 0..h.div_ceil(4) {
+        let Some(row) = rows.get(y * pitch..y * pitch + across * size) else {
+            break;
+        };
+        for block in row.chunks_exact(size) {
+            counts.0 += 1;
+            counts.1 += u64::from(block.iter().all(|&b| b == 0));
+        }
+    }
+    Some(counts)
+}
+
 /// At the present of a listed frame: logs every texture slot TL_PS and
 /// SkyMain read (one line per slot and resource), who last wrote each
 /// texture, and the shares of its texels that are zero, NaN and infinite.
@@ -707,6 +858,17 @@ fn dump_slots(
     const TEXTURES: usize = 64;
     const BYTES: u64 = 128 << 20;
     const DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
+    let depth = std::mem::take(&mut *DEPTH_UAVS.lock().unwrap_or_else(|e| e.into_inner()));
+    for (program, resource, twin, description) in depth {
+        tracing::info!(
+            frame,
+            program,
+            resource = format_args!("{resource:#x}"),
+            description,
+            twin,
+            "unordered view of a depth texture"
+        );
+    }
     let slots = std::mem::take(&mut *SLOTS.lock().unwrap_or_else(|e| e.into_inner()));
     if slots.is_empty() {
         return;
@@ -714,21 +876,21 @@ fn dump_slots(
     let written = |r: usize| {
         targets.iter().any(|t| t.0 == r) || accesses.iter().any(|(x, w, _)| *x == r && *w)
     };
-    let mut order: Vec<(usize, _, Option<u32>)> = Vec::new();
+    let mut order: Vec<(usize, _, Option<u32>, bool)> = Vec::new();
     for (key, seen) in &slots {
         if let Some(copy) = &seen.copy
             && !order.iter().any(|o| o.0 == key.4)
         {
-            order.push((key.4, copy, seen.format));
+            order.push((key.4, copy, seen.format, material_family(key.0)));
         }
     }
-    order.sort_by_key(|o| written(o.0));
+    order.sort_by_key(|o| (o.3, written(o.0)));
     let started = std::time::Instant::now();
     let mut reads = Vec::new();
     let mut skipped = std::collections::HashMap::new();
     if let Ok(list) = host.new_list() {
         let mut bytes = 0;
-        for &(r, copy, format) in &order {
+        for &(r, copy, format, _) in &order {
             let texture = &copy.texture;
             let mut size = 0;
             // SAFETY: a live resource; the total of its first subresource.
@@ -784,6 +946,7 @@ fn dump_slots(
     }
     let mut values = std::collections::HashMap::new();
     let mut details = std::collections::HashMap::new();
+    let mut extra = std::collections::HashMap::new();
     for (r, buffer, footprint, view_format) in reads {
         if started.elapsed() > DEADLINE {
             skipped.insert(r, "past the 750 ms deadline");
@@ -818,7 +981,17 @@ fn dump_slots(
                 .filter(|_| tile > 0)
                 .map(|s| (tile, tile_grids(&s.1, w.div_ceil(tile))));
             let hex = bytes(host_format).and_then(|n| texel_hex(w, h, pitch, n as usize, rows));
+            let alpha = (tile > 0 && matches!(format, 27..=32 | 87..=93))
+                .then(|| alpha_grid(w, h, pitch, rows, tile));
+            let bits = match (format, bytes(host_format)) {
+                (42 | 57 | 62, Some(n)) if w * h > 256 && w * h <= 16384 => {
+                    bit_rows(w, h, pitch, n as usize, rows)
+                }
+                _ => Vec::new(),
+            };
+            let blocks = zero_blocks(host_format, w, h, pitch, rows);
             buffer.Unmap(0, None);
+            extra.insert(r, (alpha, bits, blocks));
             values.insert(r, (format, stats.map(|s| s.0)));
             if grids.is_some() || hex.is_some() {
                 details.insert(r, (grids, hex));
@@ -852,6 +1025,11 @@ fn dump_slots(
                 uploaded,
             )
         };
+        // SAFETY: a live resource.
+        let mips = seen
+            .copy
+            .as_ref()
+            .map(|c| unsafe { c.texture.GetDesc() }.MipLevels);
         let shares = match values.get(resource) {
             Some((format, Some([n, zero, nan, inf]))) if *n > 0 => {
                 let pc = |c: u64| 100.0 * c as f64 / *n as f64;
@@ -862,7 +1040,13 @@ fn dump_slots(
                     pc(*inf)
                 )
             }
-            Some((format, _)) => format!("f{format}: format not decoded"),
+            Some((format, _)) => match extra.get(resource).and_then(|e| e.2) {
+                Some((n, zero)) if n > 0 => format!(
+                    "f{format}: {n} blocks, all-zero {:.3}%",
+                    100.0 * zero as f64 / n as f64
+                ),
+                _ => format!("f{format}: format not decoded"),
+            },
             None => match skipped.get(resource) {
                 Some(why) => format!("not read: {why}"),
                 None if seen.copy.is_none() => "no host texture".to_owned(),
@@ -880,6 +1064,7 @@ fn dump_slots(
             address = format_args!("{address:#x}+{bytes:#x}"),
             description,
             view_format = ?seen.format,
+            mips = ?mips,
             writer,
             values = shares,
             "lighting program texture slot"
@@ -904,6 +1089,30 @@ fn dump_slots(
                 "lighting program texture slot texels"
             ),
             _ => {}
+        }
+        let Some((alpha, bits, _)) = extra.get(resource) else {
+            continue;
+        };
+        if let Some(alpha) = alpha {
+            tracing::info!(
+                frame,
+                family,
+                register = format_args!("t{register}"),
+                resource = ?r,
+                alpha = alpha.as_str(),
+                "lighting program texture slot alpha"
+            );
+        }
+        for (bit, rows) in bits {
+            tracing::info!(
+                frame,
+                family,
+                register = format_args!("t{register}"),
+                resource = ?r,
+                bit,
+                rows = rows.as_str(),
+                "lighting program texture slot bits"
+            );
         }
     }
     tracing::info!(
@@ -1468,6 +1677,23 @@ mod tests {
             hex.as_deref(),
             Some("00000001 000000cb / 00000000 0000ffff")
         );
+    }
+
+    /// A 5x2 R8 mask prints bit 0 (x 0 and 4 of row 0) and bit 2 (x 3 of
+    /// row 1) as hex rows; of two BC1 blocks one is all zero; a 2x2 tile's
+    /// alpha bytes are three 7s and a 9.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn masks_print_each_bit_and_block_textures_count_zero_blocks() {
+        let mask = [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0];
+        assert_eq!(
+            super::bit_rows(5, 2, 8, 1, &mask),
+            [(0, "88 / 00".to_owned()), (2, "00 / 10".to_owned())]
+        );
+        let blocks = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(super::zero_blocks(71, 8, 4, 16, &blocks), Some((2, 1)));
+        let rgba = [0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 9, 0, 0, 0, 7];
+        assert_eq!(super::alpha_grid(2, 2, 8, &rgba, 2), "7:75,9:25");
     }
 
     /// A write this frame wins; otherwise the later of the GPU's and an
