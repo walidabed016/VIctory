@@ -211,7 +211,19 @@ pub(crate) fn build(
         .map(|&(k, offset, len)| (copies[k].range().0 + offset, len))
         .collect();
     let n = 2 * (pieces.len() as u32 + 1);
-    let first = heap.dynamic(n)?;
+    let Some(first) = heap.dynamic(n) else {
+        static FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let times = FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if times.is_power_of_two() {
+            tracing::warn!(
+                times,
+                views = n,
+                copies = copies.len(),
+                "title memory page table: no dynamic slots for its copies' views (its draws and dispatches dropped)"
+            );
+        }
+        return None;
+    };
     slots.extend([first, n]);
     heap.raw_pair_at(first, None, 0, 0);
     for (p, &(k, offset, len)) in pieces.iter().enumerate() {
