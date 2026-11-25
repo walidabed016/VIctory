@@ -363,6 +363,10 @@ struct Guards {
     pools: Blocks,
     /// The physical pages the runtime's views show.
     shown: Option<Shown>,
+    /// Blocks the runtime is unmapping ([`title_memory_unmapping`]): a copy
+    /// may guard them again meanwhile, but they are neither armed nor
+    /// written in place until it is done.
+    unmapping: Vec<(usize, usize)>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -372,6 +376,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     saved: BTreeMap::new(),
     pools: Blocks(BTreeMap::new()),
     shown: None,
+    unmapping: Vec::new(),
 });
 
 /// The physical pages blocks of the runtime's views show
@@ -408,13 +413,14 @@ impl Shown {
     }
 }
 
-/// Held to read an armed block in place ([`in_place`]) and to arm blocks
-/// ([`arm`]); the runtime's unmappings wait for it, and it for them
+/// Held to read an armed block in place ([`in_place`]) and to write title
+/// memory in place ([`writing_in_place`]); the runtime's unmappings take it
+/// while they change the guard state, before unmapping
 /// ([`title_memory_unmapping`]).
 static MAPPING: RwLock<()> = RwLock::new(());
 
-/// Unmappings done: armed runs read before the latest may hold blocks it
-/// unmapped.
+/// Unmappings begun: armed runs read before the latest may hold blocks it
+/// unmaps.
 static UNMAPPED: AtomicU64 = AtomicU64::new(0);
 
 /// A set of blocks as runs (first, end), apart and in order, so that a
@@ -767,14 +773,14 @@ fn save(g: &mut Guards, from: usize, to: usize) {
 /// the copy took a page, 0 if never), nor saved since an earlier arming of
 /// the submission: guarded again since, the block holds a write its saved
 /// bytes lack, which a copy that took it would put back over the title's
-/// next write (runs 57, 60 and 64). Returns the asking now and the runs
-/// of blocks of the range not armed. Waits for the runtime's unmappings.
+/// next write (runs 57, 60 and 64). Blocks the runtime is unmapping are
+/// not armed. Returns the asking now and the runs of blocks of the range
+/// not armed.
 pub(crate) fn arm(
     start: usize,
     end: usize,
     copied: impl Fn(usize) -> u64,
 ) -> (u64, Vec<(usize, usize)>) {
-    let _mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     let (first, last) = (start.div_ceil(BLOCK), end / BLOCK);
@@ -799,10 +805,13 @@ pub(crate) fn arm(
                     }
                     pages.next();
                 }
-                let current = block < b && !g.saved.contains_key(&block) && {
-                    let taken = copied(page);
-                    taken != 0 && written <= taken
-                };
+                let current = block < b
+                    && !g.saved.contains_key(&block)
+                    && !g.unmapping.iter().any(|&(f, t)| f <= block && block < t)
+                    && {
+                        let taken = copied(page);
+                        taken != 0 && written <= taken
+                    };
                 match (current, run) {
                     (true, None) => run = Some(block),
                     (false, Some(from)) => {
@@ -830,10 +839,11 @@ pub(crate) fn arm(
     (j.asked, loose)
 }
 
-/// `read` of armed block `block` in place, while no unmapping can run;
-/// `None` if it is not armed. `seen` keeps the armed runs from one call
-/// to the next until an unmapping. An unmapping waits for one block's
-/// read, not a whole copy-back's.
+/// `read` of armed block `block` in place, while no unmapping can begin
+/// (blocks being unmapped are not armed); `None` if it is not armed.
+/// `seen` keeps the armed runs from one call to the next until an
+/// unmapping begins. An unmapping waits for one block's read, not a whole
+/// copy-back's.
 pub(crate) fn in_place<T>(
     block: usize,
     seen: &mut Option<(u64, Vec<(usize, usize)>)>,
@@ -909,17 +919,16 @@ pub fn writing(at: usize, len: usize) {
 
 /// Before our own write into title memory `[at, at + len)` from the CPU,
 /// word by word: opens its guarded blocks as [`writing`] does, then runs
-/// `write` while no unmapping can run, telling it whether every block was
-/// guarded until now (so mapped read-write once opened, and stores need no
-/// kernel copy to leave unmapped pages alone).
+/// `write` while no unmapping can begin, telling it whether every block was
+/// guarded until now and none is being unmapped (so mapped read-write once
+/// opened, and stores need no kernel copy to leave unmapped pages alone).
 pub(crate) fn writing_in_place<T>(at: usize, len: usize, write: impl FnOnce(bool) -> T) -> T {
     let _mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
     let ours = {
         let mut g = guards();
-        let ours = g
-            .protected
-            .gaps(at / BLOCK, (at + len).div_ceil(BLOCK))
-            .is_empty();
+        let (from, to) = (at / BLOCK, (at + len).div_ceil(BLOCK));
+        let ours = g.protected.gaps(from, to).is_empty()
+            && !g.unmapping.iter().any(|&(f, t)| f < to && from < t);
         open(&mut g, at, at + len);
         ours
     };
@@ -942,17 +951,26 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// blocks keep what they held, and nothing of the range is guarded or
 /// armed after, though a copy may guard it again while `unmap` runs: a
 /// block left guarded with nothing mapped would be armed and read in place.
-/// Copies reading armed blocks in place and arming wait for it.
+/// While `unmap` runs the range is neither armed nor written in place, so
+/// copies reading armed blocks in place and writing in place wait only for
+/// the guard state to change before it (in run 79, arming spent more than
+/// half its time waiting for unmappings).
 pub fn title_memory_unmapping<R>(at: usize, len: usize, unmap: impl FnOnce() -> R) -> R {
-    let _mapping = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    unguard(&mut guards(), from, to, true);
+    {
+        let _mapping = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+        let mut g = guards();
+        unguard(&mut g, from, to, true);
+        g.unmapping.push((from, to));
+        UNMAPPED.fetch_add(1, Ordering::Relaxed);
+    }
     let unmapped = unmap();
     let mut g = guards();
     unguard(&mut g, from, to, false);
     forget_shown(&mut g, from, to);
-    drop(g);
-    UNMAPPED.fetch_add(1, Ordering::Relaxed);
+    if let Some(i) = g.unmapping.iter().position(|&r| r == (from, to)) {
+        g.unmapping.swap_remove(i);
+    }
     unmapped
 }
 
@@ -1657,6 +1675,78 @@ mod tests {
         // another test given it would read as its own.
         // SAFETY: a reservation of the free range.
         let kept = unsafe { VirtualAlloc(v as *const _, BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!kept.is_null());
+    }
+
+    /// While the runtime unmaps a range, copies wait only for the guard
+    /// state to change before it: blocks of the range that a copy guards
+    /// again meanwhile are not armed, written in place, or read in place.
+    #[test]
+    fn blocks_being_unmapped_are_left_alone_without_waiting() {
+        use std::time::Duration;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_RESERVE, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, PAGE_NOACCESS, UnmapViewOfFile, VirtualAlloc,
+        };
+        let _serial = serial();
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let v = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(v, 0);
+        // SAFETY: our view, not guarded yet.
+        unsafe { std::slice::from_raw_parts_mut(v as *mut u8, 2 * BLOCK).fill(5) };
+        forget_asked();
+        let (now, _) = writes(v, v + 2 * BLOCK, true).expect("view memory");
+        // The first block armed (and saved when the unmapping begins), the
+        // second not.
+        let (_, loose) = arm(v, v + BLOCK, |_| now);
+        assert!(loose.is_empty());
+        let b = v / BLOCK;
+        let mut seen = None;
+        // SAFETY: an armed block, mapped while it is read.
+        let read = || unsafe { (v as *const u8).read() };
+        assert_eq!(in_place(b, &mut seen, read), Some(5));
+        title_memory_unmapping(v, 2 * BLOCK, || {
+            // On another thread, so that waiting for this unmapping fails
+            // the test instead of hanging it.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // A copy asks again before the view goes: guarded again.
+                forget_asked();
+                let (now, _) = writes(v, v + 2 * BLOCK, true).expect("view memory");
+                let (_, loose) = arm(v, v + 2 * BLOCK, |_| now);
+                let ours = writing_in_place(v, 2 * BLOCK, |ours| ours);
+                let read = in_place::<u8>(b, &mut seen, || unreachable!());
+                tx.send((loose, ours, read)).unwrap();
+            });
+            let (loose, ours, read) = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("waited for the unmapping");
+            assert_eq!(loose, vec![(b, b + 2)]);
+            assert!(!ours, "written in place");
+            assert_eq!(read, None);
+            assert!(guards().armed.within(b, b + 2).is_empty());
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
+        });
+        let g = guards();
+        assert!(g.protected.within(b, b + 2).is_empty());
+        assert!(!g.unmapping.contains(&(b, b + 2)));
+        drop(g);
+        // The addresses stay taken: the journal keeps their pages, which
+        // another test given them would read as its own.
+        // SAFETY: a reservation of the free range.
+        let kept = unsafe { VirtualAlloc(v as *const _, 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!kept.is_null());
     }
 
