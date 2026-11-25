@@ -3754,15 +3754,85 @@ fn mirror(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(slab)
 }
 
+/// Whether [`map_windows`] makes its tile mappings with the mirror's lock
+/// held, as it did: `VICTORY_TILE_MAPS_UNDER_LOCK=1`. Under memory
+/// pressure a mapping can wait in the kernel's memory manager, on work the
+/// queue holds behind fences the completion thread signals once copy-back's
+/// deferred steps ran (`crate::pipelined::step_wait`, `gpu_wait`), and
+/// those steps take the lock: runs 156 and 159 stalled for good with the
+/// submitting thread in UpdateTileMappings and the completion thread
+/// waiting for the lock in [`Shadow::pieces`].
+fn maps_under_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TILE_MAPS_UNDER_LOCK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "tile mappings made with the mirror's lock held (VICTORY_TILE_MAPS_UNDER_LOCK)"
+            );
+        }
+        on
+    })
+}
+
+/// Tile mappings of whole windows: regions of `resource` (their first
+/// tiles) each onto a window's tiles in `heap` (from their first).
+struct Remap {
+    resource: ID3D12Resource,
+    heap: ID3D12Heap,
+    at: Vec<D3D12_TILED_RESOURCE_COORDINATE>,
+    from: Vec<u32>,
+}
+
 /// Before a submission runs: maps the tiles of the windows given host
 /// memory since the last call into the slabs that show them (until then the
-/// GPU reads zeros there).
+/// GPU reads zeros there), after the twins' tiles [`Mirror::twin_windows`]
+/// noted. The mappings are gathered under the mirror's lock and made once
+/// it is let go, unless [`maps_under_lock`]; only the submitting thread
+/// maps, so they keep their order on the queue.
 pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
     let mut m = mirror_state();
+    let mut remaps = Vec::new();
     if twins_on() {
         m.twin_windows();
-        map_twins(&mut m, queue);
+        twin_remaps(&mut m, &mut remaps);
     }
+    window_remaps(&mut m, &mut remaps);
+    let _held = maps_under_lock().then_some(m);
+    let tiles = (WINDOW / TILE) as u32;
+    for r in remaps {
+        let n = r.at.len();
+        let sizes = vec![
+            D3D12_TILE_REGION_SIZE {
+                NumTiles: tiles,
+                ..Default::default()
+            };
+            n
+        ];
+        let (counts, flags) = (vec![tiles; n], vec![D3D12_TILE_RANGE_FLAG_NONE; n]);
+        // SAFETY: a reserved buffer and a heap of ours, both held; the
+        // regions lie in the buffer, the ranges in the heap.
+        unsafe {
+            queue.UpdateTileMappings(
+                &r.resource,
+                n as u32,
+                Some(r.at.as_ptr()),
+                Some(sizes.as_ptr()),
+                &r.heap,
+                n as u32,
+                Some(flags.as_ptr()),
+                Some(r.from.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            )
+        };
+    }
+}
+
+/// The windows given host memory since the last call: one mapping per slab
+/// (or its twin, which shows the windows without VRAM of their own as well)
+/// and pool heap.
+fn window_remaps(m: &mut Mirror, remaps: &mut Vec<Remap>) {
     if m.unmapped.is_empty() {
         return;
     }
@@ -3770,8 +3840,6 @@ pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
     pairs.sort_unstable();
     pairs.dedup();
     let tiles = (WINDOW / TILE) as u32;
-    // One call per slab (or its twin, which shows the windows without VRAM
-    // of their own as well) and pool heap: the windows' first tiles in each.
     type Call = (Vec<D3D12_TILED_RESOURCE_COORDINATE>, Vec<u32>);
     let mut calls: BTreeMap<(u64, bool, usize), Call> = BTreeMap::new();
     for (k, w) in pairs {
@@ -3791,40 +3859,21 @@ pub(crate) fn map_windows(queue: &ID3D12CommandQueue) {
     for ((k, onto, heap), (at, from)) in calls {
         let slab = &m.slabs[&k];
         let resource = slab.twin.as_ref().filter(|_| onto).unwrap_or(&slab.buffer);
-        let n = at.len();
-        let sizes = vec![
-            D3D12_TILE_REGION_SIZE {
-                NumTiles: tiles,
-                ..Default::default()
-            };
-            n
-        ];
-        let (counts, flags) = (vec![tiles; n], vec![D3D12_TILE_RANGE_FLAG_NONE; n]);
-        // SAFETY: a reserved buffer and a pool heap of ours; the regions lie
-        // in the buffer, the ranges in the heap.
-        unsafe {
-            queue.UpdateTileMappings(
-                resource,
-                n as u32,
-                Some(at.as_ptr()),
-                Some(sizes.as_ptr()),
-                &m.heaps[heap].0,
-                n as u32,
-                Some(flags.as_ptr()),
-                Some(from.as_ptr()),
-                Some(counts.as_ptr()),
-                D3D12_TILE_MAPPING_FLAG_NONE,
-            )
-        };
+        remaps.push(Remap {
+            resource: resource.clone(),
+            heap: m.heaps[heap].0.clone(),
+            at,
+            from,
+        });
     }
 }
 
 /// The twins' tiles [`Mirror::twin_windows`] noted: each mapped onto its
 /// window's VRAM slot, or back onto its host memory.
-fn map_twins(m: &mut Mirror, queue: &ID3D12CommandQueue) {
+fn twin_remaps(m: &mut Mirror, remaps: &mut Vec<Remap>) {
     let tiles = (WINDOW / TILE) as u32;
     for (k, w, slot) in std::mem::take(&mut m.retile) {
-        let Some(twin) = m.slabs.get(&k).and_then(|s| s.twin.as_ref()) else {
+        let Some(twin) = m.slabs.get(&k).and_then(|s| s.twin.clone()) else {
             continue;
         };
         let (heap, slot) = match (slot, m.windows.get(&w)) {
@@ -3832,30 +3881,15 @@ fn map_twins(m: &mut Mirror, queue: &ID3D12CommandQueue) {
             (None, Some(&(heap, slot))) => (&m.heaps[heap].0, slot),
             (None, None) => continue,
         };
-        let at = D3D12_TILED_RESOURCE_COORDINATE {
-            X: ((w * WINDOW - k * SLAB) / TILE) as u32,
-            ..Default::default()
-        };
-        let size = D3D12_TILE_REGION_SIZE {
-            NumTiles: tiles,
-            ..Default::default()
-        };
-        // SAFETY: a reserved buffer and a heap of ours; the region lies in
-        // the buffer, the range in the heap.
-        unsafe {
-            queue.UpdateTileMappings(
-                twin,
-                1,
-                Some(&at),
-                Some(&size),
-                heap,
-                1,
-                Some(&D3D12_TILE_RANGE_FLAG_NONE),
-                Some(&(slot * tiles)),
-                Some(&tiles),
-                D3D12_TILE_MAPPING_FLAG_NONE,
-            )
-        };
+        remaps.push(Remap {
+            resource: twin,
+            heap: heap.clone(),
+            at: vec![D3D12_TILED_RESOURCE_COORDINATE {
+                X: ((w * WINDOW - k * SLAB) / TILE) as u32,
+                ..Default::default()
+            }],
+            from: vec![slot * tiles],
+        });
     }
 }
 
