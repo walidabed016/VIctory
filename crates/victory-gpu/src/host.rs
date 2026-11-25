@@ -43,6 +43,10 @@ pub(crate) struct Host {
     /// ([`crate::pipelined::newest_writing`]): the GPU waits on it before
     /// compares that store into host copies a copy-back in flight reads.
     copied: ID3D12Fence,
+    /// How far the steps deferred to submissions' copy-backs have run
+    /// ([`crate::pipelined::step_fence`]): the GPU waits on it before a
+    /// submission that needs them.
+    stepped: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     /// Resources heap slots stopped viewing (see [`Host::retire`]).
@@ -156,6 +160,22 @@ pub(crate) fn copied_back(seq: u64) {
     }
 }
 
+/// Pipelined, with [`crate::pipelined::step_fence`]: the steps deferred to
+/// submissions in flight have run up to `value`; the GPU may run the
+/// submissions that wait for them.
+pub(crate) fn steps_ran(value: u64) {
+    if !crate::pipelined::step_fence() {
+        return;
+    }
+    let Some(host) = host() else {
+        return;
+    };
+    // SAFETY: our fence.
+    if let Err(e) = unsafe { host.stepped.Signal(value) } {
+        tracing::error!(error = %e, value, "deferred steps run not told to the GPU");
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -239,6 +259,7 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let copied: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let stepped: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -260,6 +281,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             copied,
+            stepped,
             submitted: Mutex::new(0),
             retired: Mutex::default(),
             twin_lists: Mutex::default(),
@@ -1614,7 +1636,15 @@ impl Host {
         crate::shadow::snapshot_untold(&back, compares.as_deref());
         // Pipelined: refreshes deferred to copy-backs in flight are done
         // when those complete (`crate::pipelined::defer`); the GPU waits
-        // for them before the copies into twins.
+        // for them before the copies into twins: as they are done
+        // (`crate::pipelined::step_fence`), else for the copy-backs.
+        if let Some(value) = crate::pipelined::step_wait() {
+            // SAFETY: our queue and fence.
+            if let Err(e) = unsafe { self.queue.Wait(&self.stepped, value) } {
+                tracing::warn!(error = %e, "deferred steps waited for on the CPU");
+                crate::pipelined::wait_completed(value >> crate::pipelined::STEP_BITS);
+            }
+        }
         if let Some(seq) = crate::pipelined::gpu_wait() {
             // SAFETY: our queue and fence.
             if let Err(e) = unsafe { self.queue.Wait(&self.copied, seq) } {

@@ -409,8 +409,11 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     };
     // Pipelined: the runtime remaps memory submissions in flight copy back
-    // into.
-    crate::pipelined::wait_all();
+    // into; with `crate::pipelined::narrow_remaps`, only those wait.
+    let narrow = crate::pipelined::narrow_remaps();
+    if !narrow {
+        crate::pipelined::wait_all();
+    }
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -418,6 +421,20 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    if narrow {
+        let remapped: Vec<(usize, usize)> = batches
+            .into_iter()
+            .flatten()
+            .filter(|b| !b.ranges.is_null())
+            .map(|b| {
+                // SAFETY: each batch holds `count` ranges.
+                let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+                let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
+                (b.destination as usize, (b.destination + len) as usize)
+            })
+            .collect();
+        crate::pipelined::wait_remapped(&remapped);
+    }
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
