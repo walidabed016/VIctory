@@ -966,14 +966,8 @@ impl<'a> Lower<'a> {
 
     /// The bytes past `least` of the address a phi of `block` joins (see
     /// [`Resources::joined`]): each predecessor computes its address's at
-    /// its end, and the join picks one. An edge no lane reading it takes
-    /// gives 0.
-    fn joined_offset(
-        &mut self,
-        block: usize,
-        addresses: &[Option<Address>],
-        least: u32,
-    ) -> Result<V, Why> {
+    /// its end, and the join picks one.
+    fn joined_offset(&mut self, block: usize, addresses: &[Address], least: u32) -> Result<V, Why> {
         let mut incoming = Vec::new();
         for (&q, a) in self.x.p.blocks[block].preds.iter().zip(addresses) {
             if self.block[q].is_none() {
@@ -983,10 +977,6 @@ impl<'a> Lower<'a> {
                 return Err("an address joined by a loop");
             };
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
-            let Some(a) = a else {
-                incoming.push((self.s.m.i32(0), at));
-                continue;
-            };
             let here = std::mem::replace(&mut self.cur, at);
             let mut off = self.s.m.i32(a.offset.wrapping_sub(least));
             let d = a.dynamic.map(|d| self.i32_of(d)).transpose();
@@ -5039,11 +5029,10 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Select { args, .. } | Source::Lanes { args, .. } = src {
+        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
+            src
+        {
             return self.used_kind(args.first()?);
-        }
-        if let Source::Phi { args, .. } = src {
-            return self.used_kind(args.iter().flatten().next()?);
         }
         if let Source::LanePhi { args, .. } = src {
             return args.iter().flatten().find_map(|a| self.used_kind(a));
@@ -5378,8 +5367,7 @@ impl<'a> Lower<'a> {
                 // Each predecessor computes its heap index at its end; the
                 // join picks one with a phi. A phi an edge brings is one of
                 // an earlier join (code paths that merge, then merge again),
-                // which dominates the edge. An edge no lane reading it takes
-                // gives index 0.
+                // which dominates the edge.
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
@@ -5390,15 +5378,14 @@ impl<'a> Lower<'a> {
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let index = match arg {
-                        Some(Source::Loaded { load, first }) => {
+                        Source::Loaded { load, first } => {
                             let here = std::mem::replace(&mut self.cur, at);
                             let index = self.heap_index(*load, *first, sampler);
                             self.cur = here;
                             index?
                         }
-                        Some(arg @ Source::Phi { .. }) => self.heap_slot(arg, sampler)?.0,
-                        Some(_) => return Err("a descriptor chosen by control flow"),
-                        None => self.s.m.i32(0),
+                        Source::Phi { .. } => self.heap_slot(arg, sampler)?.0,
+                        _ => return Err("a descriptor chosen by control flow"),
                     };
                     incoming.push((index, at));
                 }
