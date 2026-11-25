@@ -1424,7 +1424,11 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     // The description's flags, after its alignment, size and format words.
     let writable = resource[12] & UNORDERED != 0;
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let (texture, dropped) = crate::resource::placed_at(address, resource).unzip();
+    let top = match <[u32; 10]>::try_from(&desc[..10]) {
+        Ok(words) if !*unordered => crate::resource::first_mip(&words),
+        _ => 0,
+    };
+    let (texture, dropped) = crate::resource::placed_at(address, resource, top).unzip();
     #[cfg(feature = "diagnostics")]
     if *unordered || texture.is_none() || resource[12] & 0x7 != 0 {
         let program = crate::pipeline::host_pipeline(BINDING.get() as crate::object::This)
