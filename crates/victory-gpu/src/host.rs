@@ -3639,6 +3639,7 @@ impl Meter {
                 crate::pipelining::log(span);
                 crate::pipelined::log(span);
                 log_recycled(span);
+                crate::indirect::log_rings(span, crate::shadow::kept_bytes());
                 log_gpu_memory();
                 let uploaded = crate::texture::UPLOADED
                     .each_ref()

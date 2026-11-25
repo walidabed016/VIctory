@@ -3117,6 +3117,21 @@ fn changed(words: usize, slot: usize) -> Option<u64> {
     Some(c.gpu)
 }
 
+/// The VRAM held keeping twins' ranges for the compare, every slot's
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_bytes() -> u64 {
+    KEEP.iter()
+        .map(|k| {
+            k.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .as_ref()
+                .map_or(0, |k| k.2)
+        })
+        .sum()
+}
+
 /// The host gave no VRAM to keep twins' ranges in: they come down whole.
 static NO_KEEP: AtomicBool = AtomicBool::new(false);
 

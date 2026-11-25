@@ -162,9 +162,57 @@ impl Command {
 const COMMANDS: u32 = 256;
 /// A segment's bytes in its table: the command count, then the commands.
 const SEGMENT: u64 = 8 + COMMANDS as u64 * size_of::<Command>() as u64;
-/// Bytes of a table (upload memory) and of a buffer of clamped records.
+/// Bytes of a table (upload memory).
 const TABLE: u64 = 64 * SEGMENT;
-const RING: u64 = 4 << 20;
+
+/// Bytes of a buffer of clamped records (video memory), at least: 4 MiB,
+/// else `VICTORY_CLAMP_RING_KIB` (64 to 65536). Each host list that
+/// clamps an execution holds one until it is let go of, free lists too: in
+/// runs 155-157 ~100-310 lists were held by submissions in flight, and
+/// with `VICTORY_FREE_LISTS=256` up to ~190 more were kept free.
+fn ring_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let set = std::env::var("VICTORY_CLAMP_RING_KIB").ok();
+        let bytes = ring_bytes_from(set.as_deref());
+        if set.is_some() {
+            tracing::info!(bytes, "clamped records' buffers (VICTORY_CLAMP_RING_KIB)");
+        }
+        bytes
+    })
+}
+
+fn ring_bytes_from(set: Option<&str>) -> u64 {
+    set.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(4 << 20, |kib| kib.clamp(64, 65536) << 10)
+}
+
+/// Clamped records' buffers live and their bytes; since the last frame-rate
+/// line, the list resets after clamped records, the bytes of buffers they
+/// took (whole buffers before the last) and the most one took
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+static RINGS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Logs [`RINGS`] over `frames` frames (diagnostics), with the VRAM that
+/// keeps twins' ranges for the compare (`kept` bytes).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_rings(frames: f64, kept: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [live, bytes] = [&RINGS[0], &RINGS[1]].map(|n| n.load(Relaxed));
+    let [resets, took, most] = [&RINGS[2], &RINGS[3], &RINGS[4]].map(|n| n.swap(0, Relaxed));
+    tracing::info!(
+        "VRAM held per list and slot: {live} clamped records' buffers, {} MiB; per frame {:.1} \
+         list resets after clamps, which took {:.0} KiB on average, at most {} KiB; {} MiB \
+         keeping twins' ranges for the compare",
+        bytes >> 20,
+        resets as f64 / frames.max(1.0),
+        took as f64 / resets.max(1) as f64 / 1024.0,
+        most >> 10,
+        kept >> 20
+    );
+}
 /// Where a fused segment's executions start in its part of the table,
 /// after the count word and the dispatch ([`fused`]).
 const EXECUTIONS: u64 = 32;
@@ -352,6 +400,15 @@ pub(crate) struct Clamps {
 // written by the list's recording thread only.
 unsafe impl Send for Clamps {}
 
+#[cfg(feature = "diagnostics")]
+impl Drop for Clamps {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        RINGS[0].fetch_sub(self.rings.len() as u64, Relaxed);
+        RINGS[1].fetch_sub(self.rings.iter().map(|r| r.1).sum(), Relaxed);
+    }
+}
+
 /// An open segment: its table, where in it, and the commands so far; when
 /// fused ([`fused`]), its views of records and counts and its widest
 /// execution's groups.
@@ -380,6 +437,16 @@ impl Clamps {
 
     /// After the list is reset: everything reused from the start.
     pub(crate) fn reset(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if self.ring < self.rings.len() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let took = self.rings[..self.ring].iter().map(|r| r.1).sum::<u64>() + self.used;
+            if took > 0 {
+                RINGS[2].fetch_add(1, Relaxed);
+                RINGS[3].fetch_add(took, Relaxed);
+                RINGS[4].fetch_max(took, Relaxed);
+            }
+        }
         (self.ring, self.used, self.table, self.table_used, self.open) = (0, 0, 0, 0, None);
         self.reading.iter_mut().for_each(|r| *r = false);
     }
@@ -390,8 +457,13 @@ impl Clamps {
             (self.ring, self.used) = (self.ring + 1, 0);
         }
         if self.ring == self.rings.len() {
-            let size = need.max(RING);
+            let size = need.max(ring_bytes());
             let buffer = default_buffer(size)?;
+            #[cfg(feature = "diagnostics")]
+            {
+                RINGS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RINGS[1].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            }
             crate::host::name(&buffer, || format!("clamped indirect records {size:#x}"));
             self.rings.push((buffer, size));
             self.reading.push(false);
@@ -735,6 +807,15 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamped_records_buffers_are_4_mib_unless_set() {
+        assert_eq!(ring_bytes_from(None), 4 << 20);
+        assert_eq!(ring_bytes_from(Some("x")), 4 << 20);
+        assert_eq!(ring_bytes_from(Some(" 512 ")), 512 << 10);
+        assert_eq!(ring_bytes_from(Some("1")), 64 << 10);
+        assert_eq!(ring_bytes_from(Some("1000000")), 64 << 20);
+    }
 
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
