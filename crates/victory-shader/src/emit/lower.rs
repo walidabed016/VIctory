@@ -1982,7 +1982,7 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
+    /// `f` as an f16 in the low bits, rounded toward zero: DXIL's
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
     fn f16_toward_zero(&mut self, f: V) -> V {
@@ -2002,44 +2002,19 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, away, stepped, h)
     }
 
-    /// `f` as an f16 in the low bits, rounded to nearest even as the
-    /// console's f16 results are (the MODE default), from its bits: DXIL's
-    /// conversion rounds toward zero on the RTX 4090 and WARP, and turns an
-    /// overflow into the largest finite half. A NaN gives a quiet NaN.
+    /// `f` as an f16 in the low bits, rounded to nearest even (an overflow
+    /// to infinity) as the console rounds f16 results (the MODE default):
+    /// DXIL's `fptrunc` to half under native 16-bit types. The RTX 4090
+    /// rounds it so; WARP rounds it toward zero, as both do
+    /// `legacyF32ToF16`, which also turns an overflow into the largest
+    /// finite half.
     fn f16_nearest(&mut self, f: V) -> V {
         let c = self.cur;
-        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
-        let x = self.as_int(f);
-        let (k16, k8000) = (k(self, 16), k(self, 0x8000));
-        let sign = self.s.m.bin(c, Bin::LShr, x, k16);
-        let sign = self.s.m.bin(c, Bin::And, sign, k8000);
-        let abs = k(self, 0x7FFF_FFFF);
-        let a = self.s.m.bin(c, Bin::And, x, abs);
-        // Normal halves: rebiased, 13 bits rounded off, ties to even.
-        let (k13, k1) = (k(self, 13), k(self, 1));
-        let odd = self.s.m.bin(c, Bin::LShr, a, k13);
-        let odd = self.s.m.bin(c, Bin::And, odd, k1);
-        let rebias = k(self, 0x3800_0000 - 0xFFF);
-        let n = self.s.m.bin(c, Bin::Sub, a, rebias);
-        let n = self.s.m.bin(c, Bin::Add, n, odd);
-        let normal = self.s.m.bin(c, Bin::LShr, n, k13);
-        // Below 2^-14: whole 2^-24ths, nearest even.
-        let fa = self.unary(6, f);
-        let scale = self.s.m.f32(0x4B80_0000);
-        let t = self.s.m.bin(c, Bin::Mul, fa, scale);
-        let t = self.unary(26, t);
-        let small = self.s.m.cast(c, Cast::FpToUi, t, self.s.t.i32);
-        let below = k(self, 0x3880_0000);
-        let is_small = self.s.m.cmp(c, pred::IULT, a, below);
-        let m = self.s.m.select(c, is_small, small, normal);
-        // From 65520 on (and infinity): infinity; NaN: a quiet NaN.
-        let (big, inf) = (k(self, 0x477F_F000), k(self, 0x7C00));
-        let is_big = self.s.m.cmp(c, pred::IUGE, a, big);
-        let m = self.s.m.select(c, is_big, inf, m);
-        let (top, qnan) = (k(self, 0x7F80_0000), k(self, 0x7E00));
-        let nan = self.s.m.cmp(c, pred::IUGT, a, top);
-        let m = self.s.m.select(c, nan, qnan, m);
-        self.s.m.bin(c, Bin::Or, sign, m)
+        self.s.flags |= flags::NATIVE_16;
+        let (half, i16t) = (self.s.m.half(), self.s.m.int(16));
+        let h = self.s.m.cast(c, Cast::FpTrunc, f, half);
+        let h = self.s.m.cast(c, Cast::Bitcast, h, i16t);
+        self.s.m.cast(c, Cast::ZExt, h, self.s.t.i32)
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -5721,9 +5696,7 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.f16_nearest(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -5748,9 +5721,7 @@ impl<'a> Lower<'a> {
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.f16_nearest(a);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -6185,8 +6156,7 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h =
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            let h = l.f16_nearest(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -6480,7 +6450,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -6512,8 +6482,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.f16_nearest(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -7238,15 +7207,7 @@ impl<'a> Lower<'a> {
                     };
                     let x = channel(l, row, ch)?;
                     let f = l.as_float(x);
-                    let i32t = l.s.t.i32;
-                    Ok(Some(l.s.op(
-                        l.cur,
-                        "legacyF32ToF16",
-                        Attr::ReadNone,
-                        i32t,
-                        130,
-                        &[f],
-                    )))
+                    Ok(Some(l.f16_nearest(f)))
                 };
                 let h = 2 * attribute.channel;
                 let c = self.cur;
@@ -7890,9 +7851,7 @@ impl<'a> Lower<'a> {
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                self.f16_nearest(x)
             } else {
                 self.as_int(x)
             });
@@ -8382,14 +8341,11 @@ impl<'a> Lower<'a> {
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.as_float(xs[ch as usize]);
-                    let h = self
-                        .s
-                        .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let h = self.f16_nearest(f);
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(self.cur, Bin::Shl, hi, k16);

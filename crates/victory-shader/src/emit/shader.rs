@@ -50,6 +50,7 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const NATIVE_16: u64 = 1 << 5 | 1 << 23;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -690,6 +691,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::NATIVE_16 != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::ATOMIC64_TYPED != 0 {
             features |= 0x40_0000;

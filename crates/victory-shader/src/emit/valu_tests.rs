@@ -1040,3 +1040,43 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn f16_results_round_to_nearest_even() {
+    // Results past half an ulp, ties (to even, up and down), past the
+    // largest half (infinity) and between subnormals: rounding toward zero
+    // gives the half below each.
+    let add = [0x32 << 25 | 2 << 9 | vgpr(1) as u32]; // v_add_f16 v0, v1, v2
+    let mul = [0x35 << 25 | 2 << 9 | vgpr(1) as u32]; // v_mul_f16 v0, v1, v2
+    let cvt = [vop1(0x00A, 0, vgpr(1))]; // v_cvt_f16_f32 v0, v1
+    let pk_add = [0xCC0F_4000, 0x1A02_0501]; // v_pk_add_f16 v0, v1, v2
+    let cases: &[(&str, &[u32], [u32; 2], u32)] = &[
+        ("v_add_f16", &add, [0x3C00, 0x1200], 0x3C01),
+        ("v_add_f16", &add, [0x3C01, 0x1000], 0x3C02),
+        ("v_add_f16", &add, [0x7BFF, 0x4C00], 0x7C00),
+        ("v_add_f16", &add, [0xFBFF, 0xCC00], 0xFC00),
+        ("v_mul_f16", &mul, [0x0001, 0x3E00], 0x0002),
+        ("v_mul_f16", &mul, [0x0003, 0x3800], 0x0002),
+        ("v_cvt_f16_f32", &cvt, [0x3F80_1400, 0], 0x3C01),
+        ("v_cvt_f16_f32", &cvt, [0x477F_F000, 0], 0x7C00),
+        ("v_cvt_f16_f32", &cvt, [0x33C0_0000, 0], 0x0002),
+        (
+            "v_pk_add_f16",
+            &pk_add,
+            [0x3C01_3C00, 0x1000_1200],
+            0x3C02_3C01,
+        ),
+    ];
+    for &(name, body, [a, b], want) in cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[[a, b, 0, 0]], |backend, _, _, got| {
+            // WARP rounds a conversion to half toward zero.
+            if backend == "hardware" {
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} {a:#x}, {b:#x}: {got:#010x}, want {want:#010x}"
+                );
+            }
+        });
+    }
+}
