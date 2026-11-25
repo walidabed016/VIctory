@@ -2351,11 +2351,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
-        // The kernel writes the destination: it must not be guarded.
+        // Its guarded blocks are opened before the stores.
         crate::watch::writing(dst as usize, len);
         // Through memory of ours: unmapped source pages read as zeros, and
-        // the kernel leaves unmapped destination pages alone (asking
-        // `VirtualQuery` first cost as much as the copies).
+        // unmapped destination pages are left alone (asking `VirtualQuery`
+        // first cost as much as the copies).
         let mut bytes = vec![0u8; len];
         copy_mapped(bytes.as_mut_ptr(), src, len, false);
         write_mapped(dst, bytes.as_ptr(), len);
@@ -2395,46 +2395,57 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     copy_until_fault(src, dst.as_mut_ptr(), dst.len())
 }
 
-// `victory_gpu_copy(dst, src, len)` copies with `rep movsb` and returns the
-// bytes it did not copy: none, unless a read faults at
-// `victory_gpu_copy_faults`, where [`on_copy_fault`] resumes it at
-// `victory_gpu_copy_resumes` with the count left.
-std::arch::global_asm!(
-    ".text",
-    ".p2align 4",
-    ".globl victory_gpu_copy",
-    ".seh_proc victory_gpu_copy",
-    "victory_gpu_copy:",
-    "push rdi",
-    ".seh_pushreg rdi",
-    "push rsi",
-    ".seh_pushreg rsi",
-    ".seh_endprologue",
-    "mov rdi, rcx",
-    "mov rsi, rdx",
-    "mov rcx, r8",
-    ".globl victory_gpu_copy_faults",
-    "victory_gpu_copy_faults:",
-    "rep movsb",
-    ".globl victory_gpu_copy_resumes",
-    "victory_gpu_copy_resumes:",
-    "mov rax, rcx",
-    "pop rsi",
-    "pop rdi",
-    "ret",
-    ".seh_endproc",
-);
+// `victory_gpu_copy(dst, src, len)` (title memory into ours) and
+// `victory_gpu_store(dst, src, len)` (ours into title memory) copy with
+// `rep movsb` and return the bytes they did not copy: none, unless the
+// copy's read or the store's write faults at its `_faults` label, where
+// [`on_copy_fault`] resumes it at its `_resumes` label with the count left.
+macro_rules! copy_routine {
+    ($name:literal) => {
+        std::arch::global_asm!(
+            ".text",
+            ".p2align 4",
+            concat!(".globl ", $name),
+            concat!(".seh_proc ", $name),
+            concat!($name, ":"),
+            "push rdi",
+            ".seh_pushreg rdi",
+            "push rsi",
+            ".seh_pushreg rsi",
+            ".seh_endprologue",
+            "mov rdi, rcx",
+            "mov rsi, rdx",
+            "mov rcx, r8",
+            concat!(".globl ", $name, "_faults"),
+            concat!($name, "_faults:"),
+            "rep movsb",
+            concat!(".globl ", $name, "_resumes"),
+            concat!($name, "_resumes:"),
+            "mov rax, rcx",
+            "pop rsi",
+            "pop rdi",
+            "ret",
+            ".seh_endproc",
+        );
+    };
+}
+copy_routine!("victory_gpu_copy");
+copy_routine!("victory_gpu_store");
 
 unsafe extern "C" {
     fn victory_gpu_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
     fn victory_gpu_copy_faults();
     fn victory_gpu_copy_resumes();
+    fn victory_gpu_store(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    fn victory_gpu_store_faults();
+    fn victory_gpu_store_resumes();
 }
 
-/// Ends a [`victory_gpu_copy`] whose read faults: it resumes after the
-/// copy, which returns the bytes left. Every other exception, a write fault
-/// in the copy included, goes on untouched to the other handlers (the
-/// guard's, the title's, the crash reporter's).
+/// Ends a [`victory_gpu_copy`] whose read faults, or a
+/// [`victory_gpu_store`] whose write faults: it resumes after the routine,
+/// which returns the bytes left. Every other exception, a write fault in
+/// the copy and a read fault in the store included, goes on untouched to
+/// the other handlers (the guard's, the title's, the crash reporter's).
 unsafe extern "system" fn on_copy_fault(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
@@ -2445,30 +2456,47 @@ unsafe extern "system" fn on_copy_fault(
         EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     };
     const READ: usize = 0;
+    const WRITE: usize = 1;
     // SAFETY: the system passes the exception being dispatched and the
     // context it resumes.
     let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-    let unreadable = [
+    let faulted = [
         EXCEPTION_ACCESS_VIOLATION,
         EXCEPTION_GUARD_PAGE,
         EXCEPTION_IN_PAGE_ERROR,
     ]
     .contains(&r.ExceptionCode)
-        && r.NumberParameters >= 2
-        && r.ExceptionInformation[0] == READ;
-    if !unreadable || context.Rip != victory_gpu_copy_faults as *const () as u64 {
+        && r.NumberParameters >= 2;
+    let routines = [
+        (
+            victory_gpu_copy_faults as *const (),
+            READ,
+            victory_gpu_copy_resumes as *const (),
+        ),
+        (
+            victory_gpu_store_faults as *const (),
+            WRITE,
+            victory_gpu_store_resumes as *const (),
+        ),
+    ];
+    let Some(&(.., resumes)) = routines.iter().find(|&&(at, access, _)| {
+        faulted && context.Rip == at as u64 && r.ExceptionInformation[0] == access
+    }) else {
         return EXCEPTION_CONTINUE_SEARCH;
-    }
-    context.Rip = victory_gpu_copy_resumes as *const () as u64;
+    };
+    context.Rip = resumes as u64;
     EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// Copies `len` bytes of title memory at `src` into memory of ours at
-/// `dst` with the CPU; false at a source page it cannot read, whose fault
-/// ends the copy there ([`on_copy_fault`]), the bytes before it copied.
-/// Through the kernel (`ReadProcessMemory`), which maps each piece of the
-/// source to copy it, copies ran at 1-2.5 GB/s.
-fn copy_until_fault(src: *const u8, dst: *mut u8, len: usize) -> bool {
+/// Runs a copy routine (`victory_gpu_copy` or `victory_gpu_store`) over
+/// `len` bytes from `src` to `dst`; false if a fault ended it
+/// ([`on_copy_fault`]), the bytes before copied.
+fn until_fault(
+    routine: unsafe extern "C" fn(*mut u8, *const u8, usize) -> usize,
+    src: *const u8,
+    dst: *mut u8,
+    len: usize,
+) -> bool {
     static HANDLER: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only moves a faulting copy of ours to its end.
     HANDLER.call_once(|| unsafe {
@@ -2477,43 +2505,50 @@ fn copy_until_fault(src: *const u8, dst: *mut u8, len: usize) -> bool {
             Some(on_copy_fault),
         );
     });
-    // SAFETY: `dst` is memory of ours, writable for `len` bytes; a source
-    // page that cannot be read ends the copy.
-    unsafe { victory_gpu_copy(dst, src, len) == 0 }
+    // SAFETY: the caller's memory, writable for `len` bytes at `dst` and
+    // readable at `src`, but for the title memory the routine is for.
+    unsafe { routine(dst, src, len) == 0 }
 }
 
-/// Copies `len` bytes from `src` to `dst` through the kernel, which checks
-/// both: false (and some bytes copied) if a source page is not readable or
-/// a destination page not writable.
-fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut done = 0;
-    // SAFETY: the kernel probes both ranges and reports a fault instead of
-    // raising it.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+/// Copies `len` bytes of title memory at `src` into memory of ours at
+/// `dst` with the CPU; false at a source page it cannot read, whose fault
+/// ends the copy there ([`on_copy_fault`]), the bytes before it copied.
+/// Through the kernel (`ReadProcessMemory`), which maps each piece of the
+/// source to copy it, copies ran at 1-2.5 GB/s.
+fn copy_until_fault(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    until_fault(victory_gpu_copy, src, dst, len)
+}
+
+/// Stores `len` bytes of ours at `src` into title memory at `dst` with
+/// the CPU; false at a destination page it cannot write, whose fault ends
+/// the store there ([`on_copy_fault`]), the bytes before it stored.
+fn store_until_fault(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    until_fault(victory_gpu_store, src, dst, len)
 }
 
 /// Copies host memory into title memory (what shaders wrote, title copies
-/// at submission), leaving pages that are not mapped alone. Guarded blocks
-/// must have been opened (`watch::writing`): the kernel does not write
-/// read-only pages. `ReadProcessMemory` into the destination, not
-/// `WriteProcessMemory`, which asks every call for the destination's
-/// protection (as slow as `VirtualQuery` in the title's big pools: ~20 us
-/// a copy, ~0.15 s per world frame).
+/// at submission) with the CPU, leaving pages that are not mapped or not
+/// writable alone. Guarded blocks are opened first (`watch::writing`); one
+/// guarded again since faults into the guard's handler, which opens it, or
+/// ends the store and is opened before it is stored again. Through the
+/// kernel (`ReadProcessMemory` into the destination), run 83's writes back
+/// took 19.3 ms a frame for 35 MB (opening guarded blocks included), and a
+/// block guarded again kept its old bytes.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        // The kernel reads our host memory and checks the destination.
-        read(from, at as *mut u8, n)
+    let store = |at: usize, n: usize| {
+        store_until_fault(src.wrapping_add(at - dst as usize), at as *mut u8, n)
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || store(dst as usize, len) {
         return;
     }
+    // A block guarded again, or a page that is not mapped: page by page
+    // (64 KiB, then 4 KiB in a piece that fails), what cannot be written
+    // left alone.
+    crate::watch::writing(dst as usize, len);
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if !store(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                store(at, n);
             });
         }
     });
@@ -2533,7 +2568,9 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod copy_faults {
-    use super::{copy_mapped, copy_until_fault, on_copy_fault, read_into};
+    use super::{
+        copy_mapped, copy_until_fault, on_copy_fault, read_into, store_until_fault, write_mapped,
+    };
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         VirtualFree,
@@ -2592,33 +2629,38 @@ mod copy_faults {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// What [`on_copy_fault`] answers to exception `code` of an `access`
+    /// (0 read, 1 write) at `rip`, and where it resumes.
+    fn take(code: i32, access: usize, rip: u64) -> (i32, u64) {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            CONTEXT, EXCEPTION_POINTERS, EXCEPTION_RECORD,
+        };
+        // SAFETY: zeroed is a valid record and context.
+        let (mut record, mut context): (EXCEPTION_RECORD, CONTEXT) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+        record.ExceptionCode = code;
+        record.NumberParameters = 2;
+        record.ExceptionInformation[..2].copy_from_slice(&[access, 0x1000]);
+        context.Rip = rip;
+        let mut info = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut context,
+        };
+        // SAFETY: a record and context that outlive the call.
+        let r = unsafe { on_copy_fault(&mut info) };
+        (r, context.Rip)
+    }
+
     /// The handler takes only read faults of its own copy: anything else
     /// goes on to the other handlers, the context as it was.
     #[test]
     fn only_the_copys_read_faults_are_taken() {
         use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT};
         use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
-            EXCEPTION_RECORD,
+            EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         };
         let faults = super::victory_gpu_copy_faults as *const () as u64;
         let resumes = super::victory_gpu_copy_resumes as *const () as u64;
-        let take = |code, access: usize, rip: u64| {
-            // SAFETY: zeroed is a valid record and context.
-            let (mut record, mut context): (EXCEPTION_RECORD, CONTEXT) =
-                unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
-            record.ExceptionCode = code;
-            record.NumberParameters = 2;
-            record.ExceptionInformation[..2].copy_from_slice(&[access, 0x1000]);
-            context.Rip = rip;
-            let mut info = EXCEPTION_POINTERS {
-                ExceptionRecord: &mut record,
-                ContextRecord: &mut context,
-            };
-            // SAFETY: a record and context that outlive the call.
-            let r = unsafe { on_copy_fault(&mut info) };
-            (r, context.Rip)
-        };
         let read = (EXCEPTION_CONTINUE_EXECUTION, resumes);
         assert_eq!(take(EXCEPTION_ACCESS_VIOLATION, 0, faults), read);
         let passed = |rip| (EXCEPTION_CONTINUE_SEARCH, rip);
@@ -2639,19 +2681,74 @@ mod copy_faults {
         );
     }
 
-    /// Beside the guard: a copy reads a guarded view block without a
-    /// fault, and a title write to the block still faults into the guard's
-    /// handler, which lets it land and reports the block written.
+    /// The handler takes only write faults of its own store.
     #[test]
-    fn guarded_blocks_are_copied_and_still_take_title_writes() {
-        use crate::watch::{PAGE, forget_asked, serial, title_memory_unmapping, writes};
+    fn only_the_stores_write_faults_are_taken() {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        };
+        let faults = super::victory_gpu_store_faults as *const () as u64;
+        let resumes = super::victory_gpu_store_resumes as *const () as u64;
+        assert_eq!(
+            take(EXCEPTION_ACCESS_VIOLATION, 1, faults),
+            (EXCEPTION_CONTINUE_EXECUTION, resumes)
+        );
+        assert_eq!(
+            take(EXCEPTION_ACCESS_VIOLATION, 0, faults),
+            (EXCEPTION_CONTINUE_SEARCH, faults),
+            "a read"
+        );
+        let copy = super::victory_gpu_copy_faults as *const () as u64;
+        assert_eq!(
+            take(EXCEPTION_ACCESS_VIOLATION, 1, copy),
+            (EXCEPTION_CONTINUE_SEARCH, copy),
+            "the copy's write"
+        );
+    }
+
+    /// A store stops at a page it cannot write, the bytes before it stored;
+    /// `write_mapped` stores around it and leaves it alone, a read-only page
+    /// too.
+    #[test]
+    fn stores_stop_at_pages_they_cannot_write() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let _serial = crate::watch::serial();
+        let (p, hole) = holed();
+        let (len, at) = (3 << 16, hole - p);
+        let locked = (2 << 16) + (3 << 12);
+        let mut was = 0;
+        // SAFETY: a page of ours.
+        let protected =
+            unsafe { VirtualProtect((p + locked) as *const _, 4096, PAGE_READONLY, &mut was) };
+        assert_ne!(protected, 0);
+        let ours = vec![0x5a_u8; len];
+        assert!(!store_until_fault(ours.as_ptr(), p as *mut u8, len));
+        // SAFETY: committed below the hole.
+        let stored = unsafe { std::slice::from_raw_parts(p as *const u8, at) };
+        assert!(stored.iter().all(|&b| b == 0x5a));
+        write_mapped(p as *mut u8, ours.as_ptr(), len);
+        for i in (0..len).filter(|i| !(at..at + 4096).contains(i)) {
+            // SAFETY: committed outside the hole.
+            let b = unsafe { (p as *const u8).add(i).read() };
+            let want = if (locked..locked + 4096).contains(&i) {
+                pattern(i)
+            } else {
+                0x5a
+            };
+            assert_eq!(b, want, "byte {i:#x}");
+        }
+        // SAFETY: ours.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A read-write view of `len` bytes of a pagefile section of ours,
+    /// holding [`pattern`].
+    fn view(len: usize) -> usize {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-            PAGE_NOACCESS, UnmapViewOfFile,
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
         };
-        let _serial = serial();
-        let len = 2 * PAGE;
         // SAFETY: a pagefile section of ours, mapped read-write.
         let view = unsafe {
             let section = CreateFileMappingW(
@@ -2671,6 +2768,37 @@ mod copy_faults {
         let expected: Vec<u8> = (0..len).map(pattern).collect();
         // SAFETY: our view, read-write.
         unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), view as *mut u8, len) };
+        view
+    }
+
+    /// Unmaps a [`view`] as the runtime does; its addresses stay reserved,
+    /// as the watch tests keep theirs (the journal keeps their pages).
+    fn unmap(view: usize, len: usize) {
+        use crate::watch::title_memory_unmapping;
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_MAPPED_VIEW_ADDRESS, PAGE_NOACCESS, UnmapViewOfFile,
+        };
+        // SAFETY: our view.
+        title_memory_unmapping(view, len, || unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        });
+        // SAFETY: a reservation of the range just freed.
+        let kept = unsafe { VirtualAlloc(view as *const _, len, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!kept.is_null());
+    }
+
+    /// Beside the guard: a copy reads a guarded view block without a
+    /// fault, and a title write to the block still faults into the guard's
+    /// handler, which lets it land and reports the block written.
+    #[test]
+    fn guarded_blocks_are_copied_and_still_take_title_writes() {
+        use crate::watch::{PAGE, forget_asked, serial, writes};
+        let _serial = serial();
+        let len = 2 * PAGE;
+        let view = view(len);
+        let expected: Vec<u8> = (0..len).map(pattern).collect();
         forget_asked();
         writes(view, view + len, true).expect("view memory, guarded now");
         let mut copy = vec![0u8; len];
@@ -2689,16 +2817,26 @@ mod copy_faults {
             .map(|&(page, _)| page - view / PAGE)
             .collect();
         assert_eq!(blocks, [1]);
-        // SAFETY: our view; its addresses stay reserved, as the watch tests
-        // keep theirs (the journal keeps their pages).
-        title_memory_unmapping(view, len, || unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: view as *mut _,
-            })
-        });
-        // SAFETY: a reservation of the range just freed.
-        let kept = unsafe { VirtualAlloc(view as *const _, len, MEM_RESERVE, PAGE_NOACCESS) };
-        assert!(!kept.is_null());
+        unmap(view, len);
+    }
+
+    /// Stores land in guarded blocks nothing opened (guarded again after
+    /// `watch::writing` opened them, by an arming on another thread): the
+    /// kernel's write left them as they were.
+    #[test]
+    fn stores_land_in_blocks_guarded_again() {
+        use crate::watch::{PAGE, forget_asked, serial, writes};
+        let _serial = serial();
+        let len = 2 * PAGE;
+        let view = view(len);
+        forget_asked();
+        writes(view, view + len, true).expect("view memory, guarded now");
+        let ours: Vec<u8> = (0..len).map(|i| !pattern(i)).collect();
+        write_mapped(view as *mut u8, ours.as_ptr(), len);
+        // SAFETY: our view, readable.
+        let now = unsafe { std::slice::from_raw_parts(view as *const u8, len) };
+        assert!(now == ours, "stored");
+        unmap(view, len);
     }
 }
 
