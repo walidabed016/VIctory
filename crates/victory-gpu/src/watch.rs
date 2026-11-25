@@ -91,8 +91,8 @@ pub(crate) fn wrote_since(asked: u64, start: usize, end: usize) -> bool {
 /// We wrote `[start, end)` of title memory: shaders in place (no CPU write
 /// the kernel sees) or a copy at submission (seen by the kernel only at the
 /// next asking of a range not asked about since [`forget_asked`]). Its pages
-/// count as written now.
-pub(crate) fn wrote(start: usize, end: usize) {
+/// count as written now: the asking it returns.
+pub(crate) fn wrote(start: usize, end: usize) -> u64 {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.asked += 1;
     let now = j.asked;
@@ -103,7 +103,7 @@ pub(crate) fn wrote(start: usize, end: usize) {
     // So are the blocks showing the same physical pages elsewhere.
     let mut g = guards();
     let Some(shown) = &g.shown else {
-        return;
+        return now;
     };
     let aliases: Vec<usize> = (start / BLOCK..end.div_ceil(BLOCK))
         .flat_map(|b| shown.aliases(b))
@@ -113,6 +113,7 @@ pub(crate) fn wrote(start: usize, end: usize) {
         j.written.insert(a * BLOCK / PAGE, now);
         j.ours.push((now, a * BLOCK, (a + 1) * BLOCK));
     }
+    now
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -121,12 +122,31 @@ pub(crate) fn wrote(start: usize, end: usize) {
 /// asked about since [`forget_asked`] are not asked about again). `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    asked_writes(start, end, guarded, true)
+}
+
+/// [`writes`] of guarded and write-watched memory for copy-back, which may
+/// run beside the next submission's preparation: every page is asked
+/// about, and none counts as asked for the submission being prepared
+/// (whose own asking must still take what the title writes until then).
+pub(crate) fn writes_now(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    asked_writes(start, end, true, false)
+}
+
+/// [`writes`]; with `fresh`, ranges asked about since [`forget_asked`] are
+/// not asked again and those asked now are noted.
+fn asked_writes(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    fresh: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     let mut gaps = Vec::new();
     let mut at = first;
-    for &(a, b, view) in &j.fresh {
+    for &(a, b, view) in j.fresh.iter().filter(|_| fresh) {
         if b <= at || view && !guarded {
             continue;
         }
@@ -195,8 +215,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         } else {
             Vec::new()
         };
-        let at = j.fresh.partition_point(|&(a, ..)| a < from);
-        j.fresh.insert(at, (from, to, failed));
+        if fresh {
+            let at = j.fresh.partition_point(|&(a, ..)| a < from);
+            j.fresh.insert(at, (from, to, failed));
+        }
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -1283,6 +1305,34 @@ mod tests {
             )
             .is_none()
         );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Copy-back asks beside the next submission's preparation: its asking
+    /// does not count as the preparation's, which still finds a title
+    /// write made after it.
+    #[test]
+    fn copy_back_askings_leave_the_preparation_its_own() {
+        let _serial = serial();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        forget_asked();
+        let (now, _) = writes_now(start, end).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write(1) };
+        let (later, after) = writes(start, end, false).expect("watched");
+        assert!(later > now, "not asked again");
+        assert!(after.contains(&(p / PAGE + 2, later)), "{after:?}");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

@@ -769,34 +769,30 @@ impl Shadow {
             // what they changed there); copies and textures of it that the
             // kernel's watch cannot tell (no CPU wrote) take it again. The
             // twin holds it already: of the pages it had taken, it takes
-            // again only those the title wrote since (`title`); the others
-            // count as taken at our write, the earliest asking the watch
-            // has for the range after it (a later one is the title's).
+            // again only those the title wrote before our write (`title`)
+            // or after it (`since`); the others count as taken at our write.
             for (from, to) in merged {
                 let (a, b) = (start + from, start + to);
                 let title = self
                     .twin
                     .as_ref()
-                    .and_then(|_| crate::watch::writes(a, b, true));
-                crate::watch::wrote(a, b);
+                    .and_then(|_| crate::watch::writes_now(a, b));
+                let at = crate::watch::wrote(a, b);
                 let Some((_, title)) = title else {
                     continue;
                 };
-                let Some((_, ours)) = crate::watch::writes(a, b, true) else {
-                    continue;
-                };
-                let Some(at) = ours.iter().map(|w| w.1).min() else {
+                let Some((_, since)) = crate::watch::writes_now(a, b) else {
                     continue;
                 };
                 let (base, end) = (start / PAGE, start + self.len as usize);
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for &(page, _) in &ours {
+                for &(page, last) in &since {
                     let wrote = title
                         .binary_search_by_key(&page, |w| w.0)
                         .map_or(0, |i| title[i].1);
                     let whole = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= b;
                     let taken = &mut copied[page - base];
-                    if whole && *taken != 0 && wrote <= *taken {
+                    if whole && *taken != 0 && wrote <= *taken && last <= at {
                         *taken = at;
                     }
                 }
@@ -1050,7 +1046,7 @@ impl Shadow {
         if first < last
             && !synced.is_empty()
             && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-            && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+            && let Some((now, _)) = crate::watch::writes_now(first * PAGE, last * PAGE)
         {
             let current = split(synced.len(), synced.len() * PIECE, |part| {
                 let mut title = vec![0u8; PIECE];

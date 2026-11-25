@@ -1354,7 +1354,6 @@ impl Host {
             None => vec![std::collections::HashSet::new(); back.len()],
         };
         for ((shadow, declared), unchanged) in back.iter().zip(&unchanged) {
-            crate::watch::forget_asked();
             let written = shadow.copy_back(declared, unchanged);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             crate::shadow::touched(shadow);
