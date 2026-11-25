@@ -62,6 +62,11 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Diagnostics (`VICTORY_GPU_SPANS=1`): timestamps at each submission's
+    /// first and last lists, two per slot, and their readback buffer
+    /// ([`Host::span_heap`]).
+    #[cfg(feature = "diagnostics")]
+    spans: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -267,6 +272,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            #[cfg(feature = "diagnostics")]
+            spans: OnceLock::new(),
         })
     }
 }
@@ -494,6 +501,46 @@ pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+    })
+}
+
+/// Diagnostics, pipelined: whether each submission takes a GPU timestamp
+/// before its first list and after its last, so the pipe trace shows when
+/// it ran on the GPU, and the GPU's idle time split into nothing launched
+/// and launched but held (fence waits for copy-backs, tile mappings)
+/// (`VICTORY_GPU_SPANS=1`).
+#[cfg(feature = "diagnostics")]
+fn spans_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::pipelined::on()
+            && std::env::var_os("VICTORY_GPU_SPANS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("submissions' GPU spans timed (VICTORY_GPU_SPANS)");
+        }
+        on
+    })
+}
+
+/// The first of the host's lists [`spans_on`] takes timestamps in, two per
+/// slot, after the twin copies' three per slot.
+#[cfg(feature = "diagnostics")]
+const SPAN_LISTS: usize = 3 * crate::pipelined::DEPTH;
+
+/// Diagnostics: whether a present's black-frame probe is read at the next
+/// present, once its copy has run (`VICTORY_LATE_PROBE=1`), instead of
+/// waiting there for every submission in flight. That wait drained the
+/// pipeline at each present: 16 ms a frame in run 149, 29-46 ms in run 110
+/// (depth 6). A frame's black flag then comes one present late.
+#[cfg(feature = "diagnostics")]
+fn late_probes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LATE_PROBE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("black-frame probes read a present late (VICTORY_LATE_PROBE)");
+        }
+        on
     })
 }
 
@@ -914,6 +961,8 @@ impl Pending {
             .collect();
         #[cfg(feature = "diagnostics")]
         crate::pipelined::gpu_done(early);
+        #[cfg(feature = "diagnostics")]
+        host.read_span(self.done.slot);
         let since = self.done.prepared.max(last);
         host.complete(&runs, self.done, since);
     }
@@ -1263,6 +1312,101 @@ impl Host {
         }
     }
 
+    /// Diagnostics ([`spans_on`]): the timestamp heap of submissions' spans
+    /// and its readback buffer, made when first needed.
+    #[cfg(feature = "diagnostics")]
+    fn span_heap(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        if !spans_on() {
+            return None;
+        }
+        self.spans
+            .get_or_init(|| {
+                let count = 2 * crate::pipelined::DEPTH as u32;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(count) * 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: plain object creation.
+                unsafe {
+                    self.device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC {
+                                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                                Count: count,
+                                NodeMask: 0,
+                            },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    self.device
+                        .CreateCommittedResource(
+                            &readback,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut back,
+                        )
+                        .ok()?;
+                }
+                Some((heap?, back?))
+            })
+            .as_ref()
+    }
+
+    /// Diagnostics ([`spans_on`]): when the submission of `slot`, which
+    /// has run, started and ended on the GPU, told to the pipe trace.
+    #[cfg(feature = "diagnostics")]
+    fn read_span(&self, slot: usize) {
+        let Some((_, back)) = self.span_heap() else {
+            return;
+        };
+        let mut data = std::ptr::null_mut();
+        let (mut gpu, mut cpu) = (0, 0);
+        // SAFETY: the submission's lists ran (its fence was waited for), and
+        // its two stamps lie inside the buffer; plain queries.
+        let (stamps, frequency, calibrated) = unsafe {
+            if back.Map(0, None, Some(&mut data)).is_err() {
+                return;
+            }
+            let stamps = data.cast::<[u64; 2]>().add(slot).read_unaligned();
+            back.Unmap(0, None);
+            (
+                stamps,
+                self.queue.GetTimestampFrequency().unwrap_or(0),
+                self.queue.GetClockCalibration(&mut gpu, &mut cpu).is_ok(),
+            )
+        };
+        if !calibrated || frequency == 0 {
+            return;
+        }
+        let (now, now_qpc, per_second) = (std::time::Instant::now(), qpc(), qpc_frequency());
+        let on_cpu = |stamp: u64| {
+            let ticks = i128::from(stamp) - i128::from(gpu);
+            let at = i128::from(cpu) + ticks * i128::from(per_second) / i128::from(frequency);
+            let ago = (i128::from(now_qpc) - at).max(0) as f64 / per_second as f64;
+            now.checked_sub(std::time::Duration::from_secs_f64(ago))
+        };
+        if let (Some(start), Some(end)) = (on_cpu(stamps[0]), on_cpu(stamps[1])) {
+            crate::pipelined::gpu_span(start, end);
+        }
+    }
+
     /// Diagnostics: waits until the queue has run all it was given; the ms
     /// that took, or `None` if it could not wait.
     #[cfg(feature = "diagnostics")]
@@ -1478,6 +1622,21 @@ impl Host {
                 crate::pipelined::wait_completed(seq);
             }
         }
+        // Diagnostics ([`spans_on`]): a timestamp before the submission's
+        // first list, after what the GPU waits for.
+        #[cfg(feature = "diagnostics")]
+        let spans = self.span_heap();
+        #[cfg(feature = "diagnostics")]
+        if let Some((heap, _)) = spans
+            && let Some(list) = self.twin_list(SPAN_LISTS + 2 * slot, |l| {
+                // SAFETY: an open list; our query heap.
+                unsafe { l.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * slot as u32) };
+                1
+            })
+        {
+            // SAFETY: a closed list, run first.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        }
         for list in &twins_before {
             // SAFETY: a closed list, run before the submission's.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list.clone())]) };
@@ -1522,6 +1681,28 @@ impl Host {
                 }
             }
             // SAFETY: a closed list, run after the submission's.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some((heap, back)) = spans
+            && let Some(list) = self.twin_list(SPAN_LISTS + 2 * slot + 1, |l| {
+                let at = 2 * slot as u32;
+                // SAFETY: an open list; our query heap and readback buffer.
+                unsafe {
+                    l.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 1);
+                    l.ResolveQueryData(
+                        heap,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        at,
+                        2,
+                        back,
+                        u64::from(at) * 8,
+                    );
+                }
+                1
+            })
+        {
+            // SAFETY: a closed list, run last.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         }
         let done = Done {
@@ -3270,6 +3451,10 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Diagnostics, with [`late_probes`]: the last present's black-frame
+    /// probe, read at the next present.
+    #[cfg(feature = "diagnostics")]
+    probed: Option<ID3D12Resource>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3525,6 +3710,9 @@ impl Host {
                 return None;
             };
             p.copy.reset();
+            // The last present's probe: its copy has run (the reset waited).
+            #[cfg(feature = "diagnostics")]
+            let probed = p.probed.take();
             let list = &p.copy.list;
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -3555,7 +3743,7 @@ impl Host {
             self.execute(&[&p.copy]);
             // Read back below: pipelined, the copy may still be queued.
             #[cfg(feature = "diagnostics")]
-            if capture.is_some() || probe.is_some() {
+            if capture.is_some() || (probe.is_some() && !late_probes()) {
                 crate::pipelined::wait_all();
             }
             #[cfg(feature = "diagnostics")]
@@ -3564,6 +3752,11 @@ impl Host {
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            if late_probes() {
+                p.probed = probe;
+                return Some(probed.is_some_and(|b| crate::capture::black(&b)));
+            }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -3611,6 +3804,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                probed: None,
             })
         }
     }

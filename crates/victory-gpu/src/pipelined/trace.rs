@@ -20,6 +20,8 @@ struct Submission {
     /// was done before the thread got to it (behind older copy-backs).
     gpu: Option<(Instant, bool)>,
     retired: Option<Instant>,
+    /// When it started and ended on the GPU (`VICTORY_GPU_SPANS=1`).
+    span: Option<(Instant, Instant)>,
 }
 
 #[derive(Clone, Copy)]
@@ -39,6 +41,8 @@ struct Trace {
     waits: VecDeque<Wait>,
     /// When [`log`] last summed.
     since: Option<Instant>,
+    /// Waits for every submission: where called, when they ended, ms.
+    alls: VecDeque<(&'static std::panic::Location<'static>, Instant, f64)>,
 }
 
 static TRACE: Mutex<Option<Trace>> = Mutex::new(None);
@@ -88,6 +92,7 @@ pub(super) fn preparing(seq: u64) {
             launched: None,
             gpu: None,
             retired: None,
+            span: None,
         });
         if t.submissions.len() > KEEP {
             t.submissions.pop_front();
@@ -103,6 +108,23 @@ pub(super) fn launched(seq: u64) {
 pub(super) fn gpu_done(seq: u64, early: bool) {
     let now = Instant::now();
     with(|t| submission(t, seq).map(|s| s.gpu = Some((now, early))));
+}
+
+/// Submission `seq` ran on the GPU from `start` to `end`.
+pub(super) fn span(seq: u64, start: Instant, end: Instant) {
+    with(|t| submission(t, seq).map(|s| s.span = Some((start, end))));
+}
+
+/// A wait for every submission, called at `caller`, waited since `from`.
+pub(super) fn waited_all(caller: &'static std::panic::Location<'static>, from: Instant) {
+    let to = Instant::now();
+    let ms = to.saturating_duration_since(from).as_secs_f64() * 1e3;
+    with(|t| {
+        t.alls.push_back((caller, to, ms));
+        if t.alls.len() > KEEP {
+            t.alls.pop_front();
+        }
+    });
 }
 
 pub(super) fn retired(seq: u64) {
@@ -132,11 +154,12 @@ pub(super) fn waited(why: usize, seq: u64, from: Instant) {
 pub(super) fn log(frames: f64, names: &[&str]) {
     static WINDOWS: AtomicU64 = AtomicU64::new(0);
     let now = Instant::now();
-    let (submissions, waits, since) = with(|t| {
+    let (submissions, waits, alls, since) = with(|t| {
         let since = t.since.replace(now);
         (
             t.submissions.iter().copied().collect::<Vec<_>>(),
             t.waits.iter().copied().collect::<Vec<_>>(),
+            t.alls.iter().copied().collect::<Vec<_>>(),
             since,
         )
     });
@@ -229,6 +252,65 @@ pub(super) fn log(frames: f64, names: &[&str]) {
         waits_text.join(", "),
         threads_text.join(", ")
     );
+    // The GPU's time from the spans: running some submission's lists, idle
+    // with the next not launched yet, and idle with it launched but held
+    // (fence waits for copy-backs, tile mappings).
+    let (mut busy, mut unlaunched, mut held, mut spans) = (0.0, 0.0, 0.0, 0);
+    let mut ended: Option<Instant> = None;
+    for s in &done {
+        let Some((start, end)) = s.span else {
+            continue;
+        };
+        spans += 1;
+        match ended {
+            Some(e) if start > e => {
+                let gap = ms(e, start);
+                let late = s.launched.map_or(0.0, |l| ms(e, l).min(gap));
+                unlaunched += late;
+                held += gap - late;
+                busy += ms(start, end);
+            }
+            Some(e) => busy += ms(e, end),
+            None => busy += ms(start, end),
+        }
+        ended = Some(ended.map_or(end, |e| e.max(end)));
+    }
+    if spans > 0 {
+        tracing::info!(
+            "GPU spans per frame over {spans} submissions: running lists {:.1} ms, idle with \
+             the next submission not launched {:.1} ms, idle with it launched but held {:.1} ms",
+            busy / f,
+            unlaunched / f,
+            held / f
+        );
+    }
+    let mut callers: Vec<(&std::panic::Location, u64, f64)> = Vec::new();
+    for &(caller, _, waited) in alls.iter().filter(|a| a.1 > since) {
+        match callers.iter_mut().find(|c| std::ptr::eq(c.0, caller)) {
+            Some(c) => (c.1, c.2) = (c.1 + 1, c.2 + waited),
+            None => callers.push((caller, 1, waited)),
+        }
+    }
+    if !callers.is_empty() {
+        callers.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let text: Vec<String> = callers
+            .iter()
+            .take(6)
+            .map(|(c, n, w)| {
+                format!(
+                    "{}:{} {:.1}x {:.1} ms",
+                    c.file(),
+                    c.line(),
+                    *n as f64 / f,
+                    w / f
+                )
+            })
+            .collect();
+        tracing::info!(
+            "waits for every submission per frame, by caller: {}",
+            text.join(", ")
+        );
+    }
     let listed = std::env::var_os("VICTORY_PIPE_TRACE").is_some_and(|v| v == "1");
     if !listed || !WINDOWS.fetch_add(1, Relaxed).is_multiple_of(6) {
         return;
@@ -243,9 +325,12 @@ pub(super) fn log(frames: f64, names: &[&str]) {
             || "-".into(),
             |(t, early)| format!("{:.1}{}", ms(base, t), if early { "*" } else { "" }),
         );
+        let ran = s.span.map_or_else(String::new, |(a, b)| {
+            format!(" ran {}-{}", at(Some(a)), at(Some(b)))
+        });
         tracing::info!(
-            "pipe trace: seq {} t{} prepared {} launched {} gpu done {} copied back {} (ms; * done \
-             before the completion thread got to it)",
+            "pipe trace: seq {} t{} prepared {} launched {}{ran} gpu done {} copied back {} (ms; * \
+             done before the completion thread got to it)",
             s.seq,
             s.thread,
             at(Some(s.prepared)),
