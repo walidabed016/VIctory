@@ -40,8 +40,10 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
-    /// An internal constant with this initialiser (a constant table).
+    /// An internal global with this initialiser: a constant table, or this
+    /// thread's own variable ([`Module::private_global`]).
     init: Option<u32>,
+    constant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -346,12 +348,28 @@ impl Module {
             ptr,
             space,
             init: None,
+            constant: false,
         });
         V::Global(self.globals.len() as u32 - 1)
     }
 
     /// An internal constant global initialised with the constant `init`.
     pub fn constant_global(&mut self, name: &str, init: V) -> V {
+        let V::Const(i) = init else {
+            panic!("a global initialised with a non-constant")
+        };
+        let ty = self.consts[i as usize].0;
+        let g = self.global(name, ty, 0);
+        if let V::Global(n) = g {
+            self.globals[n as usize].init = Some(i);
+            self.globals[n as usize].constant = true;
+        }
+        g
+    }
+
+    /// An internal variable of each thread's own (HLSL `static`),
+    /// initialised with the constant `init`.
+    pub fn private_global(&mut self, name: &str, init: V) -> V {
         let V::Const(i) = init else {
             panic!("a global initialised with a non-constant")
         };
@@ -640,10 +658,11 @@ impl Module {
             // [type, address space << 2 | explicit type | constant, init id
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
-            let (constant, init, linkage) = match g.init {
-                Some(i) => (1, first_const + u64::from(i) + 1, 3),
-                None => (0, 0, 0),
+            let (init, linkage) = match g.init {
+                Some(i) => (first_const + u64::from(i) + 1, 3),
+                None => (0, 0),
             };
+            let constant = u64::from(g.constant);
             w.record(
                 7,
                 &[

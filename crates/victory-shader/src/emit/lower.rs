@@ -343,6 +343,9 @@ struct Lower<'a> {
     /// IR block, its incoming (value, DXIL block) pairs, and the loop's
     /// limit ([`LOOP_LIMIT`] or [`SPIN_LIMIT`]).
     counters: HashMap<usize, (V, Vec<(V, usize)>, u32)>,
+    /// With [`super::loop_budget`]: the lane's count of passes over all its
+    /// loops (a variable of its own) and the most it may reach.
+    budget: Option<(V, u32)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// Wave64 on 32-lane halves ([`super::halves`]).
@@ -1126,6 +1129,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            budget: None,
             abort: None,
             halves,
             ballot_fail: HashMap::new(),
@@ -1829,6 +1833,7 @@ impl<'a> Lower<'a> {
             });
         }
         // Loop headers count iterations (`LOOP_LIMIT`, `SPIN_LIMIT`).
+        let mut waiting = false;
         for &b in &order {
             let mut stack: Vec<usize> = p.blocks[b]
                 .preds
@@ -1856,6 +1861,7 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|i| may_wait(i) || i.name().starts_with("image_bvh"))
             });
+            waiting |= waits;
             let limit = if waits {
                 SPIN_LIMIT.min(super::loop_limit())
             } else {
@@ -1866,6 +1872,15 @@ impl<'a> Lower<'a> {
             self.counters.insert(b, (phi, Vec::new(), limit));
             #[cfg(test)]
             self.loop_limits.push(limit);
+        }
+        if super::loop_budget() && !self.counters.is_empty() {
+            let most = match waiting {
+                true => super::DEFAULT_LOOP_BUDGET.min(super::loop_limit()),
+                false => super::loop_limit(),
+            };
+            let zero = self.s.m.i32(0);
+            let count = self.s.m.private_global("passes", zero);
+            self.budget = Some((count, most));
         }
         self.cur = self.s.entry;
         self.cur_ir = order[0];
@@ -3251,6 +3266,15 @@ impl<'a> Lower<'a> {
             let hi = inst.read(Reg::S(code + 1)).ok_or(untracked)?;
             return self.pair_bit(lo, hi);
         }
+        // Wave32 with console lanes: a mask held only as a number is the
+        // console's, and the lane tests its own bit.
+        if !self.x.st.masks.contains_key(&lo)
+            && self.console_lanes
+            && self.halves.is_none()
+            && super::mask_numbers()
+        {
+            return self.own_bit(lo, self.cur).map_err(|_| untracked);
+        }
         self.mask_bit(lo, untracked)
     }
 
@@ -3697,6 +3721,10 @@ impl<'a> Lower<'a> {
         let k6 = self.s.m.i32(6);
         let first = self.s.m.bin(head, Bin::Shl, turn, k6);
         let thread = self.s.m.bin(head, Bin::Add, first, ids.thread);
+        // Each console wave's turn counts its own passes.
+        if let Some((count, _)) = self.budget {
+            self.s.m.store(head, count, zero);
+        }
         if let Some(h) = &mut self.halves {
             h.ids = Some(HalfIds { thread, ..ids });
             h.serial = Some(Serial {
@@ -10463,12 +10491,20 @@ impl<'a> Lower<'a> {
             _ => None,
         }
         .filter(|_| super::subdword_buffer_loads());
+        // A byte or short stored: into the dword holding it, its bits
+        // cleared and then set by atomic operations on that dword.
+        let sub_store = match plain.strip_prefix("buffer_store_") {
+            Some("byte") => Some(8u32),
+            Some("short") => Some(16),
+            _ => None,
+        }
+        .filter(|_| super::subdword_stores());
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() || sub.is_some() => (false, 1),
+            _ if atomic.is_some() || sub.is_some() || sub_store.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -10609,7 +10645,7 @@ impl<'a> Lower<'a> {
             },
         };
         // shortcut: a byte or short is taken not to cross a dword.
-        let (off, shift) = match sub {
+        let (off, shift) = match sub.map(|s| s.0).or(sub_store) {
             Some(_) => {
                 let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, off, three);
@@ -10665,6 +10701,42 @@ impl<'a> Lower<'a> {
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
+            return Ok(());
+        }
+        if let (Some(bits), Some(shift)) = (sub_store, shift) {
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let x = self.vgprs(inst, d, 1)?[0];
+            let mask = self.s.m.i32(((1u64 << bits) - 1) as u32);
+            let x = self.s.m.bin(c, Bin::And, x, mask);
+            let set = self.s.m.bin(c, Bin::Shl, x, shift);
+            let field = self.s.m.bin(c, Bin::Shl, mask, shift);
+            let ones = self.s.m.i32(u32::MAX);
+            let clear = self.s.m.bin(c, Bin::Xor, field, ones);
+            let (known, off) = match slot {
+                None => {
+                    let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
+                    (Some(h), off)
+                }
+                Some(_) => (None, off),
+            };
+            let at = self.begin_guarded(guard);
+            match (known, slot) {
+                (Some(h), _) => {
+                    self.buffer_atomic(h, 1, off, &[clear]);
+                    self.buffer_atomic(h, 2, off, &[set]);
+                }
+                (None, Some((index, per_lane, .., kind))) => {
+                    let kinds = [view_kind::RAW_UAV];
+                    self.by_kind(kind, &kinds, 0, |l, k| {
+                        let h = l.s.heap_handle(l.cur, index, false, per_lane, props(k));
+                        l.buffer_atomic(h, 1, off, &[clear]);
+                        l.buffer_atomic(h, 2, off, &[set]);
+                        Ok(Vec::new())
+                    })?;
+                }
+                (None, None) => unreachable!(),
+            }
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         if store {
@@ -11385,7 +11457,18 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+        let own = self.s.m.cmp(c, p, next, limit);
+        let Some((count, most)) = self.budget else {
+            return own;
+        };
+        // And the lane's passes over all its loops (`super::loop_budget`).
+        let n = self.s.m.load(c, count);
+        let n = self.s.m.bin(c, Bin::Add, n, one);
+        self.s.m.store(c, count, n);
+        let most = self.s.m.i32(most);
+        let all = self.s.m.cmp(c, p, n, most);
+        let join = if p == pred::IULT { Bin::And } else { Bin::Or };
+        self.s.m.bin(c, join, own, all)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through (in turn,

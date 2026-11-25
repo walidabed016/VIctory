@@ -209,6 +209,13 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// Passes a lane takes in all over the loops of a program with a loop that
+/// can wait on memory, with [`loop_budget`] (and no more than
+/// [`loop_limit`]): eight of [`lower::SPIN_LIMIT`]'s waits, tens of
+/// milliseconds at microseconds a pass.
+// shortcut: a genuine program that loops more than this in all is cut short too.
+pub const DEFAULT_LOOP_BUDGET: u32 = 8 * lower::SPIN_LIMIT;
+
 /// Heap slots whose view addresses shaders may read: a slot index at or
 /// past it reads the last one's. The host's view addresses (`t1` in
 /// [`shader::MEMORY_SPACE`], a root view, which nothing bounds) hold at
@@ -284,6 +291,59 @@ pub fn small_groups_on_halves() -> bool {
 pub fn coherent_memory() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT").is_some())
+}
+
+/// Whether a select (`v_cndmask_b32`, a carry-in) on a lane mask held
+/// only as a number, such as a scan's literal `0xaaaaaaaa`, tests the
+/// lane's own bit in wave32 compute code whose host lanes are the
+/// console's; refused otherwise (wave64 code keeps its halves' ways).
+/// XboxBvhBuilder's PrefixSum64 and PrefixSum128 scan so, and the radix
+/// sort between its Morton codes and its tree leaves takes their offsets.
+/// Off unless `VICTORY_MASK_NUMBERS` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn mask_numbers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_NUMBERS").is_some())
+}
+
+/// Whether a lane's loops share one count of passes besides each loop's
+/// own (per entry, [`loop_limit`]): a lane that has gone back
+/// [`DEFAULT_LOOP_BUDGET`] times in all, in a program with a loop that
+/// can wait on memory, or [`loop_limit`] times in any other, leaves the
+/// program as a loop stopped by its limit does. Per-entry limits multiply
+/// in nested loops: XboxBvhBuilder's FindTreelets nests two loops that can
+/// wait and two more under them, so a lane on a broken tree can loop for
+/// minutes while its submission holds every later one back. Off unless
+/// `VICTORY_LOOP_BUDGET` is set. The value is part of the translation, so
+/// the shader cache must key on it (`victory-gpu`'s does).
+pub fn loop_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_BUDGET").is_some())
+}
+
+/// Whether buffer stores of a byte or short (`buffer_store_byte`,
+/// `buffer_store_short`) are translated, as two atomic operations on the
+/// dword holding them (clear its bits, then set them), so lanes storing
+/// the dword's other bytes keep theirs; refused otherwise.
+/// XboxBvhBuilder's Box16Rehydration stores its nodes' 16-bit bounds so.
+/// Off unless `VICTORY_SUBDWORD_STORES` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn subdword_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBDWORD_STORES").is_some())
+}
+
+/// Whether a vector memory access whose address's two dwords are joined
+/// in different blocks takes it as title memory its lanes compute (their
+/// registers hold it at the access); refused otherwise. XboxBvhBuilder's
+/// LeafRehydration and ReloadTriangles read an unaligned dword so: an arm
+/// loads over the address's low dword, and the arm for the other lanes
+/// reads both dwords where the low one is a join. Off unless
+/// `VICTORY_SPLIT_JOINS` is set. The value is part of the translation, so
+/// the shader cache must key on it (`victory-gpu`'s does).
+pub fn split_joins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_JOINS").is_some())
 }
 
 /// Whether buffer loads of a byte or short (`buffer_load_ubyte`,

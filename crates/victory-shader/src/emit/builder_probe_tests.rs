@@ -387,3 +387,45 @@ fn find_treelets_then_construct_bvh4() {
         }
     }
 }
+
+#[test]
+fn prefix_sum64_scans_each_group_s_64_values() {
+    // PrefixSum64 (cut from XboxBvhBuilder.dll at 0xa1080, named by
+    // `VICTORY_PREFIX_SUM`): each group of 32 lanes takes 64 values, two a
+    // lane, and leaves their exclusive scan in place and their sum at the
+    // group's dword of the second buffer (root constant bit 0).
+    if !super::mask_numbers() {
+        eprintln!("without VICTORY_MASK_NUMBERS PrefixSum64 is refused: skipped");
+        return;
+    }
+    let groups = 64;
+    let mut im = Image {
+        memory: Vec::new(),
+        pages: 0,
+    };
+    let values = im.alloc(64 * groups);
+    let sums = im.alloc(groups);
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let input: Vec<u32> = (0..64 * groups)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s % 1000) as u32
+        })
+        .collect();
+    im.memory[values..values + input.len()].copy_from_slice(&input);
+    let slots = [address(values), address(sums)];
+    let Some(r) = dispatch("VICTORY_PREFIX_SUM", &im.memory, &slots, &[1], groups as u32) else {
+        eprintln!("VICTORY_PREFIX_SUM unset or no GPU: skipped");
+        return;
+    };
+    for g in 0..groups {
+        let mut total = 0;
+        for k in 0..64 {
+            assert_eq!(r[values + 64 * g + k], total, "group {g}, value {k}");
+            total += input[64 * g + k];
+        }
+        assert_eq!(r[sums + g], total, "group {g}'s sum");
+    }
+}

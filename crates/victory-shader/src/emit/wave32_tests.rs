@@ -511,3 +511,123 @@ fn a_lane_mask_a_loop_carries_as_a_number_keeps_its_lanes() {
     let carry = [0xD761_000D, 7 | 4 << 9, 0xD760_0002, v(13) as u32 | 4 << 9];
     check_lanes_left(&build(&lanes_left_loop(&carry)));
 }
+
+/// `v_cndmask_b32 vdst, src0, src1, sgpr` (VOP3).
+const fn cndmask(vdst: u8, src0: u16, src1: u16, mask: u8) -> [u32; 2] {
+    [
+        0xD501_0000 | vdst as u32,
+        src0 as u32 | (src1 as u32) << 9 | (mask as u32) << 18,
+    ]
+}
+
+/// `buffer_store_short vdata, vaddr, s[8:11], 0 offen offset:byte`.
+const fn store_short(vdata: u8, vaddr: u8, byte: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1A << 18 | 1 << 12 | (byte as u32 & 0xFFF),
+        0x80 << 24 | 2 << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+#[test]
+fn a_select_on_a_mask_held_as_a_number_tests_the_lane_s_own_bit() {
+    // PrefixSum64's scan: s7 = 0xaaaaaaaa (the odd lanes) by `s_mov_b32`,
+    // `v_cndmask_b32 v5, 0, v1, s7`; a backward permute makes the program
+    // one of console lanes.
+    let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+    w.push(vop2(0x1A, 4, inline((SLOTS * 4).trailing_zeros() as u16), 0));
+    w.extend([vop2(0x25, 1, 255, 0), 1000]);
+    w.extend([sop1(0x03, 7, 255), 0xAAAA_AAAA]);
+    w.extend(cndmask(5, ZERO, v(1), 7));
+    w.push(vop2(0x1A, 2, inline(2), 0));
+    w.extend(bpermute(6, 2, 1, 0));
+    w.extend(store(5, 4, 0));
+    w.extend(store(6, 4, 4));
+    w.push(S_ENDPGM);
+    if !crate::emit::mask_numbers() {
+        let e = lower32(&w).err().expect("refused without VICTORY_MASK_NUMBERS");
+        assert!(e.to_string().contains("a select on an untracked mask"), "{e}");
+        return;
+    }
+    let shader = build(&w);
+    for (label, got) in run(&shader) {
+        for x in 0..THREADS {
+            let odd = 0xAAAA_AAAAu32 >> (x & 31) & 1 != 0;
+            let at = (x * SLOTS) as usize;
+            assert_eq!(got[at], if odd { 1000 + x } else { 0 }, "{label}: thread {x}");
+            assert_eq!(got[at + 1], 1000 + x, "{label}: thread {x}");
+        }
+    }
+}
+
+#[test]
+fn short_stores_keep_the_other_half_of_their_dword() {
+    // Thread x stores the short 1000 + x at byte 2x (two threads per dword,
+    // at once), and at byte 256 + 4x over the dword 0xBEEFFFFF it stored
+    // there itself.
+    let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+    w.extend([vop2(0x25, 1, 255, 0), 1000]);
+    w.push(vop2(0x1A, 4, inline(1), 0));
+    w.push(vop2(0x1A, 8, inline(2), 0));
+    w.extend(mov_k(7, 0xBEEF_FFFF));
+    w.extend(store(7, 8, 256));
+    w.extend(store_short(1, 4, 0));
+    w.extend(store_short(1, 8, 256));
+    w.push(S_ENDPGM);
+    if !crate::emit::subdword_stores() {
+        let e = lower32(&w).err().expect("refused without VICTORY_SUBDWORD_STORES");
+        assert!(e.to_string().contains("buffer_store_short"), "{e}");
+        return;
+    }
+    let shader = build(&w);
+    for (label, got) in run(&shader) {
+        for k in 0..THREADS / 2 {
+            let want = (1000 + 2 * k) | (1001 + 2 * k) << 16;
+            assert_eq!(got[k as usize], want, "{label}: dword {k}");
+        }
+        for x in 0..THREADS {
+            assert_eq!(got[64 + x as usize], 0xBEEF_0000 | (1000 + x), "{label}: thread {x}");
+        }
+    }
+}
+
+#[test]
+fn nested_loops_share_the_loop_budget() {
+    // 64 passes of a loop round 4096 passes of one that can wait on memory
+    // (`s_dcache_inv`): each loop within its own limit, 262144 in all.
+    // Each outer pass stores the count so far.
+    let w = [
+        sop1(0x03, 1, 0x80),
+        0xF408_0200,
+        0xFA00_0000,
+        vop2(0x1A, 4, inline((SLOTS * 4).trailing_zeros() as u16), 0),
+        sop1(0x03, 3, 0x80),
+        sop1(0x03, 4, 0x80),
+        sop1(0x03, 2, 0x80),
+        0xF480_0000,
+        0x0000_0000,
+        0x8102_8102, // s_add_i32 s2, s2, 1
+        0x8103_8103, // s_add_i32 s3, s3, 1
+        0xBF0A_FF02, // s_cmp_lt_u32 s2, 4096
+        4096,
+        sopp(0x05, -7),
+        vop1(0x001, 5, 3),
+        store(5, 4, 0)[0],
+        store(5, 4, 0)[1],
+        0x8104_8104, // s_add_i32 s4, s4, 1
+        0xBF0A_C004, // s_cmp_lt_u32 s4, 64
+        sopp(0x05, -14),
+        S_ENDPGM,
+    ];
+    let shader = build(&w);
+    let budget = crate::emit::DEFAULT_LOOP_BUDGET.min(crate::emit::loop_limit());
+    for (label, got) in run(&shader) {
+        for x in 0..THREADS {
+            let n = got[(x * SLOTS) as usize];
+            if crate::emit::loop_budget() {
+                assert!(n < budget && n + 2 * 4096 > budget, "{label}: thread {x} counted {n}");
+            } else {
+                assert_eq!(n, 64 * 4096, "{label}: thread {x}");
+            }
+        }
+    }
+}

@@ -901,6 +901,11 @@ impl<'a> Tracer<'a> {
             Term::Const(_) => None,
         };
         if hi_phi.is_some_and(|(b, _)| b != block) {
+            // A vector access's lanes hold the address they read from in
+            // their own registers: title memory they compute.
+            if at.is_none() && crate::emit::split_joins() {
+                return Ok(None);
+            }
             return Err("an address joined in two blocks");
         }
         let phis = &self.p.blocks[block].phis;
