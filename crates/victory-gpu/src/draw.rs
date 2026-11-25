@@ -471,13 +471,13 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
-            crate::resource::alias::gpu_wrote(t as This);
+            crate::resource::alias::gpu_wrote(list, t as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_access(t as This, true);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
-            crate::resource::alias::gpu_wrote(self.depth as This);
+            crate::resource::alias::gpu_wrote(list, self.depth as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_access(self.depth as This, true);
         }
@@ -1428,7 +1428,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             let mut resource = *resource as This;
-            crate::resource::alias::gpu_wrote(resource);
+            crate::resource::alias::gpu_wrote(list, resource);
             // A depth texture's twin starts as the texture is.
             if let Some(twin) = crate::resource::unordered_twin(resource)
                 && let (Some(to), Some(from)) = (

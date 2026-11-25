@@ -50,17 +50,43 @@ struct Aliases {
     /// Reader and writer pairs logged (diagnostics).
     #[cfg(feature = "diagnostics")]
     logged: std::collections::HashSet<(usize, usize)>,
+    /// Addresses read through another resource than wrote them, and the
+    /// newest write there when the first such read was recorded: older
+    /// writes went unrecorded (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    aliased: HashMap<u64, u64>,
+    /// What each host list recorded at those addresses, until it is
+    /// recorded again (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    lists: HashMap<usize, Recorded>,
+    /// The newest write submitted at each of them (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    submitted: HashMap<u64, u64>,
+}
+
+/// A host list's reads and writes at addresses read through another
+/// resource than wrote them (diagnostics).
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Recorded {
+    /// Address, the newest write noted there when read, and whether this
+    /// list recorded that write.
+    reads: Vec<(u64, u64, bool)>,
+    /// The newest write at each address.
+    writes: HashMap<u64, u64>,
 }
 
 /// Held while a copy is recorded, so that its writer is not let go of
 /// meanwhile ([`forget`]).
 static ALIASES: Mutex<Option<Aliases>> = Mutex::new(None);
 
-/// Since the last frame line (diagnostics): alias copies, their bytes, and
-/// newer writes at a read's address not copied (layouts that differ).
+/// Since the last frame line (diagnostics): alias copies, their bytes,
+/// newer writes at a read's address not copied (layouts that differ), and
+/// submitted reads of aliased memory that took an older write than one
+/// submitted ahead of them (late), or a write submitted after them (early).
 #[cfg(feature = "diagnostics")]
-static COUNTS: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static COUNTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -77,9 +103,12 @@ fn aliases() -> std::sync::MutexGuard<'static, Option<Aliases>> {
     ALIASES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A draw or dispatch writes texture `this` through a render target, depth
-/// or unordered view.
-pub(crate) fn gpu_wrote(this: This) {
+/// A draw or dispatch recorded on `list` writes texture `this` through a
+/// render target, depth or unordered view.
+pub(crate) fn gpu_wrote(
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] list: &HostList,
+    this: This,
+) {
     if this.is_null() || !on() {
         return;
     }
@@ -92,6 +121,10 @@ pub(crate) fn gpu_wrote(this: This) {
     let a = guard.get_or_insert_with(Aliases::default);
     a.seq += 1;
     let seq = a.seq;
+    #[cfg(feature = "diagnostics")]
+    if a.aliased.contains_key(&start) {
+        recorded(a, list).writes.insert(start, seq);
+    }
     let at = a.written.entry(start).or_default();
     if let Some(w) = at.iter_mut().find(|w| w.resource == this as usize) {
         w.seq = seq;
@@ -148,6 +181,16 @@ pub(crate) fn before_read(list: &HostList, this: This) -> bool {
         inside(a, this, start);
         return false;
     };
+    #[cfg(feature = "diagnostics")]
+    if a.written[&start]
+        .iter()
+        .any(|w| w.resource != this as usize)
+    {
+        a.aliased.entry(start).or_insert(seq);
+        let recorded = recorded(a, list);
+        let here = recorded.writes.get(&start) == Some(&seq);
+        recorded.reads.push((start, seq, here));
+    }
     let seen = a.read.entry(this as usize).or_default();
     if writer == this || seq <= *seen {
         *seen = (*seen).max(seq);
@@ -370,6 +413,67 @@ fn copy_buffer(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
+/// What `list` recorded at aliased addresses, made afresh (and checked
+/// when the list is submitted) once per recording (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn recorded<'a>(a: &'a mut Aliases, list: &HostList) -> &'a mut Recorded {
+    let key = std::ptr::from_ref(list) as usize;
+    // Odd: never a texture's key.
+    if list.first_use(1) {
+        list.defer_host(move || submitted(key));
+        a.lists.insert(key, Recorded::default());
+    }
+    a.lists.entry(key).or_default()
+}
+
+/// When the list `list` is submitted (diagnostics): counts its reads of
+/// aliased memory that took an older write than one submitted ahead of
+/// them (late: recorded before their writer's list, submitted after it),
+/// and those that took a write another list recorded but has not
+/// submitted yet (early: the copy runs before that write); then notes its
+/// writes as submitted.
+#[cfg(feature = "diagnostics")]
+fn submitted(list: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    let mut guard = aliases();
+    let Some(Aliases {
+        lists,
+        submitted,
+        aliased,
+        ..
+    }) = guard.as_mut()
+    else {
+        return;
+    };
+    let Some(recorded) = lists.get(&list) else {
+        return;
+    };
+    for &(address, taken, here) in &recorded.reads {
+        let ahead = submitted.get(&address).copied().unwrap_or(0);
+        let late = ahead > taken;
+        let since = aliased.get(&address).copied().unwrap_or(0);
+        if !late && (here || taken <= ahead || taken <= since) {
+            continue;
+        }
+        COUNTS[if late { 3 } else { 4 }].fetch_add(1, Relaxed);
+        if LOGGED.fetch_add(1, Relaxed) < 20 {
+            let what = if late { "late" } else { "early" };
+            tracing::info!(
+                address = format_args!("{address:#x}"),
+                taken,
+                ahead,
+                "alias read {what}: it took write {taken} at submission, when write {ahead} was \
+                 the newest submitted"
+            );
+        }
+    }
+    for (&address, &seq) in &recorded.writes {
+        let newest = submitted.entry(address).or_default();
+        *newest = (*newest).max(seq);
+    }
+}
+
 /// A read that starts inside memory another resource was written through,
 /// past its start: logged once per pair (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -408,7 +512,7 @@ fn log_pair(a: &mut Aliases, reader: This, writer: This, what: &str) {
 /// The frame line of alias copies per frame (diagnostics).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn line(frames: f64) -> String {
-    let [copies, bytes, other] = COUNTS
+    let [copies, bytes, other, late, early] = COUNTS
         .each_ref()
         .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if !on() {
@@ -416,7 +520,8 @@ pub(crate) fn line(frames: f64) -> String {
     }
     format!(
         "  host costs per frame, alias copies: {copies:.1} copies {:.2} MiB; {other:.1} newer \
-         writes not copied (layouts differ)",
+         writes not copied (layouts differ); aliased reads at submission: {late:.1} late (took an \
+         older write than one submitted ahead), {early:.1} early (took a write submitted after)",
         bytes / f64::from(1 << 20)
     )
 }
@@ -568,7 +673,7 @@ mod tests {
                 None,
             );
         }
-        gpu_wrote(writer);
+        gpu_wrote(&list, writer);
         run(list);
         // The reads.
         let list = host.new_list().unwrap();
@@ -600,13 +705,36 @@ mod tests {
             read
         };
         assert!(read == pattern, "the reader holds the writer's bytes");
-        gpu_wrote(writer);
         let list = host.new_list().unwrap();
+        gpu_wrote(&list, writer);
         assert!(
             before_read(&list, reader),
             "a newer write is copied in again"
         );
         run(list);
+        // A read recorded before a newer write's list but submitted after
+        // it is late; one that took a write submitted after it is early.
+        #[cfg(feature = "diagnostics")]
+        {
+            let counts = || [3, 4].map(|i| COUNTS[i].load(std::sync::atomic::Ordering::Relaxed));
+            let before = counts();
+            let since = || {
+                let now = counts();
+                [now[0] - before[0], now[1] - before[1]]
+            };
+            let (reading, writing) = (host.new_list().unwrap(), host.new_list().unwrap());
+            assert!(!before_read(&reading, reader), "nothing newer yet");
+            gpu_wrote(&writing, writer);
+            run(writing);
+            run(reading);
+            assert_eq!(since(), [1, 0], "one late read");
+            let (reading, writing) = (host.new_list().unwrap(), host.new_list().unwrap());
+            gpu_wrote(&writing, writer);
+            assert!(before_read(&reading, reader), "the newer write");
+            run(reading);
+            run(writing);
+            assert_eq!(since(), [1, 1], "and one early");
+        }
         assert_eq!(host.log_messages(), None, "debug layer errors");
         for r in [narrow, reader, writer] {
             crate::object::release_boxed::<Resource>(r);
