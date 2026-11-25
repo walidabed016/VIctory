@@ -1861,7 +1861,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.vram_shared_buffer(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -2688,12 +2688,54 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        self.mapped_buffer(
+            size,
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A buffer in VRAM that the CPU maps (the GPU upload heap, through the
+    /// resizable BAR: the CPU writes it combined and reads it slowly) and
+    /// shaders read and write: for words shaders use atomically, which in
+    /// system memory cost a PCIe round trip each (the argument clamp's
+    /// budget word made each clamp command ~2.5 µs slower, VICT-9's
+    /// probe). A shared buffer where the host has no GPU upload heap.
+    pub(crate) fn vram_shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static UPLOAD_HEAPS: OnceLock<bool> = OnceLock::new();
+        let upload_heaps = *UPLOAD_HEAPS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes the structure of the given size.
+            unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok_and(|()| options.GPUUploadHeapSupported.as_bool())
+        });
+        let vram = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
             ..Default::default()
         };
+        upload_heaps
+            .then(|| self.mapped_buffer(size, vram))
+            .flatten()
+            .or_else(|| self.shared_buffer(size))
+    }
+
+    /// A buffer of `size` bytes in `heap`, mapped for the CPU, that shaders
+    /// read and write, in the common state.
+    fn mapped_buffer(
+        &self,
+        size: u64,
+        heap: D3D12_HEAP_PROPERTIES,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -2729,7 +2771,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, heap = heap.Type.0, "no CPU-mapped buffer");
                 None
             }
         }
