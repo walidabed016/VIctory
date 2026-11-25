@@ -954,6 +954,10 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(u) = used {
+                            crate::capture::note_slot(None, u);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -1460,6 +1464,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
 /// the programs `VICTORY_DUMP_DATA` names (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn note_data(view: &View, u: &UsedResource) {
+    crate::capture::note_slot(Some(view), u);
     let range = match *view {
         View::Constant(address, size) => Some((address, u64::from(size))),
         _ => crate::descriptor::host::buffer_range(view),

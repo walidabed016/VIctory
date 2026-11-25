@@ -80,6 +80,8 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    #[cfg(feature = "diagnostics")]
+    crate::capture::note_gpu_write(resource);
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     set.get_or_insert_with(Default::default)
         .insert(resource as usize);
@@ -177,6 +179,7 @@ impl Staging {
             use std::sync::atomic::Ordering::Relaxed;
             UPLOADED[0].fetch_add(self.footprints.len() as u64, Relaxed);
             UPLOADED[1].fetch_add(self.size, Relaxed);
+            crate::capture::note_upload(texture);
         }
     }
 

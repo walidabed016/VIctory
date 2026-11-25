@@ -344,7 +344,12 @@ pub(crate) fn note_data(slot: u8, offset: u32, address: u64, len: u64) {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    note_gpu_write(resource);
+    if !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -366,6 +371,442 @@ pub(crate) fn note_access(resource: crate::object::This, write: bool) {
         .map_or_else(|| format!("{pipeline:?}"), |p| p.name.clone());
     let mut accesses = ACCESSES.lock().unwrap_or_else(|e| e.into_inner());
     accesses.insert((resource as usize, write, name));
+}
+
+/// With `VICTORY_DUMP_TARGETS`, from the start: the frame the host GPU last
+/// wrote each title texture (render target, depth, unordered view, a copy
+/// or resolve), by resource, and the frame each host texture last took
+/// title memory (an upload), by host texture; for the slot lines.
+#[cfg(feature = "diagnostics")]
+static GPU_WROTE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+    std::sync::Mutex::new(None);
+#[cfg(feature = "diagnostics")]
+static UPLOADS: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// The host GPU writes the title texture `resource` in the frame being
+/// built (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_gpu_write(resource: crate::object::This) {
+    if resource.is_null() || !dump_on() {
+        return;
+    }
+    let mut map = GPU_WROTE.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .insert(resource as usize, crate::queue::presented() + 1);
+}
+
+/// Title memory is copied into the host texture `texture` (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_upload(texture: &ID3D12Resource) {
+    use windows::core::Interface;
+    if !dump_on() {
+        return;
+    }
+    let mut map = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .insert(texture.as_raw() as usize, crate::queue::presented() + 1);
+}
+
+/// A texture slot a lighting program reads in a listed frame: its view
+/// format and the programs that read it, with the host copy held.
+#[cfg(feature = "diagnostics")]
+struct SlotSeen {
+    format: Option<u32>,
+    programs: std::collections::BTreeSet<String>,
+    copy: Option<std::sync::Arc<crate::resource::HostTexture>>,
+}
+
+/// (program family, register, root parameter, table offset in dwords,
+/// resource: 0 without a texture view).
+#[cfg(feature = "diagnostics")]
+type SlotKey = (&'static str, u32, u8, u32, usize);
+
+#[cfg(feature = "diagnostics")]
+static SLOTS: std::sync::Mutex<std::collections::BTreeMap<SlotKey, SlotSeen>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The lighting family of a pipeline named with its shaders' names
+/// ([`crate::host::named`]): TL_PS or SkyMain.
+#[cfg(feature = "diagnostics")]
+fn lighting_family(named: &str) -> Option<&'static str> {
+    if named.contains("\"TL_PS") {
+        Some("TL_PS")
+    } else if named.contains("CS_SkyMain") {
+        Some("SkyMain")
+    } else {
+        None
+    }
+}
+
+/// Notes the texture slot `u` a table gives the pipeline being bound
+/// (`view` `None`: an entry without a view), if the pipeline is TL_PS or
+/// SkyMain by `VICTORY_SHADER_NAMES` and the frame is listed.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_slot(view: Option<&crate::descriptor::View>, u: &victory_shader::UsedResource) {
+    use crate::descriptor::View;
+    if u.kind != victory_shader::ResourceType::Srv
+        || u.dwords != 8
+        || !dump_on()
+        || !listed(crate::queue::presented() + 1)
+    {
+        return;
+    }
+    type Families = std::collections::HashMap<usize, Option<(&'static str, String)>>;
+    static FAMILIES: std::sync::Mutex<Option<Families>> = std::sync::Mutex::new(None);
+    let pipeline = crate::descriptor::host::BINDING.get();
+    let mut families = FAMILIES.lock().unwrap_or_else(|e| e.into_inner());
+    let families = families.get_or_insert_with(Default::default);
+    if let std::collections::hash_map::Entry::Vacant(entry) = families.entry(pipeline) {
+        let Some(p) = crate::pipeline::host_pipeline(pipeline as crate::object::This) else {
+            return;
+        };
+        entry.insert(lighting_family(&crate::host::named(&p.name)).map(|f| (f, p.name.clone())));
+    }
+    let Some(Some((family, name))) = families.get(&pipeline).cloned() else {
+        return;
+    };
+    let placed = view.and_then(crate::descriptor::host::placed_texture);
+    let (resource, format) = match placed.as_ref().or(view) {
+        Some(View::Shader(r, words)) => (*r, words.map(|w| w[0])),
+        _ => (0, None),
+    };
+    let key = (
+        family,
+        u.lower_bound,
+        u.slot,
+        u.table_offset_dwords,
+        resource,
+    );
+    let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    slots
+        .entry(key)
+        .or_insert_with(|| SlotSeen {
+            format,
+            programs: Default::default(),
+            copy: crate::resource::host_copy(resource as crate::object::This),
+        })
+        .programs
+        .insert(name);
+}
+
+/// Who last wrote a texture: the host GPU in `frame` (`this_frame`, or
+/// `gpu` there), the GPU or an upload of title memory in an earlier
+/// frame, or nothing.
+#[cfg(feature = "diagnostics")]
+fn last_writer(frame: u64, this_frame: bool, gpu: Option<u64>, cpu: Option<u64>) -> String {
+    if this_frame || gpu == Some(frame) {
+        return "gpu this frame".into();
+    }
+    match (gpu, cpu) {
+        (Some(g), Some(c)) if c > g => format!("cpu upload, frame {c} (gpu frame {g})"),
+        (Some(g), Some(c)) => format!("gpu, frame {g} (cpu upload frame {c})"),
+        (Some(g), None) => format!("gpu, frame {g}"),
+        (None, Some(c)) => format!("cpu upload, frame {c}"),
+        (None, None) => "never".into(),
+    }
+}
+
+/// Bytes per texel, channels, and the decoder of a texel's channels.
+#[cfg(feature = "diagnostics")]
+type TexelDecoder = (usize, usize, fn(&[u8]) -> [f32; 4]);
+
+/// A texel's channels as floats, NaN and infinity kept; `None` for formats
+/// not handled (block compressed).
+#[cfg(feature = "diagnostics")]
+fn texel_decoder(format: u32) -> Option<TexelDecoder> {
+    fn u16_at(b: &[u8], i: usize) -> u16 {
+        u16::from_le_bytes([b[2 * i], b[2 * i + 1]])
+    }
+    fn u32_at(b: &[u8], i: usize) -> u32 {
+        u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    }
+    fn f16(h: u16) -> f32 {
+        let sign = u32::from(h >> 15) << 31;
+        let (exp, man) = (u32::from(h >> 10 & 0x1f), u32::from(h & 0x3ff));
+        match exp {
+            0 => f32::from_bits(sign | (man as f32 / 16_777_216.0).to_bits()),
+            31 => f32::from_bits(sign | 0x7f80_0000 | man << 13),
+            e => f32::from_bits(sign | (e + 112) << 23 | man << 13),
+        }
+    }
+    fn small(bits: u32, man: u32) -> f32 {
+        let (exp, m) = (bits >> man & 0x1f, bits & ((1 << man) - 1));
+        match exp {
+            0 => m as f32 / (1u32 << (14 + man)) as f32,
+            31 => f32::from_bits(0x7f80_0000 | m << (23 - man)),
+            e => f32::from_bits((e + 112) << 23 | m << (23 - man)),
+        }
+    }
+    Some(match format {
+        2 => (16, 4, |b| {
+            [0, 1, 2, 3].map(|i| f32::from_bits(u32_at(b, i)))
+        }),
+        6 => (12, 3, |b| {
+            [0, 1, 2, 0].map(|i| f32::from_bits(u32_at(b, i)))
+        }),
+        9 | 10 => (8, 4, |b| [0, 1, 2, 3].map(|i| f16(u16_at(b, i)))),
+        11..=14 => (8, 4, |b| [0, 1, 2, 3].map(|i| f32::from(u16_at(b, i)))),
+        15 | 16 => (8, 2, |b| {
+            [
+                f32::from_bits(u32_at(b, 0)),
+                f32::from_bits(u32_at(b, 1)),
+                0.0,
+                0.0,
+            ]
+        }),
+        19..=22 => (8, 1, |b| [f32::from_bits(u32_at(b, 0)), 0.0, 0.0, 0.0]),
+        23..=25 | 89 => (4, 4, |b| {
+            let v = u32_at(b, 0);
+            [v & 0x3ff, v >> 10 & 0x3ff, v >> 20 & 0x3ff, v >> 30].map(|c| c as f32)
+        }),
+        26 => (4, 3, |b| {
+            let v = u32_at(b, 0);
+            [
+                small(v & 0x7ff, 6),
+                small(v >> 11 & 0x7ff, 6),
+                small(v >> 22, 5),
+                0.0,
+            ]
+        }),
+        27..=32 | 87 | 88 | 90..=93 => (4, 4, |b| [b[0], b[1], b[2], b[3]].map(f32::from)),
+        33 | 34 => (4, 2, |b| [f16(u16_at(b, 0)), f16(u16_at(b, 1)), 0.0, 0.0]),
+        35..=38 => (4, 2, |b| {
+            [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0, 0.0]
+        }),
+        39..=41 => (4, 1, |b| [f32::from_bits(u32_at(b, 0)), 0.0, 0.0, 0.0]),
+        42 | 43 => (4, 1, |b| [u32_at(b, 0) as f32, 0.0, 0.0, 0.0]),
+        44..=47 => (4, 1, |b| [(u32_at(b, 0) & 0xff_ffff) as f32, 0.0, 0.0, 0.0]),
+        48..=52 => (2, 2, |b| [f32::from(b[0]), f32::from(b[1]), 0.0, 0.0]),
+        53 | 54 => (2, 1, |b| [f16(u16_at(b, 0)), 0.0, 0.0, 0.0]),
+        55..=59 => (2, 1, |b| [f32::from(u16_at(b, 0)), 0.0, 0.0, 0.0]),
+        60..=65 => (1, 1, |b| [f32::from(b[0]), 0.0, 0.0, 0.0]),
+        67 => (4, 3, |b| {
+            let v = u32_at(b, 0);
+            let scale = f32::from_bits(((v >> 27) + 103) << 23);
+            [v & 0x1ff, v >> 9 & 0x1ff, v >> 18 & 0x1ff, 0].map(|c| c as f32 * scale)
+        }),
+        _ => return None,
+    })
+}
+
+/// Of `w` x `h` texels `pitch` bytes a row apart in `format`: how many,
+/// and how many have every channel zero, a NaN channel, an infinite one.
+#[cfg(feature = "diagnostics")]
+fn value_counts(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<[u64; 4]> {
+    let (n, channels, decode) = texel_decoder(format)?;
+    let mut counts = [0u64; 4];
+    for y in 0..h {
+        let Some(row) = rows.get(y * pitch..y * pitch + w * n) else {
+            break;
+        };
+        for texel in row.chunks_exact(n) {
+            let v = decode(texel);
+            let v = &v[..channels];
+            counts[0] += 1;
+            counts[1] += u64::from(v.iter().all(|&c| c == 0.0));
+            counts[2] += u64::from(v.iter().any(|c| c.is_nan()));
+            counts[3] += u64::from(v.iter().any(|c| c.is_infinite()));
+        }
+    }
+    Some(counts)
+}
+
+/// At the present of a listed frame: logs every texture slot TL_PS and
+/// SkyMain read (one line per slot and resource), who last wrote each
+/// texture, and the shares of its texels that are zero, NaN and infinite.
+/// The values come from one readback of at most 64 textures and 128 MiB,
+/// textures the frame did not write first, decoded until 750 ms in.
+#[cfg(feature = "diagnostics")]
+fn dump_slots(
+    host: &crate::host::Host,
+    frame: u64,
+    targets: &[(usize, std::sync::Arc<crate::resource::HostTexture>)],
+    accesses: &std::collections::BTreeSet<(usize, bool, String)>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    const TEXTURES: usize = 64;
+    const BYTES: u64 = 128 << 20;
+    const DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
+    let slots = std::mem::take(&mut *SLOTS.lock().unwrap_or_else(|e| e.into_inner()));
+    if slots.is_empty() {
+        return;
+    }
+    let written = |r: usize| {
+        targets.iter().any(|t| t.0 == r) || accesses.iter().any(|(x, w, _)| *x == r && *w)
+    };
+    let mut order: Vec<(usize, _, Option<u32>)> = Vec::new();
+    for (key, seen) in &slots {
+        if let Some(copy) = &seen.copy
+            && !order.iter().any(|o| o.0 == key.4)
+        {
+            order.push((key.4, copy, seen.format));
+        }
+    }
+    order.sort_by_key(|o| written(o.0));
+    let started = std::time::Instant::now();
+    let mut reads = Vec::new();
+    let mut skipped = std::collections::HashMap::new();
+    if let Ok(list) = host.new_list() {
+        let mut bytes = 0;
+        for &(r, copy, format) in &order {
+            let texture = &copy.texture;
+            let mut size = 0;
+            // SAFETY: a live resource; the total of its first subresource.
+            let d = unsafe {
+                let d = texture.GetDesc();
+                host.device
+                    .GetCopyableFootprints(&d, 0, 1, 0, None, None, None, Some(&mut size));
+                d
+            };
+            let why = if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                Some("multisampled or a buffer")
+            } else if reads.len() >= TEXTURES {
+                Some("over the 64 texture cap")
+            } else if bytes + size > BYTES {
+                Some("over the 128 MiB cap")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                skipped.insert(r, why);
+                continue;
+            }
+            let state = crate::host::legal_state(texture, copy.state.load(Relaxed));
+            let state = D3D12_RESOURCE_STATES(state as i32);
+            let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            // SAFETY: an open list of ours and a live texture, moved back to
+            // the state it is tracked in.
+            let read = unsafe {
+                if state != source {
+                    list.list
+                        .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
+                }
+                let read = read_back(&host.device, &list.list, texture);
+                if state != source {
+                    list.list
+                        .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
+                }
+                read
+            };
+            match read {
+                Some((buffer, footprint)) => {
+                    bytes += size;
+                    reads.push((r, buffer, footprint, format));
+                }
+                None => {
+                    skipped.insert(r, "readback failed");
+                }
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        crate::pipelined::wait_all();
+    }
+    let mut values = std::collections::HashMap::new();
+    for (r, buffer, footprint, view_format) in reads {
+        if started.elapsed() > DEADLINE {
+            skipped.insert(r, "past the 750 ms deadline");
+            continue;
+        }
+        let f = footprint.Footprint;
+        let host_format = f.Format.0 as u32;
+        let bytes = |format: u32| {
+            crate::resource::element(format)
+                .filter(|e| e.1 == 1)
+                .map(|e| e.0)
+        };
+        let format = view_format
+            .filter(|&v| bytes(v).is_some() && bytes(v) == bytes(host_format))
+            .unwrap_or(host_format);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy finished; the mapping spans the footprint's rows.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), rows_bytes(&f) as usize);
+            let counts = value_counts(
+                format,
+                f.Width as usize,
+                (f.Height * f.Depth) as usize,
+                f.RowPitch as usize,
+                rows,
+            );
+            buffer.Unmap(0, None);
+            values.insert(r, (format, counts));
+        }
+    }
+    let gpu = GPU_WROTE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    let cpu = UPLOADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    for ((family, register, root, offset, resource), seen) in &slots {
+        let r = *resource as crate::object::This;
+        let (address, bytes, description) = crate::resource::texture_span(r).unwrap_or_default();
+        let uploaded = seen
+            .copy
+            .as_ref()
+            .and_then(|c| cpu.get(&(c.texture.as_raw() as usize)).copied());
+        let writer = if *resource == 0 {
+            "no texture view".to_owned()
+        } else {
+            last_writer(
+                frame,
+                written(*resource),
+                gpu.get(resource).copied(),
+                uploaded,
+            )
+        };
+        let shares = match values.get(resource) {
+            Some((format, Some([n, zero, nan, inf]))) if *n > 0 => {
+                let pc = |c: u64| 100.0 * c as f64 / *n as f64;
+                format!(
+                    "f{format}: {n} texels, zero {:.3}%, NaN {:.3}%, Inf {:.3}%",
+                    pc(*zero),
+                    pc(*nan),
+                    pc(*inf)
+                )
+            }
+            Some((format, _)) => format!("f{format}: format not decoded"),
+            None => match skipped.get(resource) {
+                Some(why) => format!("not read: {why}"),
+                None if seen.copy.is_none() => "no host texture".to_owned(),
+                None => "not read".to_owned(),
+            },
+        };
+        tracing::info!(
+            frame,
+            family,
+            register = format_args!("t{register}"),
+            root,
+            table_dword = offset,
+            programs = seen.programs.len(),
+            resource = ?r,
+            address = format_args!("{address:#x}+{bytes:#x}"),
+            description,
+            view_format = ?seen.format,
+            writer,
+            values = shares,
+            "lighting program texture slot"
+        );
+    }
+    tracing::info!(
+        frame,
+        slots = slots.len(),
+        textures = order.len(),
+        read = values.len(),
+        skipped = skipped.len(),
+        ms = started.elapsed().as_millis() as u64,
+        "lighting program texture slots read back"
+    );
 }
 
 /// At the present of frame `frame`: saves the noted targets, and logs the
@@ -460,6 +901,8 @@ pub(crate) fn dump_targets(frame: u64) {
         let prefix = format!("frame-{frame}-{i:02}-{resource:?}");
         dump_one(host, texture, state, resource, &prefix, &d, raw);
     }
+    #[cfg(feature = "diagnostics")]
+    dump_slots(host, frame, &targets, &accesses);
 }
 
 /// Pairs (reader, target) whose memory overlaps, of textures read but not
@@ -844,6 +1287,69 @@ mod tests {
             (5, 0x3f00, 0x200),
         ];
         assert_eq!(super::aliased(&read, &written), [(3, 1), (5, 2)]);
+    }
+
+    /// Half floats keep NaN apart from infinity, R11G11B10 too, and
+    /// R9G9B9E5 scales its mantissas by the shared exponent: a NaN, an
+    /// infinity, a zero and a value count once each.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn texel_counts_tell_zero_nan_and_infinity() {
+        let halves: Vec<u8> = [[0u16; 4], [0x7e00, 0, 0, 0], [0, 0x7c00, 0, 0], [0x3c00; 4]]
+            .iter()
+            .flatten()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        assert_eq!(
+            super::value_counts(10, 4, 1, 32, &halves),
+            Some([4, 1, 1, 1])
+        );
+        let nan_11 = (31u32 << 6) | 1;
+        let small: Vec<u8> = [nan_11, 31 << 6, 0, 15 << 6]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            super::value_counts(26, 4, 1, 16, &small),
+            Some([4, 1, 1, 1])
+        );
+        let values: Vec<u8> = [0x3c00u16, 0xc000, 1, 0x7bff]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let decode = super::texel_decoder(10).unwrap().2;
+        assert_eq!(decode(&values), [1.0, -2.0, 2f32.powi(-24), 65504.0]);
+        let decode = super::texel_decoder(26).unwrap().2;
+        let packed = (15u32 << 6) | (16 << 17) | (14 << 27);
+        assert_eq!(decode(&packed.to_le_bytes()), [1.0, 2.0, 0.5, 0.0]);
+        let half = (15u32 << 27) | 256;
+        let decode = super::texel_decoder(67).unwrap().2;
+        assert_eq!(decode(&half.to_le_bytes())[0], 0.5);
+        let shared: Vec<u8> = [0u32, half].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            super::value_counts(67, 1, 2, 4, &shared),
+            Some([2, 1, 0, 0])
+        );
+    }
+
+    /// A write this frame wins; otherwise the later of the GPU's and an
+    /// upload's frames, or nothing.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_last_writer_is_this_frames_gpu_or_the_later_of_gpu_and_upload() {
+        use super::last_writer;
+        assert_eq!(last_writer(9, true, None, Some(8)), "gpu this frame");
+        assert_eq!(last_writer(9, false, Some(9), None), "gpu this frame");
+        assert_eq!(
+            last_writer(9, false, Some(3), Some(7)),
+            "cpu upload, frame 7 (gpu frame 3)"
+        );
+        assert_eq!(
+            last_writer(9, false, Some(7), Some(3)),
+            "gpu, frame 7 (cpu upload frame 3)"
+        );
+        assert_eq!(last_writer(9, false, None, Some(2)), "cpu upload, frame 2");
+        assert_eq!(last_writer(9, false, None, None), "never");
     }
 
     #[test]
