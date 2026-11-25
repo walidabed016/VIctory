@@ -306,6 +306,26 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Programs that hang the host GPU however their loops are bounded: their
+/// dispatches are dropped unless `VICTORY_RUN_HANGING=1`.
+/// XboxBvhBuilder.dll@0x53fd0's BVH refit climbs parent links that never
+/// reach the root (runs 127 and 128, 1 warp and then 125 spinning).
+#[cfg(windows)]
+const HANGING: &[&str] = &["5552dac6a2b7a1fd"];
+
+/// Whether `this` holds a program of [`HANGING`] that is not to run.
+#[cfg(windows)]
+pub(crate) fn hangs(this: This) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    let run =
+        *RUN.get_or_init(|| std::env::var_os("VICTORY_RUN_HANGING").is_some_and(|v| v == "1"));
+    !run && !this.is_null()
+        && pipeline(this)
+            .shaders
+            .iter()
+            .any(|shader| HANGING.contains(&shader.hash.as_str()))
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

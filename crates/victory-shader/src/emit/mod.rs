@@ -207,6 +207,13 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// Heap slots whose view addresses shaders may read: a slot index at or
+/// past it reads the last one's. The host's view addresses (`t1` in
+/// [`shader::MEMORY_SPACE`], a root view, which nothing bounds) hold at
+/// least this many: an index read from memory the host has not mirrored
+/// or holds stale reached past them (run 129, a device page fault).
+pub const VIEW_ADDRESS_SLOTS: u32 = 1 << 20;
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///

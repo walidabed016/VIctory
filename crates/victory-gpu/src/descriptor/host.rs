@@ -420,7 +420,8 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let slots = self.count.max(victory_shader::emit::VIEW_ADDRESS_SLOTS);
+            let (buffer, data) = host()?.upload_buffer(u64::from(slots) * 8)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());

@@ -878,6 +878,11 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        if crate::pipeline::hangs(self.pipeline as This) {
+            once!("a dispatch of a program that hangs the host GPU dropped (VICTORY_RUN_HANGING=1 runs it)");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),

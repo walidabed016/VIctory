@@ -6273,6 +6273,12 @@ impl<'a> Lower<'a> {
             let val = if word < 2 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
+                let (slots, last) = (
+                    self.s.m.i32(super::VIEW_ADDRESS_SLOTS),
+                    self.s.m.i32(super::VIEW_ADDRESS_SLOTS - 1),
+                );
+                let inside = self.s.m.cmp(c, pred::IULT, index, slots);
+                let index = self.s.m.select(c, inside, index, last);
                 let three = self.s.m.i32(3);
                 let at = self.s.m.bin(c, Bin::Shl, index, three);
                 let w = self.s.m.i32(4 * word);
