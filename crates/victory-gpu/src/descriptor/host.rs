@@ -460,6 +460,14 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Slots viewing placed textures whose memory the title reused, if
+        // not written again since: they would hold the textures.
+        for (slot, record) in crate::resource::stale_slots(std::ptr::from_ref(self) as usize) {
+            if made.get(slot as usize) == Some(&record) {
+                made[slot as usize] = 0;
+                self.make_null(slot);
+            }
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -478,6 +486,13 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
+            if kept.is_some()
+                && let View::Placed(_, resource, desc) = &view
+            {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let heap = std::ptr::from_ref(self) as usize;
+                crate::resource::placed_slot(address, resource, heap, index, key);
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -1696,6 +1711,47 @@ mod tests {
         texture[12] = 0;
         assert!(placed_texture(&View::Placed(true, texture, words)).is_none());
         assert!(placed_texture(&View::Placed(false, texture, words)).is_some());
+    }
+
+    /// A slot viewing a placed texture whose memory another texture takes
+    /// is made null, so it no longer holds the texture; a slot viewing the
+    /// new texture keeps it.
+    #[test]
+    fn slots_of_placed_textures_whose_memory_is_reused_are_made_null() {
+        let _serial = crate::watch::serial();
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = Box::leak(vec![0u8; 0x3_0000].into_boxed_slice());
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        // 64x64 R8G8B8A8_UNORM, then B8G8R8A8_UNORM in the same memory.
+        let texture = |format: u32| [3, 0, 0, 0, 64, 0, 64, 0x1_0001, format, 1, 0, 0, 0, 0];
+        let view = |format: u32| {
+            let mut words = [0u32; 16];
+            words[..6].copy_from_slice(&[format, 4, 0x1688, 0, 0, u32::MAX]);
+            words[10] = address as u32;
+            words[11] = (address >> 32) as u32;
+            View::Placed(false, texture(format), words)
+        };
+        let slots = Box::leak(Box::new([[0u64; 4]; 2]));
+        let handles = [0, 1].map(|i| slots[i].as_ptr() as u64);
+        BINDLESS_TEXTURES.set(true);
+        crate::descriptor::record(handles[0], view(28));
+        let first = heap.mirror(0, handles[0], false);
+        let later = crate::queue::presented() + 2;
+        let reused = crate::resource::texture_at_in(address, &texture(87), later);
+        crate::descriptor::record(handles[1], view(87));
+        let second = heap.mirror(1, handles[1], false);
+        BINDLESS_TEXTURES.set(false);
+        assert!(first.is_some() && reused.is_some() && second.is_some());
+        let kept = heap.kept.lock().unwrap();
+        assert!(kept[0].is_none(), "memory reused: made null");
+        assert!(kept[1].is_some());
+        drop(kept);
+        assert_eq!(heap.made.lock().unwrap()[0], 0, "made again if read");
     }
 
     /// With `VICTORY_BINDLESS_TEXTURES=1`, the view of a texture the title

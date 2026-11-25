@@ -3402,13 +3402,15 @@ impl Meter {
                     let placed = &crate::descriptor::host::BINDLESS;
                     let [made, first, read, bytes] =
                         [0, 1, 2, 3].map(|i| placed[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                    let [live, live_mib, gone] = crate::resource::placed_textures();
+                    let [live, live_mib, held, held_mib, gone, nulled] =
+                        crate::resource::placed_textures();
                     tracing::info!(
                         "placed textures per frame: {made:.1} views made as the title wrote them \
                          ({:.1} MiB of textures reached first), {read:.1} brought up to date for a \
                          stage ({:.1} MiB); {} textures, {} MiB so far; {live} live ({live_mib} \
-                         MiB), {gone} let go of as their memory was reused \
-                         (VICTORY_BINDLESS_TEXTURES)",
+                         MiB), {held} let go of that heap slots may still view ({held_mib} MiB); \
+                         {gone} let go of, {nulled} heap slots made null as their memory was \
+                         reused (VICTORY_BINDLESS_TEXTURES)",
                         first / f64::from(1 << 20),
                         bytes / f64::from(1 << 20),
                         placed[4].load(Ordering::Relaxed),
