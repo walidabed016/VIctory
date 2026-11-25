@@ -1162,10 +1162,8 @@ mod tests {
         if again.take_if(|&mut d| d == at).is_some() {
             let mut old = 0;
             // SAFETY: the test's own allocation; only its protection changes.
-            assert_ne!(
-                unsafe { VirtualProtect(at as _, 1, PAGE_READONLY, &mut old) },
-                0
-            );
+            let guarded = unsafe { VirtualProtect(at as _, 1, PAGE_READONLY, &mut old) };
+            assert_ne!(guarded, 0);
         }
     }
 
