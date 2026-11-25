@@ -247,6 +247,101 @@ fn merge_words(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Merged {
     (runs, taken)
 }
 
+/// [`merge_words`] told the words the GPU changed by the compare's bits
+/// (`bits`, from bit `first`, that of the word `skip` bytes into which the
+/// slices start) instead of by what the copy held: those words' bytes are
+/// the GPU's, and the copy takes the title's others. By word, as the
+/// compare tells: a byte the title wrote meanwhile into a word the GPU
+/// changed is lost.
+fn merge_bits(
+    title: &mut [u8],
+    host: &mut [u8],
+    bits: &[u32],
+    first: usize,
+    skip: usize,
+) -> Merged {
+    assert!(host.len() == title.len() && skip < 4);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut taken: Option<(usize, usize)> = None;
+    let len = title.len();
+    let words = (len + skip).div_ceil(4);
+    let edge = |w: usize| (4 * w).saturating_sub(skip).min(len);
+    for k in 0..words.div_ceil(32) {
+        let mut mask = bits_at(bits, first + 32 * k);
+        let held = (words - 32 * k).min(32);
+        if held < 32 {
+            mask &= (1 << held) - 1;
+        }
+        let (from, to) = (edge(32 * k), edge(32 * k + held));
+        if mask == 0 && title[from..to] == host[from..to] {
+            continue;
+        }
+        for w in 0..held {
+            let (a, b) = (edge(32 * k + w), edge(32 * k + w + 1));
+            let (t, h) = (&mut title[a..b], &mut host[a..b]);
+            if t == h {
+                continue;
+            }
+            if mask >> w & 1 != 0 {
+                t.copy_from_slice(h);
+                match runs.last_mut() {
+                    Some(run) if run.1 == a => run.1 = b,
+                    _ => runs.push((a, b)),
+                }
+            } else {
+                h.copy_from_slice(t);
+                taken = Some((taken.map_or(a, |s| s.0), b));
+            }
+        }
+    }
+    (runs, taken)
+}
+
+/// The 32 bits of `bits` from bit `at` (clear past its end).
+fn bits_at(bits: &[u32], at: usize) -> u32 {
+    let (i, s) = (at / 32, at % 32);
+    let low = bits.get(i).map_or(0, |b| b >> s);
+    match s {
+        0 => low,
+        _ => low | bits.get(i + 1).map_or(0, |b| b << (32 - s)),
+    }
+}
+
+/// Whether any of `count` bits of `bits` from bit `first` is set: the
+/// words between the first and the last read whole (copy-back reads a
+/// world frame's ~6 MB of them).
+fn any_bit(bits: &[u32], first: usize, count: usize) -> bool {
+    if count == 0 {
+        return false;
+    }
+    let end = first + count;
+    let (a, z) = (first / 32, (end - 1) / 32);
+    let edge = |i: usize| {
+        let (lo, hi) = (first.max(32 * i) - 32 * i, end.min(32 * i + 32) - 32 * i);
+        bits.get(i)
+            .map_or(0, |b| b & (u32::MAX >> (32 - (hi - lo))) << lo)
+    };
+    edge(a) != 0
+        || edge(z) != 0
+        || bits
+            .get(a + 1..z.min(bits.len()))
+            .is_some_and(|m| m.iter().any(|&b| b != 0))
+}
+
+/// What tells [`Shadow::write_back`] the words shaders changed: what the
+/// copy held before the submission, or the compare's bits ([`told`]) from
+/// the bit of the word holding the range's first byte, with the title
+/// blocks it found no word changed in ([`unchanged`]), whose bits go
+/// unread.
+enum How<'a> {
+    Was(&'a Was<'a>),
+    Bits {
+        bits: &'a [u32],
+        first: usize,
+        unchanged: &'a std::collections::HashSet<usize>,
+    },
+}
+
 /// What a copy held before a submission, for its copy-back: snapshots
 /// (offset, bytes), blocks kept (title block, bytes) and armed regions
 /// (from, to, asking; [`Shadow::arm`]).
@@ -648,12 +743,8 @@ impl Shadow {
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per region of the copy and submission, grown to cover
-    /// every range the submission declares there (the world declares
-    /// overlapping views of its 174 MB heap dozens of times), joining
-    /// ranges less than a window apart, in reused memory (fresh snapshots
-    /// cost ~2.3 million page faults per world frame).
+    /// write this range. Its bytes are kept to tell later what the GPU wrote
+    /// ([`Shadow::snapshot`]), unless the compare tells it by word.
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.in_place {
             return;
@@ -664,6 +755,30 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
+        if !self.told_by_words() {
+            self.snapshot(address, len, slot);
+        }
+    }
+
+    /// Whether the compare tells copy-back by word what shaders changed in
+    /// this copy ([`words_on`]): its GpuWrite steps take no snapshot, and
+    /// ranges no compare tells take theirs at submission
+    /// ([`snapshot_untold`]).
+    pub(crate) fn told_by_words(&self) -> bool {
+        words_on()
+            && twin_compare_on()
+            && self.twin.is_some()
+            && !self.in_place
+            && self.start.is_multiple_of(4)
+    }
+
+    /// The bytes of title addresses `[address, address + len)` kept for the
+    /// submission in `slot`: one snapshot per region of the copy and
+    /// submission, grown to cover every range the submission declares there
+    /// (the world declares overlapping views of its 174 MB heap dozens of
+    /// times), joining ranges less than a window apart, in reused memory
+    /// (fresh snapshots cost ~2.3 million page faults per world frame).
+    fn snapshot(&self, address: usize, len: usize, slot: usize) {
         let (from, to) = self.inside(address, len);
         if from < to && armed_snapshots() && crate::watch::view(self.start as usize + from) {
             #[cfg(feature = "diagnostics")]
@@ -879,6 +994,7 @@ impl Shadow {
         &self,
         declared: &[(usize, usize)],
         unchanged: &std::collections::HashSet<usize>,
+        told: Option<ToldOf>,
         slot: usize,
     ) -> usize {
         let merged = self.merged(declared);
@@ -932,11 +1048,58 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             slot,
         };
+        // The ranges the compare told by word ([`told`]), whole words, within
+        // those declared, once each: offsets and the bit of the word holding
+        // the first byte. What the copy held tells the rest.
+        let mut by_words: Vec<(usize, usize, usize)> = Vec::new();
+        for &(title, bytes, bit) in told.map_or(&[][..], |t| t.1) {
+            let (a, b) = (title - start, title - start + bytes);
+            let first = merged.partition_point(|&(_, to)| to <= a);
+            for &(from, to) in merged[first..].iter().take_while(|r| r.0 < b) {
+                let lo = from.max(a);
+                by_words.push((lo, to.min(b), bit + lo / 4 - a / 4));
+            }
+        }
+        by_words.sort_unstable();
+        let mut end = 0;
+        by_words.retain_mut(|r| {
+            if r.0 < end {
+                r.2 += end / 4 - r.0 / 4;
+                r.0 = end;
+            }
+            end = end.max(r.1);
+            r.0 < r.1
+        });
         let mut written = 0;
         #[cfg(feature = "diagnostics")]
         let lux_merged = merged.clone();
         for (from, to) in merged {
-            written += self.write_back(from, to, &was);
+            let mut at = from;
+            for &(a, b, _) in &by_words {
+                if b <= at {
+                    continue;
+                }
+                if a >= to {
+                    break;
+                }
+                if a > at {
+                    written += self.write_back(at, a, &How::Was(&was));
+                }
+                at = at.max(b);
+            }
+            if at < to {
+                written += self.write_back(at, to, &How::Was(&was));
+            }
+        }
+        if let Some((bits, _)) = told {
+            for &(from, to, first) in &by_words {
+                let how = How::Bits {
+                    bits,
+                    first,
+                    unchanged,
+                };
+                written += self.write_back(from, to, &how);
+            }
         }
         #[cfg(feature = "diagnostics")]
         lux_copy_back(self, &lux_merged, "after");
@@ -964,11 +1127,12 @@ impl Shadow {
         written
     }
 
-    /// [`Shadow::copy_back`] of offsets `[from, to)`, whose bytes before
-    /// the submission `was` tells: by 64 KiB piece, the copy compared with
-    /// them (on several threads for big ranges; armed blocks as title memory
-    /// holds them), title memory read only where the GPU wrote.
-    fn write_back(&self, from: usize, to: usize, was: &Was) -> usize {
+    /// [`Shadow::copy_back`] of offsets `[from, to)`, `how` tells the words
+    /// shaders changed: by 64 KiB piece, the copy compared with its bytes
+    /// before the submission (on several threads for big ranges; armed
+    /// blocks as title memory holds them) or the compare's bits read, title
+    /// memory read only where the GPU wrote.
+    fn write_back(&self, from: usize, to: usize, how: &How) -> usize {
         const PIECE: usize = 64 << 10;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -986,84 +1150,106 @@ impl Shadow {
             }
             at += n;
         }
-        let changed: Vec<usize> = split(pieces.len(), to - from, |part| {
-            let mut seen = None;
-            part.filter(|&i| {
-                let (at, host, n) = pieces[i];
-                if was.unchanged.contains(&((start + at) / PAGE)) {
-                    crate::host::TWINS[4].fetch_add(n as u64, Ordering::Relaxed);
-                    return false;
-                }
-                // SAFETY: inside the copy's memory, which the GPU is done
-                // with; only this thread writes it.
-                let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
-                match was.at(at, n) {
-                    Some(Before::Bytes(before)) => host != before,
-                    // Blocks no longer armed tell what they held below.
-                    Some(Before::Armed(_)) => {
-                        crate::watch::in_place((start + at) / PAGE, &mut seen, || {
-                            // SAFETY: an armed block, mapped while it is read.
-                            host != unsafe {
-                                std::slice::from_raw_parts((start + at) as *const u8, n)
-                            }
-                        })
-                        .unwrap_or(true)
+        let changed: Vec<usize> = match how {
+            How::Bits {
+                bits,
+                first,
+                unchanged,
+            } => (0..pieces.len())
+                .filter(|&i| {
+                    let (at, _, n) = pieces[i];
+                    if unchanged.contains(&((start + at) / PAGE)) {
+                        crate::host::TWINS[4].fetch_add(n as u64, Ordering::Relaxed);
+                        return false;
                     }
-                    None => false,
-                }
+                    let words = (at + n).div_ceil(4) - at / 4;
+                    any_bit(bits, first + at / 4 - from / 4, words)
+                })
+                .collect(),
+            How::Was(was) => split(pieces.len(), to - from, |part| {
+                let mut seen = None;
+                part.filter(|&i| {
+                    let (at, host, n) = pieces[i];
+                    if was.unchanged.contains(&((start + at) / PAGE)) {
+                        crate::host::TWINS[4].fetch_add(n as u64, Ordering::Relaxed);
+                        return false;
+                    }
+                    // SAFETY: inside the copy's memory, which the GPU is done
+                    // with; only this thread writes it.
+                    let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
+                    match was.at(at, n) {
+                        Some(Before::Bytes(before)) => host != before,
+                        // Blocks no longer armed tell what they held below.
+                        Some(Before::Armed(_)) => {
+                            crate::watch::in_place((start + at) / PAGE, &mut seen, || {
+                                // SAFETY: an armed block, mapped while it is read.
+                                host != unsafe {
+                                    std::slice::from_raw_parts((start + at) as *const u8, n)
+                                }
+                            })
+                            .unwrap_or(true)
+                        }
+                        None => false,
+                    }
+                })
+                .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-        })
-        .concat();
+            .concat(),
+        };
         let mut title = vec![0u8; PIECE];
         let (mut written, mut synced) = (0, Vec::new());
         for i in changed {
             let (at, host, n) = pieces[i];
             let saved;
-            let old: &[u8] = match was.at(at, n) {
-                Some(Before::Bytes(before)) => before,
-                Some(Before::Armed(asked)) => {
-                    let block = (start + at) / PAGE;
-                    let Some(bytes) = crate::watch::before(block, asked) else {
-                        #[cfg(feature = "diagnostics")]
-                        self.audit(
-                            was.slot,
-                            at,
-                            // SAFETY: as below.
-                            unsafe { std::slice::from_raw_parts(host as *const u8, n) },
-                            None,
-                            || format!("missed: {}", crate::watch::describe(block, asked)),
-                        );
-                        #[cfg(feature = "diagnostics")]
-                        crate::copystat::cost(
-                            crate::copystat::Op::Missed,
-                            std::time::Instant::now(),
-                            start + at,
-                            n as u64,
-                        );
-                        continue;
-                    };
-                    saved = bytes;
-                    let first = start + at - block * PAGE;
-                    &saved[first..first + n]
-                }
-                None => continue,
+            let old: Option<&[u8]> = match how {
+                How::Bits { .. } => None,
+                How::Was(was) => match was.at(at, n) {
+                    Some(Before::Bytes(before)) => Some(before),
+                    Some(Before::Armed(asked)) => {
+                        let block = (start + at) / PAGE;
+                        let Some(bytes) = crate::watch::before(block, asked) else {
+                            #[cfg(feature = "diagnostics")]
+                            self.audit(
+                                was.slot,
+                                at,
+                                // SAFETY: as below.
+                                unsafe { std::slice::from_raw_parts(host as *const u8, n) },
+                                None,
+                                || format!("missed: {}", crate::watch::describe(block, asked)),
+                            );
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::cost(
+                                crate::copystat::Op::Missed,
+                                std::time::Instant::now(),
+                                start + at,
+                                n as u64,
+                            );
+                            continue;
+                        };
+                        saved = bytes;
+                        let first = start + at - block * PAGE;
+                        Some(&saved[first..first + n])
+                    }
+                    None => continue,
+                },
             };
             #[cfg(feature = "diagnostics")]
-            self.audit(
-                was.slot,
-                at,
-                // SAFETY: as below.
-                unsafe { std::slice::from_raw_parts(host as *const u8, n) },
-                Some(old),
-                || match was.at(at, n) {
-                    Some(Before::Armed(asked)) => {
-                        crate::watch::describe((start + at) / PAGE, asked)
-                    }
-                    _ if was.kept.contains_key(&((start + at) / PAGE)) => "kept".into(),
-                    _ => "snapshot".into(),
-                },
-            );
+            if let (How::Was(was), Some(old)) = (how, old) {
+                self.audit(
+                    was.slot,
+                    at,
+                    // SAFETY: as below.
+                    unsafe { std::slice::from_raw_parts(host as *const u8, n) },
+                    Some(old),
+                    || match was.at(at, n) {
+                        Some(Before::Armed(asked)) => {
+                            crate::watch::describe((start + at) / PAGE, asked)
+                        }
+                        _ if was.kept.contains_key(&((start + at) / PAGE)) => "kept".into(),
+                        _ => "snapshot".into(),
+                    },
+                );
+            }
             // SAFETY: as above.
             let host = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, n) };
             let title = &mut title[..n];
@@ -1074,7 +1260,13 @@ impl Shadow {
             // title's bytes in turn. Only the words the GPU changed go back:
             // the title writes the piece while we compare it, and writing it
             // whole put the bytes we read back over those writes.
-            let (runs, taken) = merge_words(title, host, old);
+            let (runs, taken) = match (old, how) {
+                (Some(old), _) => merge_words(title, host, old),
+                (None, How::Bits { bits, first, .. }) => {
+                    merge_bits(title, host, bits, first + at / 4 - from / 4, at % 4)
+                }
+                (None, How::Was(_)) => unreachable!("a piece told by no bytes"),
+            };
             #[cfg(test)]
             if let Some(race) = BEFORE_WRITING
                 .lock()
@@ -2376,6 +2568,26 @@ pub(crate) fn twin_skip_on() -> bool {
     })
 }
 
+/// Whether [`compare_twins`] also marks, a bit per word, the words shaders
+/// changed in twinned copies ([`CHANGED`]), for their copy-back: it writes
+/// those words back with no snapshot taken and nothing compared on the CPU,
+/// and their GpuWrite steps do not wait for the submissions in flight
+/// ([`Shadow::told_by_words`]). The GPU waits instead, before a
+/// submission's compares, for the copy-backs in flight that read what they
+/// store ([`compared`]). `VICTORY_NO_TWIN_WORDS` turns it off.
+pub(crate) fn words_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_TWIN_WORDS").is_none();
+        if !on {
+            tracing::info!(
+                "copy-back compares twinned copies with snapshots (VICTORY_NO_TWIN_WORDS)"
+            );
+        }
+        on
+    })
+}
+
 /// A twin's range a submission's shaders write, kept before it runs
 /// ([`snapshot_twins`]): the GPU addresses of the twin's bytes, of the
 /// kept bytes and of the host copy's, and the length, a multiple of 4.
@@ -2391,6 +2603,9 @@ pub(crate) struct Compare {
     /// Where the compare notes the range's blocks in [`NOTES`]: the GPU
     /// address and index of the first one's word.
     notes: Option<(u64, usize)>,
+    /// The bit of the range's first word in [`CHANGED`]; none where
+    /// copy-back is not told by word.
+    words: Option<usize>,
 }
 
 /// Where the compare notes the 64 KiB blocks of title memory it found a
@@ -2426,6 +2641,58 @@ unsafe impl Send for Keep {}
 
 /// By submission slot, as [`NOTES`].
 static KEEP: [Mutex<Keep>; SLOTS] = [const { Mutex::new(Keep(None)) }; SLOTS];
+
+/// Where the compare marks the words shaders changed in twinned copies, a
+/// bit per word of the ranges in the order [`KEEP`] holds them
+/// ([`words_on`]), in system memory: it stores only the bitmap words not
+/// zero, and copy-back clears them ([`Told::clear`]). A world frame
+/// compares ~1.3 GB, mostly unchanged: copying its 40 MB of bits down
+/// whole cost ~6 ms of GPU time.
+struct Changed {
+    /// The buffer (alive while mapped), its GPU address and its mapping.
+    _buffer: ID3D12Resource,
+    gpu: u64,
+    data: usize,
+    /// Bitmap words held, and those the submission being prepared uses.
+    words: usize,
+    used: usize,
+}
+
+// SAFETY: as [`Notes`].
+unsafe impl Send for Changed {}
+
+/// By submission slot, as [`NOTES`].
+static CHANGED: [Mutex<Option<Changed>>; SLOTS] = [const { Mutex::new(None) }; SLOTS];
+
+/// The GPU address of [`CHANGED`], made (clear) or grown first if needed
+/// to hold `words` bitmap words; none if the host gives no memory for
+/// them. Of slot `slot`.
+fn changed(words: usize, slot: usize) -> Option<u64> {
+    let mut changed = CHANGED[slot].lock().unwrap_or_else(|e| e.into_inner());
+    if changed.as_ref().is_none_or(|c| c.words < words) {
+        // The slot's last submission has completed: the smaller buffer can
+        // go.
+        *changed = None;
+        let len = (4 * words as u64).next_multiple_of(64 << 10);
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || "words the twin compare found changed".into());
+        // SAFETY: a live buffer, and its mapping of `len` bytes.
+        let gpu = unsafe {
+            std::ptr::write_bytes(data, 0, len as usize);
+            buffer.GetGPUVirtualAddress()
+        };
+        *changed = Some(Changed {
+            _buffer: buffer,
+            gpu,
+            data: data as usize,
+            words: len as usize / 4,
+            used: 0,
+        });
+    }
+    let c = changed.as_mut()?;
+    c.used = words;
+    Some(c.gpu)
+}
 
 /// The host gave no VRAM to keep twins' ranges in: they come down whole.
 static NO_KEEP: AtomicBool = AtomicBool::new(false);
@@ -2528,6 +2795,10 @@ pub(crate) fn snapshot_twins(
     let blocks = |title: usize, bytes: u64| (title + bytes as usize - 1) / PAGE - title / PAGE + 1;
     let words: usize = ranges.iter().map(|r| blocks(r.5, r.4)).sum();
     let notes = twin_skip_on().then(|| notes(list, words, slot)).flatten();
+    // A bit per kept word (those of copies not told by word go unused).
+    let told = words_on()
+        .then(|| changed(need as usize / 128, slot))
+        .flatten();
     let (mut at, mut word) = (0, 0);
     let mut compares = Vec::with_capacity(ranges.len());
     for (source, offset, twin, host, bytes, title, of) in ranges {
@@ -2541,6 +2812,9 @@ pub(crate) fn snapshot_twins(
             title,
             of,
             notes: notes.map(|gpu| (gpu + 4 * word as u64, word)),
+            words: told
+                .filter(|_| back[of].0.told_by_words())
+                .map(|_| at as usize / 4),
         });
         at += bytes.next_multiple_of(256);
         word += blocks(title, bytes);
@@ -2617,6 +2891,126 @@ pub(crate) fn unchanged(
     covered
 }
 
+/// What the compares told copy-back by word of one copy ([`Told::of`]): the
+/// bits, and the ranges told (title address, bytes, bit of the first word).
+pub(crate) type ToldOf<'a> = (&'a [u32], &'a [(usize, usize, usize)]);
+
+/// What a submission's compares told copy-back by word ([`words_on`]):
+/// the slot's bits, held while copy-back reads them, and by copy of `back`
+/// the ranges told (title address, bytes, bit of the first word).
+pub(crate) struct Told {
+    changed: std::sync::MutexGuard<'static, Option<Changed>>,
+    ranges: Vec<Vec<(usize, usize, usize)>>,
+}
+
+impl Told {
+    /// Copy `of` of `back`'s bits and ranges told, if any.
+    pub(crate) fn of(&self, of: usize) -> Option<ToldOf<'_>> {
+        let ranges = self.ranges.get(of).filter(|r| !r.is_empty())?;
+        let c = self.changed.as_ref()?;
+        // SAFETY: the mapping holds `used` words, which the finished compare
+        // set; the slot's next submission is prepared after this one
+        // completes.
+        let bits = unsafe { std::slice::from_raw_parts(c.data as *const u32, c.used) };
+        Some((bits, ranges))
+    }
+
+    /// After copy-back: clears the bits the compares may have set, those of
+    /// the title blocks they found a changed word in (by copy, `unchanged`
+    /// holds the others), for the slot's next compares.
+    pub(crate) fn clear(&self, unchanged: &[std::collections::HashSet<usize>]) {
+        let Some(c) = self.changed.as_ref() else {
+            return;
+        };
+        for (of, ranges) in self.ranges.iter().enumerate() {
+            for &(title, bytes, bit) in ranges {
+                for block in title / PAGE..=(title + bytes - 1) / PAGE {
+                    if unchanged.get(of).is_some_and(|u| u.contains(&block)) {
+                        continue;
+                    }
+                    let from = (block * PAGE).max(title) - title;
+                    let to = ((block + 1) * PAGE).min(title + bytes) - title;
+                    let a = (bit + from / 4) / 32;
+                    let b = (bit + to.div_ceil(4)).div_ceil(32).min(c.used);
+                    if a < b {
+                        // SAFETY: inside the mapping's `used` words; the
+                        // compares that set them are done, and copy-back.
+                        unsafe { std::ptr::write_bytes((c.data as *mut u32).add(a), 0, b - a) };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// After the submission ran with its compares (`None`: none ran): what
+/// they told copy-back by word, for `copies` copies. Of the submission in
+/// `slot`.
+pub(crate) fn told(compares: Option<&[Compare]>, copies: usize, slot: usize) -> Told {
+    let mut ranges = vec![Vec::new(); copies];
+    for c in compares.into_iter().flatten() {
+        if let Some(bit) = c.words {
+            ranges[c.of].push((c.title, c.bytes as usize, bit));
+        }
+    }
+    Told {
+        changed: CHANGED[slot].lock().unwrap_or_else(|e| e.into_inner()),
+        ranges,
+    }
+}
+
+/// The title memory `compares` store into host copies (or title memory
+/// used in place), `[from, to)`.
+pub(crate) fn compared(compares: &[Compare]) -> Vec<(usize, usize)> {
+    compares
+        .iter()
+        .map(|c| (c.title, c.title + c.bytes as usize))
+        .collect()
+}
+
+/// At submission, after its compares are recorded: the ranges of copies
+/// told by word ([`Shadow::told_by_words`]) that no compare tells (a
+/// mirror window without a twin, no VRAM to keep them, no compare list)
+/// take the snapshots their GpuWrite steps left, once no submission in
+/// flight writes them.
+pub(crate) fn snapshot_untold(back: &[Declared], compares: Option<&[Compare]>) {
+    let slot = prep_slot();
+    for (of, (s, declared)) in back.iter().enumerate() {
+        if !s.told_by_words() {
+            continue;
+        }
+        let mut told: Vec<(usize, usize)> = compares
+            .into_iter()
+            .flatten()
+            .filter(|c| c.of == of && c.words.is_some())
+            .map(|c| (c.title, c.title + c.bytes as usize))
+            .collect();
+        told.sort_unstable();
+        let untold = |from: usize, to: usize| {
+            crate::pipelined::wait_writes(from, to, crate::pipelined::Writer::Snapshot);
+            s.snapshot(from, to - from, slot);
+        };
+        for &(address, len) in declared {
+            let (mut at, end) = (address, address + len);
+            for &(a, b) in &told {
+                if b <= at {
+                    continue;
+                }
+                if a >= end {
+                    break;
+                }
+                if a > at {
+                    untold(at, a);
+                }
+                at = at.max(b);
+            }
+            if at < end {
+                untold(at, end);
+            }
+        }
+    }
+}
+
 /// After a submission ran: records into `list` the compares of the twins'
 /// ranges [`snapshot_twins`] kept with what the twins hold now, which store
 /// the words shaders changed into the host copies, where copy-back compares
@@ -2637,23 +3031,39 @@ pub(crate) fn compare_twins(
         list.SetComputeRootSignature(root);
         list.SetPipelineState(pipeline);
     }
+    let changed = CHANGED[slot].lock().unwrap_or_else(|e| e.into_inner());
+    let bits = changed.as_ref().map(|c| c.gpu);
     let mut bytes = 0;
     for c in compares {
         let groups = c.bytes.div_ceil(1024).min(65535) as u32;
         let first = (c.title % PAGE) as u32;
-        let constants = [c.bytes as u32, groups, first, c.notes.is_some().into()];
+        let words = c.words.filter(|_| bits.is_some());
+        let constants = [
+            c.bytes as u32,
+            groups,
+            first,
+            c.notes.is_some().into(),
+            words.unwrap_or(0) as u32,
+            words.is_some().into(),
+        ];
         // SAFETY: an open list; the addresses hold the range, the twin's and
-        // the kept bytes in VRAM, and its blocks' notes (unused without).
+        // the kept bytes in VRAM, its blocks' notes and its words' bits
+        // (unused without).
         unsafe {
             list.SetComputeRootShaderResourceView(0, c.twin);
             list.SetComputeRootShaderResourceView(1, c.kept);
             list.SetComputeRootUnorderedAccessView(2, c.host);
             list.SetComputeRootUnorderedAccessView(3, c.notes.map_or(c.host, |n| n.0));
-            list.SetComputeRoot32BitConstants(4, 4, constants.as_ptr().cast(), 0);
+            list.SetComputeRoot32BitConstants(4, 6, constants.as_ptr().cast(), 0);
+            list.SetComputeRootUnorderedAccessView(
+                5,
+                bits.filter(|_| words.is_some()).unwrap_or(c.host),
+            );
             list.Dispatch(groups, 1, 1);
         }
         bytes += c.bytes;
     }
+    drop(changed);
     // The notes come down for copy-back.
     if compares.iter().any(|c| c.notes.is_some())
         && let Some(n) = NOTES[slot]
@@ -2680,20 +3090,28 @@ pub(crate) fn compare_twins(
 /// bytes apart ran at ~0.7 GB/s, 16-byte stores at ~0.08). With `noting`
 /// it notes the 64 KiB blocks of title memory (`first`: the range's offset
 /// in its first) the KiB has a changed word in, once per KiB and block.
+/// With `wording` it marks each changed word's bit in `words` (`wordbase`:
+/// the bit of the range's first word, a multiple of 64), storing the KiB's
+/// eight bitmap words, those not zero (copy-back clears them).
 const COMPARE: &str = r#"
-#define RS "SRV(t0), SRV(t1), UAV(u0), UAV(u1), RootConstants(num32BitConstants=4, b0)"
-cbuffer Range : register(b0) { uint bytes; uint groups; uint first; uint noting; };
+#define RS "SRV(t0), SRV(t1), UAV(u0), UAV(u1), RootConstants(num32BitConstants=6, b0), UAV(u2)"
+cbuffer Range : register(b0) {
+    uint bytes; uint groups; uint first; uint noting; uint wordbase; uint wording;
+};
 ByteAddressBuffer twin : register(t0);
 ByteAddressBuffer kept : register(t1);
 RWByteAddressBuffer host : register(u0);
 RWByteAddressBuffer notes : register(u1);
+RWByteAddressBuffer words : register(u2);
 groupshared uint seen[2];
+groupshared uint bits[8];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
     for (uint base = group.x * 1024; base < bytes; base += groups * 1024) {
         uint block = (first + base) >> 16;
         if (lane < 2) seen[lane] = 0;
+        if (lane < 8) bits[lane] = 0;
         GroupMemoryBarrierWithGroupSync();
         [unroll] for (uint k = 0; k < 4; k++) {
             uint at = base + k * 256 + lane * 4;
@@ -2702,11 +3120,14 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
                 if (now != kept.Load(at)) {
                     host.Store(at, now);
                     seen[((first + at) >> 16) - block] = 1;
+                    InterlockedOr(bits[k * 2 + (lane >> 5)], 1u << (lane & 31));
                 }
             }
         }
         GroupMemoryBarrierWithGroupSync();
         if (noting != 0 && lane < 2 && seen[lane] != 0) notes.Store((block + lane) * 4, 1);
+        if (wording != 0 && lane < 8 && bits[lane] != 0)
+            words.Store(((wordbase + (base >> 2)) >> 5) * 4 + lane * 4, bits[lane]);
     }
 }
 "#;
@@ -4105,7 +4526,7 @@ pub(crate) mod tests {
         crate::watch::forget_asked();
         for (a, n) in declared {
             s.update(a, n);
-            s.writing(a, n);
+            writing(&s, a, n);
         }
         let spans: Vec<(usize, usize)> = {
             let mut spans: Vec<_> = s.before[0]
@@ -4126,7 +4547,7 @@ pub(crate) mod tests {
             unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
         }
         assert_eq!(
-            s.copy_back(&declared, &Default::default(), 0),
+            s.copy_back(&declared, &Default::default(), None, 0),
             2 * (64 << 10)
         );
         for w in written_at {
@@ -4165,7 +4586,7 @@ pub(crate) mod tests {
         let early = at + 2 * MIB + 100;
         // SAFETY: our views (guarded: our handler opens the block).
         unsafe { (early as *mut u32).write(0xe) };
-        s.writing(at + MIB, 32 * MIB);
+        writing(&s, at + MIB, 32 * MIB);
         assert!(s.before[0].lock().unwrap().is_empty(), "no snapshot");
         let kept: Vec<usize> = s.kept[0].lock().unwrap().keys().copied().collect();
         assert_eq!(kept, [early / PAGE]);
@@ -4183,7 +4604,7 @@ pub(crate) mod tests {
             unsafe { (w as *mut u32).write(7) };
         }
         assert_eq!(
-            s.copy_back(&declared, &Default::default(), 0),
+            s.copy_back(&declared, &Default::default(), None, 0),
             4 * (64 << 10)
         );
         crate::watch::disarm(0);
@@ -4264,7 +4685,7 @@ pub(crate) mod tests {
         let declared = [(x, len / 2)];
         crate::watch::forget_asked();
         s.update(x, len / 2);
-        s.writing(x, len / 2);
+        writing(&s, x, len / 2);
         // While the GPU runs, the title writes a word through the other
         // address, and the GPU another of the same block.
         let (title, gpu) = (x + PAGE + 8, x + PAGE + 64);
@@ -4273,7 +4694,7 @@ pub(crate) mod tests {
             ((title - x + y) as *mut u32).write(7);
             s.host_at(gpu - x, 4).cast::<u32>().write(0xfeed);
         }
-        s.copy_back(&declared, &Default::default(), 0);
+        s.copy_back(&declared, &Default::default(), None, 0);
         crate::watch::disarm(0);
         // SAFETY: our view.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -4315,11 +4736,11 @@ pub(crate) mod tests {
         let write = |w: usize, v: u32| unsafe { (w as *mut u32).write(v) };
         crate::watch::forget_asked();
         a.update(at, 8 * MIB);
-        a.writing(at, 8 * MIB);
+        writing(&a, at, 8 * MIB);
         write(x, 1);
         crate::watch::forget_asked();
         b.update(at + 4 * MIB, 8 * MIB);
-        b.writing(at + 4 * MIB, 8 * MIB);
+        writing(&b, at + 4 * MIB, 8 * MIB);
         assert_eq!(held(&b, x), Some(1));
         // While the GPU runs, the title writes the word again, and the GPU
         // writes a word elsewhere in each copy.
@@ -4334,9 +4755,9 @@ pub(crate) mod tests {
             };
         }
         crate::watch::forget_asked();
-        a.copy_back(&da, &Default::default(), 0);
+        a.copy_back(&da, &Default::default(), None, 0);
         crate::watch::forget_asked();
-        b.copy_back(&db, &Default::default(), 0);
+        b.copy_back(&db, &Default::default(), None, 0);
         crate::watch::disarm(0);
         // SAFETY: our view.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -4376,14 +4797,14 @@ pub(crate) mod tests {
         // The GPU writes x; the title writes next to it while copy-back runs.
         crate::watch::forget_asked();
         s.update(at, 16 * MIB);
-        s.writing(at, 16 * MIB);
+        writing(&s, at, 16 * MIB);
         // SAFETY: inside the copy's memory.
         unsafe { s.host_at(x - at, 4).cast::<u32>().write(0xfeed) };
         // SAFETY: as above.
         *BEFORE_ASKING.lock().unwrap() =
             Some(Box::new(move || unsafe { ((x + 8) as *mut u32).write(7) }));
         crate::watch::forget_asked();
-        s.copy_back(&declared, &Default::default(), 0);
+        s.copy_back(&declared, &Default::default(), None, 0);
         crate::watch::disarm(0);
         // The next submission: the GPU writes elsewhere.
         crate::watch::forget_asked();
@@ -4393,11 +4814,11 @@ pub(crate) mod tests {
             Some(7),
             "the copy missed the title's write"
         );
-        s.writing(at, 16 * MIB);
+        writing(&s, at, 16 * MIB);
         // SAFETY: inside the copy's memory.
         unsafe { s.host_at(y - at, 4).cast::<u32>().write(0xbeef) };
         crate::watch::forget_asked();
-        s.copy_back(&declared, &Default::default(), 0);
+        s.copy_back(&declared, &Default::default(), None, 0);
         crate::watch::disarm(0);
         assert_eq!(read(x + 8), 7, "the title's write was undone");
         assert_eq!((read(x), read(y)), (0xfeed, 0xbeef));
@@ -4429,20 +4850,20 @@ pub(crate) mod tests {
         crate::watch::forget_asked();
         preparing(0);
         s.update(at, 8 * MIB);
-        s.writing(at, 8 * MIB);
+        writing(&s, at, 8 * MIB);
         // SAFETY: inside the copy's memory.
         unsafe { s.host_at(x - at, 4).cast::<u32>().write(0xfeed) };
         crate::watch::forget_asked();
         preparing(1);
         s.update(at + 8 * MIB, 8 * MIB);
-        s.writing(at + 8 * MIB, 8 * MIB);
+        writing(&s, at + 8 * MIB, 8 * MIB);
         // SAFETY: as above.
         unsafe { s.host_at(y - at, 4).cast::<u32>().write(0xbeef) };
         // SAFETY: our views.
         unsafe { ((y + 8) as *mut u32).write(7) };
-        s.copy_back(&[(at, 8 * MIB)], &Default::default(), 0);
+        s.copy_back(&[(at, 8 * MIB)], &Default::default(), None, 0);
         crate::watch::disarm(0);
-        s.copy_back(&[(at + 8 * MIB, 8 * MIB)], &Default::default(), 1);
+        s.copy_back(&[(at + 8 * MIB, 8 * MIB)], &Default::default(), None, 1);
         crate::watch::disarm(1);
         preparing(0);
         assert_eq!((read(x), read(y), read(y + 8)), (0xfeed, 0xbeef, 7));
@@ -4584,14 +5005,17 @@ pub(crate) mod tests {
         let x = at + (128 << 10) + 32;
         crate::watch::forget_asked();
         s.update(at, 512 << 10);
-        s.writing(at, 512 << 10);
+        writing(&s, at, 512 << 10);
         // SAFETY: inside the copy's memory.
         unsafe { s.host_at(x - at, 4).cast::<u32>().write(0xfeed) };
         // SAFETY: our test memory.
         *BEFORE_WRITING.lock().unwrap() =
             Some(Box::new(move || unsafe { ((x + 64) as *mut u32).write(7) }));
         crate::watch::forget_asked();
-        assert_eq!(s.copy_back(&declared, &Default::default(), 0), 64 << 10);
+        assert_eq!(
+            s.copy_back(&declared, &Default::default(), None, 0),
+            64 << 10
+        );
         // SAFETY: as above.
         let read = |w: usize| unsafe { (w as *const u32).read() };
         assert_eq!(read(x + 64), 7, "the title's write was undone");
@@ -4620,14 +5044,17 @@ pub(crate) mod tests {
         let piece = at + MIB + (64 << 10);
         crate::watch::forget_asked();
         s.update(at, 4 * MIB);
-        s.writing(at, 4 * MIB);
+        writing(&s, at, 4 * MIB);
         let gpu: Vec<usize> = (0..32).map(|k| piece + k * 1024 + 8).collect();
         for &w in &gpu {
             // SAFETY: inside the copy's memory.
             unsafe { s.host_at(w - at, 4).cast::<u32>().write(0xfeed) };
         }
         crate::watch::forget_asked();
-        assert_eq!(s.copy_back(&declared, &Default::default(), 0), 64 << 10);
+        assert_eq!(
+            s.copy_back(&declared, &Default::default(), None, 0),
+            64 << 10
+        );
         crate::watch::disarm(0);
         // SAFETY: our views.
         let read = |w: usize| unsafe { (w as *const u32).read() };
@@ -4717,6 +5144,270 @@ pub(crate) mod tests {
         }
         drop((buffer, slab));
         unregister(usize::MAX - 14, at as u64);
+        release(at);
+    }
+
+    /// Told by the compare's bits, copy-back puts back the words the GPU
+    /// changed where the title does not hold them already, gives the copy
+    /// the title's other words, and keeps to the bytes it is given of a word
+    /// cut at either end.
+    #[test]
+    fn bits_tell_copy_back_the_words_the_gpu_changed() {
+        let mut title: Vec<u8> = (0..28u8).collect();
+        let mut host = title.clone();
+        let mut want = title.clone();
+        // Byte i is in word (i + 2) / 4: word 0 ends at byte 2, and word 7,
+        // cut at the end, starts at byte 26.
+        for (from, to, gpu) in [(0, 2, 0xbb), (2, 6, 0xaa), (10, 14, 0x33), (26, 28, 0xdd)] {
+            host[from..to].fill(gpu);
+            want[from..to].fill(gpu);
+        }
+        // Word 3 the title holds already; word 5 is the title's.
+        title[10..14].fill(0x33);
+        title[18..22].fill(0xcc);
+        want[18..22].fill(0xcc);
+        let first = 35;
+        let mut bits = [0u32; 3];
+        for w in [0, 1, 3, 7, 8] {
+            bits[(first + w) / 32] |= 1 << ((first + w) % 32);
+        }
+        assert!(any_bit(&bits, first + 3, 1) && any_bit(&bits, 0, first + 1));
+        assert!(!any_bit(&bits, first + 4, 3) && !any_bit(&bits, first + 9, 60));
+        assert!(!any_bit(&bits, 0, first) && !any_bit(&bits, first, 0));
+        assert!(any_bit(&bits, 1, 95) && !any_bit(&bits, 96, 64));
+        let (runs, taken) = merge_bits(&mut title, &mut host, &bits, first, 2);
+        assert_eq!(runs, [(0, 6), (26, 28)]);
+        assert_eq!(taken, Some((18, 22)));
+        assert_eq!(title, want);
+        assert_eq!(host, want);
+    }
+
+    /// Copy-back told by the compare's bits writes back the bytes declared
+    /// of the words they tell, and only those: a title byte outside them in
+    /// a word the GPU changed stays, also between two ranges whose compares
+    /// (whole words) overlap.
+    #[test]
+    fn copy_back_told_by_bits_keeps_to_the_bytes_declared() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = title_memory(1300, 256 * MIB, MIB, MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 26, at as u64, 512 << 10);
+        let s = find(at as u64, 512 << 10).unwrap();
+        assert!(!s.in_place);
+        let declared = [(at + 6, 999), (at + 1007, 20)];
+        crate::watch::forget_asked();
+        s.update(at, 512 << 10);
+        for &(address, len) in &declared {
+            s.writing(address, len);
+        }
+        let put = |to: *mut u8, bytes: &[u8]| {
+            // SAFETY: inside our test memory or the copy's.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) }
+        };
+        // The GPU's bytes, and the title's since.
+        let gpu = [
+            (at + 6, &[0xa6, 0xa7][..]),
+            (at + 500, &0xfeed_u32.to_le_bytes()[..]),
+            (at + 1004, &[0xe4][..]),
+            (at + 1012, &0xbeef_u32.to_le_bytes()[..]),
+        ];
+        for (a, bytes) in gpu {
+            put(s.host_at(a - at, bytes.len()), bytes);
+        }
+        let title = [
+            (at + 4, &[0x11][..]),
+            (at + 600, &0x600d_u32.to_le_bytes()[..]),
+            (at + 1006, &[0x22][..]),
+        ];
+        for (a, bytes) in title {
+            put(a as *mut u8, bytes);
+        }
+        // The compares' ranges as kept, and the bits of the words they found
+        // changed: those at 4, 500, 1004 (in both) and 1012.
+        let ranges = [(at + 4, 1004, 0), (at + 1004, 24, 256)];
+        let mut bits = [0u32; 16];
+        for b in [0, 124, 250, 256, 258] {
+            bits[b / 32] |= 1 << (b % 32);
+        }
+        crate::watch::forget_asked();
+        let written = s.copy_back(&declared, &Default::default(), Some((&bits, &ranges)), 0);
+        assert_eq!(written, 999 + 19);
+        // SAFETY: our test memory.
+        let byte = |a: usize| unsafe { (a as *const u8).read() };
+        let original = |a: usize| word(a & !3).to_le_bytes()[a % 4];
+        assert_eq!(
+            byte(at + 4),
+            0x11,
+            "the title's byte before the first range"
+        );
+        assert_eq!(byte(at + 5), original(at + 5));
+        assert_eq!((byte(at + 6), byte(at + 7)), (0xa6, 0xa7));
+        assert_eq!(held(&s, at + 500), Some(0xfeed));
+        // SAFETY: as above.
+        let read = |a: usize| unsafe { (a as *const u32).read() };
+        assert_eq!(
+            (read(at + 500), read(at + 600), read(at + 1012)),
+            (0xfeed, 0x600d, 0xbeef)
+        );
+        assert_eq!(held(&s, at + 600), Some(0x600d));
+        assert_eq!(byte(at + 1004), 0xe4);
+        assert_eq!(byte(at + 1005), original(at + 1005));
+        assert_eq!(byte(at + 1006), 0x22, "the title's byte between the ranges");
+        assert_eq!(byte(at + 1007), original(at + 1007));
+        drop(s);
+        unregister(usize::MAX - 26, at as u64);
+        release(at);
+    }
+
+    /// Pipelined, copy-back told by bits: the compares after a submission
+    /// wait on the GPU, not the CPU, for the copy-back in flight of one
+    /// whose shaders write what they compare, which reads the host copy
+    /// they store into.
+    #[test]
+    fn compares_wait_on_the_gpu_for_copy_backs_in_flight() {
+        use std::time::{Duration, Instant};
+        /// Lets the held copy-back go on, also when the test fails.
+        struct Go(std::sync::mpsc::Sender<()>);
+        impl Drop for Go {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _serial = crate::watch::serial();
+        if !gpu() || !twins_on() || !crate::pipelined::on() {
+            return;
+        }
+        let host = host().unwrap();
+        let at = title_memory(1310, 256 * MIB, 32 * MIB, 32 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 27, at as u64, 512 << 10);
+        let s = find(at as u64, 512 << 10).unwrap();
+        if !s.told_by_words() || compare_pipeline().is_none() {
+            drop(s);
+            unregister(usize::MAX - 27, at as u64);
+            release(at);
+            return;
+        }
+        let twin = s.resource().clone();
+        let (upload, data) = host.upload_buffer(4096).unwrap();
+        // SAFETY: our mapped upload buffer.
+        unsafe { data.cast::<[u32; 2]>().write([0xfeed, 0xbeef]) };
+        crate::pipelined::wait_all();
+        crate::watch::forget_asked();
+        let (x, y) = (at + 64, at + 128);
+        // Lists apart: the pipeline tells lists in flight by address.
+        let (one, two) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let submit = |list: &crate::host::HostList, to: usize, from: u64, refresh: bool| {
+            if refresh {
+                s.refresh(list, at as u64, 4096);
+            }
+            s.gpu_writes(list, at as u64, 4096);
+            // SAFETY: an open list; live buffers holding the ranges.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&twin, s.offset(to as u64), &upload, from, 4)
+            };
+            list.close();
+            host.execute(&[list]);
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        *BEFORE_WRITING.lock().unwrap() = Some(Box::new(move || {
+            let _ = held_tx.send(());
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        }));
+        let go = Go(go);
+        submit(&one, x, 0, true);
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first copy-back wrote back nothing");
+        let started = Instant::now();
+        submit(&two, y, 4, false);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second submission waited on the CPU"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            held(&s, y),
+            Some(word(y)),
+            "the second's compare stored during the first's copy-back"
+        );
+        drop(go);
+        crate::pipelined::wait_all();
+        // SAFETY: our test memory.
+        let read = |a: usize| unsafe { (a as *const u32).read() };
+        assert_eq!((read(x), read(y)), (0xfeed, 0xbeef));
+        drop((one, two));
+        drop(s);
+        unregister(usize::MAX - 27, at as u64);
+        release(at);
+    }
+
+    /// The bits a compare sets are clear by the next compare of its slot:
+    /// a title write since, in a word the first changed, stays when the
+    /// next changes a word beside it.
+    #[test]
+    fn a_compare_tells_only_its_own_submissions_words() {
+        let _serial = crate::watch::serial();
+        if !gpu() || !twins_on() {
+            return;
+        }
+        let host = host().unwrap();
+        let at = title_memory(1320, 256 * MIB, 32 * MIB, 32 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 28, at as u64, 512 << 10);
+        let s = find(at as u64, 512 << 10).unwrap();
+        if !s.told_by_words() || compare_pipeline().is_none() {
+            drop(s);
+            unregister(usize::MAX - 28, at as u64);
+            release(at);
+            return;
+        }
+        let twin = s.resource().clone();
+        let (upload, data) = host.upload_buffer(4096).unwrap();
+        // SAFETY: our mapped upload buffer.
+        unsafe { data.cast::<[u32; 2]>().write([0xfeed, 0xbeef]) };
+        crate::pipelined::wait_all();
+        crate::watch::forget_asked();
+        let (x, y) = (at + 64, at + 128);
+        let depth = crate::pipelined::DEPTH;
+        let lists: Vec<_> = (0..=depth).map(|_| host.new_list().unwrap()).collect();
+        let gpu_writes = |list: &crate::host::HostList, to: usize, from: u64| {
+            s.gpu_writes(list, at as u64, 4096);
+            // SAFETY: an open list; live buffers holding the ranges.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&twin, s.offset(to as u64), &upload, from, 4)
+            };
+            list.close();
+            host.execute(&[list]);
+            crate::pipelined::wait_all();
+        };
+        // SAFETY: our test memory.
+        let read = |a: usize| unsafe { (a as *const u32).read() };
+        s.refresh(&lists[0], at as u64, 4096);
+        gpu_writes(&lists[0], x, 0);
+        assert_eq!(read(x), 0xfeed);
+        // SAFETY: as above.
+        unsafe { (x as *mut u32).write(7) };
+        // Submissions in the other slots, then one in the first's.
+        for list in &lists[1..depth] {
+            list.close();
+            host.execute(&[list]);
+        }
+        gpu_writes(&lists[depth], y, 4);
+        assert_eq!(read(y), 0xbeef);
+        assert_eq!(
+            read(x),
+            7,
+            "the title's write undone by the first compare's bit"
+        );
+        drop(s);
+        unregister(usize::MAX - 28, at as u64);
         release(at);
     }
 
@@ -5009,7 +5700,7 @@ pub(crate) mod tests {
         for (what, changed) in cases {
             fill(&|i| if changed(i) { !(i as u32) } else { i as u32 });
             copy(&twin);
-            for noting in [false, true] {
+            for (noting, wording) in [(false, false), (true, false), (true, true)] {
                 let c = Compare {
                     twin: gpu(&twin),
                     kept: gpu(&kept),
@@ -5025,9 +5716,20 @@ pub(crate) mod tests {
                         crate::pipelined::wait_all();
                         (gpu, 0)
                     }),
+                    words: wording
+                        .then(|| super::changed(LEN / 128, 0).map(|_| 0))
+                        .flatten(),
                 };
                 let took = best(&|l| _ = compare_twins(l, std::slice::from_ref(&c), 0));
-                println!("{what}, notes {noting}: {took:.1} ms for 256 MiB");
+                println!("{what}, notes {noting}, words {wording}: {took:.1} ms for 256 MiB");
+                if c.words.is_some() {
+                    let told = told(Some(std::slice::from_ref(&c)), 1, 0);
+                    let (bits, _) = told.of(0).unwrap();
+                    for i in (0..LEN / 4).step_by(4099) {
+                        assert_eq!(bits_at(bits, i) & 1 != 0, changed(i), "word {i}'s bit");
+                    }
+                    told.clear(&[]);
+                }
             }
             for i in (0..LEN / 4).step_by(4099) {
                 // SAFETY: inside the mapped buffer the compare wrote.
@@ -5037,6 +5739,14 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// A GpuWrite step of the submission being prepared, then its snapshot
+    /// at submission where no compare tells copy-back what shaders change
+    /// ([`snapshot_untold`]).
+    fn writing(s: &Arc<Shadow>, address: usize, len: usize) {
+        s.writing(address, len);
+        snapshot_untold(&[(s.clone(), vec![(address, len)])], None);
     }
 
     /// The word a copy holds for title address `at` (0 where it has no
@@ -5135,7 +5845,7 @@ pub(crate) mod tests {
         ];
         for (at, n) in ranges {
             s.update(at, n);
-            s.writing(at, n);
+            writing(&s, at, n);
         }
         let spans: Vec<(usize, usize)> = {
             let before = s.before[0].lock().unwrap();
@@ -5152,7 +5862,7 @@ pub(crate) mod tests {
         let host = s.host_at(at - s.start as usize, 4);
         // SAFETY: a placed window of the copy.
         unsafe { host.cast::<u32>().write(0xfeed) };
-        let written = s.copy_back(&ranges, &Default::default(), 0);
+        let written = s.copy_back(&ranges, &Default::default(), None, 0);
         assert_eq!(written, 64 << 10);
         // SAFETY: committed test memory.
         assert_eq!(unsafe { (at as *const u32).read() }, 0xfeed);
