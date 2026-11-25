@@ -1702,21 +1702,24 @@ impl Shadow {
             return refresh(from, to);
         }
         let since = crate::watch::changes();
-        let mut copied = 0;
-        for (a, b) in self.unsynced(from, to) {
-            copied += refresh(a, b);
-            self.note_synced(a, b, since);
-        }
+        let Some((a, b)) = self.unsynced(from, to) else {
+            return 0;
+        };
+        let copied = refresh(a, b);
+        self.note_synced(a, b, since);
         copied
     }
 
-    /// The parts of `[from, to)` (inside the buffer) in regions of title
-    /// memory not brought up to date wholly guarded and clean since they
-    /// last changed ([`Shadow::note_synced`]), in order.
-    fn unsynced(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+    /// The part of `[from, to)` (inside the buffer) from the first to the
+    /// last region of title memory not brought up to date wholly guarded
+    /// and clean since it last changed ([`Shadow::note_synced`]). One
+    /// asking over it: asking about each such part on its own cost more in
+    /// run 157 (~2,800 watches a frame, ~350 more) than the bytes it left
+    /// out saved.
+    fn unsynced(&self, from: usize, to: usize) -> Option<(usize, usize)> {
         use crate::watch::REGION;
         let synced = self.synced.lock().unwrap_or_else(|e| e.into_inner());
-        let mut parts: Vec<(usize, usize)> = Vec::new();
+        let mut span: Option<(usize, usize)> = None;
         for region in from / REGION..to.div_ceil(REGION) {
             let (a, b) = (from.max(region * REGION), to.min((region + 1) * REGION));
             if synced.get(&region).is_some_and(|(since, ranges)| {
@@ -1725,21 +1728,18 @@ impl Shadow {
             }) {
                 continue;
             }
-            match parts.last_mut() {
-                Some((_, end)) if *end == a => *end = b,
-                _ => parts.push((a, b)),
-            }
+            span = Some((span.map_or(a, |s| s.0), b));
         }
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
-            let skipped = (to - from) - parts.iter().map(|(a, b)| b - a).sum::<usize>();
+            let skipped = (to - from) - span.map_or(0, |(a, b)| b - a);
             if skipped > 0 {
                 add(C::Skipped, 1);
                 add(C::SkippedBytes, skipped as u64);
             }
         }
-        parts
+        span
     }
 
     /// `[from, to)` was brought up to date after change `since` to title
@@ -5200,16 +5200,19 @@ pub(crate) mod tests {
         let w = at + 5 * MIB + 8;
         // SAFETY: our view (guarded: our handler opens the block).
         unsafe { (w as *mut u32).write(0x5eed) };
-        assert_eq!(s.unsynced(at, at + 8 * MIB), [(at + 4 * MIB, at + 8 * MIB)]);
+        assert_eq!(
+            s.unsynced(at, at + 8 * MIB),
+            Some((at + 4 * MIB, at + 8 * MIB))
+        );
         crate::watch::forget_asked();
         assert_eq!(s.update(at, 8 * MIB), PAGE);
         assert_eq!(host(w), 0x5eed);
-        assert!(s.unsynced(at, at + 8 * MIB).is_empty());
+        assert_eq!(s.unsynced(at, at + 8 * MIB), None);
         crate::watch::forget_asked();
         assert_eq!(s.update(at, 8 * MIB), 0);
         // Our write (shaders in place, a copy into title memory).
         crate::watch::wrote(at + MIB, at + MIB + 4);
-        assert_eq!(s.unsynced(at, at + 8 * MIB), [(at, at + 4 * MIB)]);
+        assert_eq!(s.unsynced(at, at + 8 * MIB), Some((at, at + 4 * MIB)));
         drop(s);
         unregister(usize::MAX - 10, at as u64);
         unmap(&made);
