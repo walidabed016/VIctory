@@ -278,10 +278,12 @@ pub enum MeshWaveOps {
     /// `0` or `off`: refused, as before they were taken (the tree imposters'
     /// MS_VS_OctaSLODWindFire and the other `*Fire` mesh programs drop).
     Off,
-    /// Unset or any other value: over the host's waves.
+    /// `1`: over the host's waves. Run 136 hung the GPU in
+    /// MS_VS_OctaSLODWindFire's fire-list waterfall with this.
     Wave,
-    /// `lane`: a reduction is the lane's own value, so a waterfall over the
-    /// distinct values of a lane value walks each lane's values alone.
+    /// Unset, `lane` or any other value: a reduction is the lane's own value,
+    /// so a waterfall over the distinct values of a lane value walks each
+    /// lane's values alone.
     Lane,
 }
 
@@ -295,8 +297,8 @@ pub fn mesh_wave_ops() -> MeshWaveOps {
 fn parse_mesh_wave_ops(value: Option<&str>) -> MeshWaveOps {
     match value.map(str::trim) {
         Some("0" | "off") => MeshWaveOps::Off,
-        Some("lane") => MeshWaveOps::Lane,
-        _ => MeshWaveOps::Wave,
+        Some("1") => MeshWaveOps::Wave,
+        _ => MeshWaveOps::Lane,
     }
 }
 
@@ -696,10 +698,11 @@ mod tests {
     }
 
     #[test]
-    fn the_mesh_wave_ops_switch_parses_or_takes_host_waves() {
+    fn the_mesh_wave_ops_switch_parses_or_takes_each_lane() {
         use super::{MeshWaveOps, parse_mesh_wave_ops};
-        assert_eq!(parse_mesh_wave_ops(None), MeshWaveOps::Wave);
+        assert_eq!(parse_mesh_wave_ops(None), MeshWaveOps::Lane);
         assert_eq!(parse_mesh_wave_ops(Some("1")), MeshWaveOps::Wave);
+        assert_eq!(parse_mesh_wave_ops(Some("wave")), MeshWaveOps::Lane);
         assert_eq!(parse_mesh_wave_ops(Some(" 0 ")), MeshWaveOps::Off);
         assert_eq!(parse_mesh_wave_ops(Some("off")), MeshWaveOps::Off);
         assert_eq!(parse_mesh_wave_ops(Some("lane")), MeshWaveOps::Lane);

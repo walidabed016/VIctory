@@ -68,7 +68,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::unread_fields()),
         ];
         let mesh = victory_shader::emit::mesh_wave_ops();
-        if mesh != victory_shader::emit::MeshWaveOps::Wave {
+        if mesh != victory_shader::emit::MeshWaveOps::Lane {
             tracing::warn!(
                 ?mesh,
                 "VICTORY_MESH_WAVE_OPS: mesh wave operations translated otherwise"
