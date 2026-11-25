@@ -369,6 +369,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         // Passes after it may write arguments later executions read.
         crate::indirect::close(list);
+        for b in barriers
+            .iter()
+            .filter(|b| b.kind == 0 && !b.first.is_null())
+        {
+            crate::resource::note_written(b.first, b.last as u32);
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))

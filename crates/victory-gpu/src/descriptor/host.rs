@@ -1196,6 +1196,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
+    // A 32-bit texture shaders write, read as shared-exponent colors.
+    if view == crate::resource::SHARED_EXPONENT
+        && family(own) == 39
+        && crate::resource::shared_exponent(texture)
+    {
+        return !unordered;
+    }
     if family(view) != family(own) && crate::resource::target_format(view) != own {
         once!(view, own, "view format of another family");
         return false;

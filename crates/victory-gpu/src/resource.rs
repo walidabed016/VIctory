@@ -798,6 +798,187 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// When a title barrier last moved it to a state draws or shaders
+    /// write in, in order: of textures in the same memory, the last holds
+    /// its contents ([`target_views`]).
+    pub(crate) written: std::sync::atomic::AtomicU64,
+}
+
+/// Whether views with no resource object of memory a texture the GPU
+/// writes is placed in read that texture (`VICTORY_TARGET_VIEWS=1`), not a
+/// placed texture made from memory the host never wrote back. Grand Theft
+/// Auto VI writes its HDR images as 32-bit integers and reads them back as
+/// shared-exponent colors; the host makes such 32-bit textures castable to
+/// those (after Belobug's a1ca60f).
+#[cfg(windows)]
+pub(crate) fn target_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_TARGET_VIEWS").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "placed views read the textures the GPU wrote there (VICTORY_TARGET_VIEWS)"
+            );
+        }
+        on
+    })
+}
+
+/// Title textures the host GPU writes (render targets and unordered ones),
+/// by the title memory they are placed in ([`target_views`]).
+#[cfg(windows)]
+static TARGETS: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Shared-exponent colors (R9G9B9E5), which 32-bit textures shaders write
+/// may be read as.
+pub(crate) const SHARED_EXPONENT: u32 = 67;
+
+/// Host textures made castable to shared-exponent colors, by address.
+#[cfg(windows)]
+static CASTABLE: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether `texture` may be viewed as shared-exponent colors.
+#[cfg(windows)]
+pub(crate) fn shared_exponent(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    use windows::core::Interface;
+    CASTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(texture.as_raw() as usize))
+}
+
+/// The texture the GPU wrote at `address` that a view described by `d`
+/// reads, the last written of several.
+#[cfg(windows)]
+fn target_at(address: u64, d: &ResourceDesc) -> Option<This> {
+    let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    targets
+        .get(&address)?
+        .iter()
+        .map(|&r| r as This)
+        .filter(|&r| read_as(&resource(r).desc, d))
+        .max_by_key(|&r| {
+            resource(r)
+                .host
+                .as_ref()
+                .map_or(0, |h| h.written.load(std::sync::atomic::Ordering::Relaxed))
+        })
+}
+
+/// Whether a view described by `d` of the memory texture `o` is placed in
+/// reads `o`: the same shape, and a format of its family, or 32-bit ones
+/// as shared-exponent colors.
+fn read_as(o: &ResourceDesc, d: &ResourceDesc) -> bool {
+    let shape = |r: &ResourceDesc| {
+        (
+            r.dimension,
+            r.width,
+            r.height,
+            r.depth_or_array_size,
+            r.mip_levels,
+        )
+    };
+    shape(o) == shape(d)
+        && (family(o.format) == family(d.format)
+            || d.format == SHARED_EXPONENT && family(o.format) == 39)
+}
+
+/// A title barrier moves `this` to `state` ([`HostTexture::written`]).
+#[cfg(windows)]
+pub(crate) fn note_written(this: This, state: u32) {
+    static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    const RENDER_TARGET: u32 = 0x4;
+    const UNORDERED: u32 = 0x8;
+    if state & (RENDER_TARGET | UNORDERED) != 0
+        && target_views()
+        && let Some(h) = &resource(this).host
+    {
+        let now = CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        h.written.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A host texture for `desc` that 32-bit and shared-exponent views may be
+/// made of, in the common state; none where the host cannot cast so.
+#[cfg(windows)]
+fn castable(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    clear: Option<*const windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_VALUE>,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    static DEVICE: std::sync::OnceLock<Option<ID3D12Device10>> = std::sync::OnceLock::new();
+    let device = DEVICE
+        .get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            // SAFETY: a structure of the size the feature has.
+            unsafe {
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS12,
+                        std::ptr::from_mut(&mut options).cast(),
+                        std::mem::size_of_val(&options) as u32,
+                    )
+                    .ok()?;
+            }
+            if !options.RelaxedFormatCastingSupported.as_bool() {
+                tracing::warn!("the host cannot read 32-bit textures as shared-exponent colors");
+                return None;
+            }
+            device.cast().ok()
+        })
+        .as_ref()?;
+    let desc = D3D12_RESOURCE_DESC1 {
+        Dimension: desc.Dimension,
+        Alignment: desc.Alignment,
+        Width: desc.Width,
+        Height: desc.Height,
+        DepthOrArraySize: desc.DepthOrArraySize,
+        MipLevels: desc.MipLevels,
+        Format: desc.Format,
+        SampleDesc: desc.SampleDesc,
+        Layout: desc.Layout,
+        Flags: desc.Flags,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let formats = [
+        DXGI_FORMAT_R32_UINT,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R32_SINT,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+    ];
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: whole descriptions; the out pointer is ours.
+    unsafe {
+        device.CreateCommittedResource3(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            clear,
+            None,
+            Some(&formats),
+            &mut texture,
+        )
+    }
+    .ok()?;
+    if let Some(t) = &texture {
+        CASTABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(t.as_raw() as usize);
+    }
+    texture
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -887,6 +1068,21 @@ fn host_texture(
         }
         value
     });
+    if target_views()
+        && (39..=43).contains(&d.format)
+        && d.flags & UNORDERED != 0
+        && let Some(texture) = castable(
+            &host.device,
+            // SAFETY: the description has the host layout (as below).
+            unsafe { &*(&raw const d).cast() },
+            clear_value
+                .as_ref()
+                .filter(|_| d.flags & RENDER_TARGET != 0)
+                .map(|v| std::ptr::from_ref(v).cast()),
+        )
+    {
+        return Some(texture);
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1066,10 +1262,14 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            let state = match shared_exponent(&texture) {
+                true => 0,
+                false => crate::host::legal_state(&texture, crate::host::texture_state(state)),
+            };
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                written: Default::default(),
             })
         }),
         #[cfg(windows)]
@@ -1079,6 +1279,10 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if desc.flags & 5 != 0 && resource.host.is_some() && target_views() {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+        targets.entry(resource.data() as u64).or_default().push(at);
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     if desc.dimension != BUFFER && (desc.flags & 7 != 0 || resource.host.is_none()) {
@@ -1157,6 +1361,26 @@ impl Drop for Resource {
             std::ptr::from_ref::<Resource>(self) as usize,
             self.data() as u64,
         );
+        #[cfg(windows)]
+        if self.desc.flags & 5 != 0 && self.host.is_some() && target_views() {
+            let at = std::ptr::from_ref::<Resource>(self) as usize;
+            let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+            let start = self.data() as u64;
+            if let Some(list) = targets.get_mut(&start) {
+                list.retain(|&r| r != at);
+                if list.is_empty() {
+                    targets.remove(&start);
+                }
+            }
+        }
+        #[cfg(windows)]
+        if let Some(h) = &self.host {
+            use windows::core::Interface;
+            CASTABLE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(h.texture.as_raw() as usize));
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         #[cfg(windows)]
@@ -1419,6 +1643,11 @@ fn texture_at_in(address: u64, desc: &[u32; 14], now: u64) -> Option<This> {
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    if target_views()
+        && let Some(target) = target_at(address, &d)
+    {
+        return Some(target);
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
@@ -1754,6 +1983,19 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// A view reads the texture the GPU wrote in its memory in the same
+    /// shape and family, and 32-bit ones as shared-exponent colors.
+    #[test]
+    fn views_read_written_textures_of_their_shape_and_family() {
+        let hdr = texture(1920, 1080, 42, 1);
+        assert!(read_as(&hdr, &texture(1920, 1080, SHARED_EXPONENT, 1)));
+        assert!(read_as(&hdr, &texture(1920, 1080, 41, 1)));
+        assert!(!read_as(&hdr, &texture(1920, 1080, 28, 1)));
+        assert!(!read_as(&hdr, &texture(960, 1080, SHARED_EXPONENT, 1)));
+        let color = texture(1920, 1080, 28, 1);
+        assert!(!read_as(&color, &texture(1920, 1080, SHARED_EXPONENT, 1)));
     }
 
     /// A placed texture whose memory another texture takes is let go of
