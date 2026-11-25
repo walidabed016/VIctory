@@ -118,6 +118,27 @@ struct Command {
     _pad: u32,
 }
 
+impl Command {
+    /// The clamp of an execution's records at host address `args` (and
+    /// its count at `count`, if the title gives one) into `clamped`.
+    fn new(
+        (kind, stride, records): (u32, u32, u32),
+        args: u64,
+        count: Option<u64>,
+        clamped: u64,
+    ) -> Self {
+        let flags = u32::from(cfg!(feature = "diagnostics")) | if count.is_some() { 2 } else { 0 };
+        Command {
+            record: [kind, stride, records, flags],
+            args,
+            count: count.unwrap_or(clamped),
+            clamped,
+            groups: [records.div_ceil(64), 1, 1],
+            _pad: 0,
+        }
+    }
+}
+
 /// Clamp commands one segment holds; more start another.
 const COMMANDS: u32 = 256;
 /// A segment's bytes in its table: the command count, then the commands.
@@ -272,6 +293,15 @@ struct Segment {
 }
 
 impl Clamps {
+    /// Whether an execution taking `need` bytes of a ring joins the open
+    /// segment: one is open, with room for it.
+    fn joinable(&self, need: u64) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|segment| segment.commands < COMMANDS)
+            && self.used + need <= self.rings[self.ring].1
+    }
+
     /// After the list is reset: everything reused from the start.
     pub(crate) fn reset(&mut self) {
         (self.ring, self.used, self.table, self.table_used, self.open) = (0, 0, 0, 0, None);
@@ -371,10 +401,7 @@ pub(crate) fn open(list: &HostList, (kind, stride, records): (u32, u32, u32)) ->
     }
     let need = region(stride, records);
     let mut s = list.clamps();
-    if let Some(segment) = &s.open
-        && segment.commands < COMMANDS
-        && s.used + need <= s.rings[s.ring].1
-    {
+    if s.joinable(need) {
         return true;
     }
     s.open = None;
@@ -449,15 +476,7 @@ pub(crate) fn add(
     // SAFETY: a live buffer.
     let clamped = unsafe { buffer.GetGPUVirtualAddress() } + at;
     let len = u64::from(stride) * u64::from(records);
-    let flags = u32::from(cfg!(feature = "diagnostics")) | if count.is_some() { 2 } else { 0 };
-    let command = Command {
-        record: [kind, stride, records, flags],
-        args,
-        count: count.unwrap_or(clamped),
-        clamped,
-        groups: [records.div_ceil(64), 1, 1],
-        _pad: 0,
-    };
+    let command = Command::new((kind, stride, records), args, count, clamped);
     let data = s.tables[table].1 + offset as usize;
     // SAFETY: the segment's part of the table's mapping (room for
     // `COMMANDS` commands after the count), which the GPU reads only once
@@ -474,6 +493,82 @@ pub(crate) fn add(
     if segment.commands == COMMANDS {
         s.open = None;
     }
+    Some((buffer, at, count.map(|_| at + len)))
+}
+
+/// Whether an execution of `records` records `stride` bytes apart joins
+/// the open segment's clamp ([`open`] would record none).
+pub(crate) fn joins(list: &HostList, (_, stride, records): (u32, u32, u32)) -> bool {
+    list.clamps().joinable(region(stride, records))
+}
+
+/// Clamps an execution alone in its segment with a dispatch of its own,
+/// recorded now: the records at host address `args` (and the count at
+/// `count`, if the title gives one). For an indirect dispatch when no
+/// segment is open ([`joins`]): its groups may write arguments later
+/// executions read, so nothing joins its segment, and a segment's
+/// ExecuteIndirect between barriers costs ~35 µs on the host GPU against
+/// ~5 µs for a dispatch (VICT-9's probe). Replaces the list's compute root
+/// signature and pipeline (callers bind theirs after). Returns as [`add`]
+/// does.
+pub(crate) fn clamp_alone(
+    list: &HostList,
+    (kind, stride, records): (u32, u32, u32),
+    args: u64,
+    count: Option<u64>,
+) -> Option<(ID3D12Resource, u64, Option<u64>)> {
+    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+        return None;
+    };
+    if !stride.is_multiple_of(4)
+        || !args.is_multiple_of(4)
+        || count.is_some_and(|c| !c.is_multiple_of(4))
+    {
+        return None;
+    }
+    let mut s = list.clamps();
+    s.open = None;
+    let ring = s.room(region(stride, records))?;
+    let (buffer, at) = (s.rings[ring].0.clone(), s.used);
+    // SAFETY: a live buffer.
+    let clamped = unsafe { buffer.GetGPUVirtualAddress() } + at;
+    let command = Command::new((kind, stride, records), args, count, clamped);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("clamp kind {kind} records {records}"));
+    let l = &list.list;
+    let mut before = vec![uav_barrier()];
+    if s.reading[ring] {
+        before.push(transition(
+            &buffer,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        ));
+    }
+    // SAFETY: an open list; our root signature and pipeline, the list's
+    // buffers, which its clamps keep.
+    unsafe {
+        // Earlier shader writes (the title's argument passes) first.
+        l.ResourceBarrier(&before);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 4, command.record.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, command.args);
+        l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, command.count);
+        l.SetComputeRootUnorderedAccessView(4, command.clamped);
+        l.Dispatch(command.groups[0], 1, 1);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ),
+        ]);
+    }
+    s.reading[ring] = true;
+    s.used += region(stride, records);
+    let len = u64::from(stride) * u64::from(records);
     Some((buffer, at, count.map(|_| at + len)))
 }
 
@@ -646,6 +741,92 @@ void main() { uint was; counted.InterlockedAdd(0, 1, was); }
         // SAFETY: the mapped buffers, which the finished list wrote.
         let (ran, kept) = unsafe { (total.cast::<u32>().read_volatile(), words.add(3).read()) };
         assert_eq!(ran, 5 + 3 + 2, "groups run");
+        assert_eq!(kept, 70000, "the title's records stay as written");
+        assert_eq!(host.log_messages(), None, "debug layer errors");
+        list.reset();
+    }
+
+    /// Indirect dispatches clamped alone, each by a dispatch of its own,
+    /// read their records clamped, one with a count limiting it, one after
+    /// another from the same ring; the title's records stay as written, and
+    /// the debug layer finds nothing wrong with the states.
+    #[test]
+    fn indirect_dispatches_clamped_alone_run_their_records_clamped() {
+        let _serial = crate::watch::serial();
+        if !crate::shadow::tests::gpu() {
+            return;
+        }
+        let host = host().unwrap();
+        let (title, words) = host.shared_buffer(4096).unwrap();
+        let (counted, total) = host.shared_buffer(256).unwrap();
+        let words = words.cast::<u32>();
+        // At 0: 5 groups, then 70000 x 70000 (past the limits: none). At
+        // 64: 3 groups then 4, of which the count at 128 runs one.
+        let records: [(usize, [u32; 3]); 4] = [
+            (0, [5, 1, 1]),
+            (3, [70000, 70000, 1]),
+            (16, [3, 1, 1]),
+            (19, [4, 1, 1]),
+        ];
+        // SAFETY: inside the mapped buffers.
+        unsafe {
+            for (at, groups) in records {
+                words.add(at).cast::<[u32; 3]>().write(groups);
+            }
+            words.add(32).write(1);
+            total.cast::<u32>().write(0);
+        }
+        // SAFETY: live buffers.
+        let (base, out) = unsafe { (title.GetGPUVirtualAddress(), counted.GetGPUVirtualAddress()) };
+        let (root, pso) = counting();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: one argument, no root arguments.
+        unsafe {
+            host.device
+                .CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 12,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &argument,
+                        NodeMask: 0,
+                    },
+                    None,
+                    &mut signature,
+                )
+                .unwrap()
+        };
+        let signature = signature.unwrap();
+        let list = host.new_list().unwrap();
+        let run = |args: u64, records: u32, count: Option<u64>| {
+            assert!(!joins(&list, (2, 12, records)), "no segment is open");
+            let (clamped, at, count_at) =
+                clamp_alone(&list, (2, 12, records), args, count).unwrap();
+            // SAFETY: an open list; live objects.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootUnorderedAccessView(0, out);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    records,
+                    &clamped,
+                    at,
+                    count_at.map(|_| &clamped),
+                    count_at.unwrap_or(0),
+                );
+            }
+        };
+        run(base, 2, None);
+        run(base + 64, 2, Some(base + 128));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapped buffers, which the finished list wrote.
+        let (ran, kept) = unsafe { (total.cast::<u32>().read_volatile(), words.add(3).read()) };
+        assert_eq!(ran, 5 + 3, "groups run");
         assert_eq!(kept, 70000, "the title's records stay as written");
         assert_eq!(host.log_messages(), None, "debug layer errors");
         list.reset();

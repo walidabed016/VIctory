@@ -1208,11 +1208,26 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Opened first: a segment's clamp binds a compute pipeline of its own.
-        if !crate::indirect::open(list, (kind, stride, max)) {
-            why("not bounded (no clamp, or a stride not a multiple of 4)");
-            return false;
-        }
+        let records = args.gpu(arguments);
+        let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        // Clamped first: the clamp binds a compute pipeline of its own. An
+        // indirect dispatch's segment holds it alone, so it is clamped now
+        // unless it joins an open segment.
+        let alone = if kind == DISPATCH && !crate::indirect::joins(list, (kind, stride, max)) {
+            let Some(clamped) =
+                crate::indirect::clamp_alone(list, (kind, stride, max), records, count)
+            else {
+                why("not bounded (no clamp, or a stride, records or count not 4-byte aligned)");
+                return false;
+            };
+            Some(clamped)
+        } else {
+            if !crate::indirect::open(list, (kind, stride, max)) {
+                why("not bounded (no clamp, or a stride not a multiple of 4)");
+                return false;
+            }
+            None
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1238,10 +1253,8 @@ impl State {
             }
             return false;
         }
-        let records = args.gpu(arguments);
-        let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
         let Some((clamped, at, count_at)) =
-            crate::indirect::add(list, (kind, stride, max), records, count)
+            alone.or_else(|| crate::indirect::add(list, (kind, stride, max), records, count))
         else {
             why("not bounded (arguments or count not 4-byte aligned)");
             return false;
