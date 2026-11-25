@@ -1613,9 +1613,10 @@ type SlotOwners = std::collections::HashMap<(usize, u32), PlacedKey>;
 static SLOT_OWNERS: std::sync::Mutex<Option<SlotOwners>> = std::sync::Mutex::new(None);
 
 /// Placed textures given a resource with one mip fewer, by the frame, until
-/// their slots move to it (locked inside [`PLACED_TEXTURES`]).
+/// their slots move to it, with the bytes of the resource they had (locked
+/// inside [`PLACED_TEXTURES`]).
 #[cfg(windows)]
-static PLACED_REDUCING: std::sync::Mutex<std::collections::VecDeque<(u64, PlacedKey)>> =
+static PLACED_REDUCING: std::sync::Mutex<std::collections::VecDeque<(u64, PlacedKey, u64)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
 /// A heap slot to bring up to date (`true`) or move to the texture now at
@@ -1635,10 +1636,13 @@ static STALE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Placed textures' bytes now; those let go of, heap slots moved, and
 /// resources given one mip fewer so far; the frame resources were last
 /// given one; textures kept so far though one placed later took memory of
-/// theirs past their smallest mips.
+/// theirs past their smallest mips; the bytes the last pass giving them
+/// left; passes so far that found too few to give one to get down to nine
+/// tenths of the budget; bytes of the resources textures had before one mip
+/// fewer, held until their slots move.
 #[cfg(windows)]
-static PLACED_COUNTS: [std::sync::atomic::AtomicU64; 6] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static PLACED_COUNTS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 std::thread_local! {
     /// Whether this thread makes the view of a descriptor the title wrote
@@ -1663,12 +1667,52 @@ fn placed_budget() -> u64 {
     })
 }
 
+/// `VICTORY_PLACED_FIRM=1`: placed textures are given one mip fewer
+/// faster, and again within a frame past the budget ([`reduce_pass`]).
+#[cfg(windows)]
+fn firm_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_PLACED_FIRM").is_ok_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "placed textures past their budget are given one mip fewer up to 1024 at a \
+                 time, and again within a frame (VICTORY_PLACED_FIRM)"
+            );
+        }
+        on
+    })
+}
+
+/// With `bytes` of placed textures against `budget`, how many at most a
+/// pass gives one mip fewer now, if one runs: past nine tenths of the
+/// budget, 64 once a frame (`ran`: one has this frame). With the firm
+/// budget, 1024, and again within a frame while past the whole budget and
+/// 64 MiB past what the last pass left (`passed`): loading places textures
+/// faster than 64 a frame can give back (runs 157 and 161 peaked ~0.8 GB
+/// past 4096 MiB).
+#[cfg(windows)]
+fn reduce_pass(bytes: u64, budget: u64, ran: bool, passed: u64, firm: bool) -> Option<usize> {
+    const PER_FRAME: usize = 64;
+    const FIRM_PER_PASS: usize = 1024;
+    const FIRM_STEP: u64 = 64 << 20;
+    let most = if firm { FIRM_PER_PASS } else { PER_FRAME };
+    if bytes <= budget / 10 * 9 {
+        return None;
+    }
+    if !ran {
+        return Some(most);
+    }
+    (firm && bytes > budget && bytes >= passed.saturating_add(FIRM_STEP)).then_some(most)
+}
+
 /// Placed textures and their MiB; those heap slots view and their MiB;
 /// those with fewer mips now; those let go of, heap slots moved, resources
 /// given one mip fewer and textures kept though memory of theirs was taken
-/// so far.
+/// so far; passes so far that left them past nine tenths of the budget;
+/// MiB of resources held until heap slots move to ones with a mip fewer.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn placed_textures() -> [u64; 9] {
+pub(crate) fn placed_textures() -> [u64; 11] {
     use std::sync::atomic::Ordering::Relaxed;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let (mut viewed, mut viewed_bytes, mut fewer) = (0, 0, 0);
@@ -1680,7 +1724,7 @@ pub(crate) fn placed_textures() -> [u64; 9] {
     }
     let live = map.len() as u64;
     drop(map);
-    let [bytes, gone, moved, reduced, _, spared] =
+    let [bytes, gone, moved, reduced, _, spared, _, short, held] =
         PLACED_COUNTS.each_ref().map(|n| n.load(Relaxed));
     [
         live,
@@ -1692,6 +1736,8 @@ pub(crate) fn placed_textures() -> [u64; 9] {
         moved,
         reduced,
         spared,
+        short,
+        held >> 20,
     ]
 }
 
@@ -1946,7 +1992,6 @@ fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(T
     const GPU_WRITTEN: u32 = 0x7;
     const MOST_DROPPED: u32 = 2;
     const SMALLEST: u64 = 256 << 10;
-    const PER_FRAME: usize = 64;
     const SETTLE_FRAMES: u64 = 4;
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
@@ -1956,10 +2001,11 @@ fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(T
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut reducing = PLACED_REDUCING.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(&(frame, key)) = reducing.front()
+        while let Some(&(frame, key, held)) = reducing.front()
             && frame.saturating_add(SETTLE_FRAMES) <= now
         {
             reducing.pop_front();
+            PLACED_COUNTS[8].fetch_sub(held, Relaxed);
             let Some(p) = map.get_mut(&key).filter(|p| p.next != 0) else {
                 continue;
             };
@@ -2109,9 +2155,17 @@ fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(T
                 }
             }
         }
-        // Still past nine tenths, once a frame: those asked for longest ago
-        // with the fewest mips dropped get a resource with one mip fewer.
-        if PLACED_COUNTS[0].load(Relaxed) > goal && PLACED_COUNTS[4].swap(now, Relaxed) != now {
+        // Still past nine tenths ([`reduce_pass`]): those asked for longest
+        // ago with the fewest mips dropped get a resource with one mip fewer.
+        let pass = reduce_pass(
+            PLACED_COUNTS[0].load(Relaxed),
+            budget,
+            PLACED_COUNTS[4].load(Relaxed) == now,
+            PLACED_COUNTS[6].load(Relaxed),
+            firm_budget(),
+        );
+        if let Some(most) = pass {
+            PLACED_COUNTS[4].store(now, Relaxed);
             let mut old: Vec<((u32, u64), PlacedKey)> = map
                 .iter()
                 .filter(|&(&(_, words), p)| {
@@ -2128,7 +2182,7 @@ fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(T
             let mut reducing = PLACED_REDUCING.lock().unwrap_or_else(|e| e.into_inner());
             let mut given = 0;
             for (_, key) in old {
-                if given == PER_FRAME || PLACED_COUNTS[0].load(Relaxed) <= goal {
+                if given == most || PLACED_COUNTS[0].load(Relaxed) <= goal {
                     break;
                 }
                 let Some(p) = map.get_mut(&key) else {
@@ -2164,15 +2218,20 @@ fn placed_in(address: u64, desc: &[u32; 14], now: u64, place: bool) -> Option<(T
                 }
                 let bytes = footprint(&h).map_or(p.bytes, |info| info.size.min(p.bytes));
                 PLACED_COUNTS[0].fetch_sub(p.bytes - bytes, Relaxed);
+                let held = p.bytes;
+                PLACED_COUNTS[8].fetch_add(held, Relaxed);
                 (p.bytes, p.next, p.used) = (bytes, next as usize, now);
                 stale.extend(
                     p.slots
                         .iter()
                         .map(|&(h, s, r)| (h, s, r, key.0, key.1, true)),
                 );
-                reducing.push_back((now, key));
+                reducing.push_back((now, key, held));
                 given += 1;
             }
+            let left = PLACED_COUNTS[0].load(Relaxed);
+            PLACED_COUNTS[6].store(left, Relaxed);
+            PLACED_COUNTS[7].fetch_add(u64::from(given < most && left > goal), Relaxed);
         }
         if resource(out).host.is_some() {
             Some((out, 0))
@@ -2518,6 +2577,30 @@ mod tests {
         array[7] |= 6;
         assert_eq!(without_top_mip(&array), None);
         assert_eq!(without_top_mip(&desc(256, 256, 1, 28, 0)), None);
+    }
+
+    /// Past nine tenths of the budget a pass gives 64 textures one mip fewer
+    /// once a frame; with the firm budget 1024, and again within the frame
+    /// each time the bytes grow 64 MiB past the whole budget.
+    #[cfg(windows)]
+    #[test]
+    fn firm_budgets_give_mips_back_within_a_frame() {
+        const MIB: u64 = 1 << 20;
+        let budget = 4096 * MIB;
+        let over = budget + 200 * MIB;
+        for (firm, most) in [(false, 64), (true, 1024)] {
+            let pass = |bytes, ran, passed| reduce_pass(bytes, budget, ran, passed, firm);
+            assert_eq!(pass(3600 * MIB, false, 0), None, "under nine tenths");
+            assert_eq!(pass(3800 * MIB, false, 0), Some(most), "once a frame");
+            assert_eq!(pass(3800 * MIB, true, 0), None, "past nine tenths only");
+            assert_eq!(pass(over, true, over - 32 * MIB), None, "small growth");
+        }
+        assert_eq!(reduce_pass(over, budget, true, budget, false), None);
+        assert_eq!(
+            reduce_pass(over, budget, true, budget, true),
+            Some(1024),
+            "again within the frame"
+        );
     }
 
     /// Views of a resource lacking mips keep their mips: the most detailed
