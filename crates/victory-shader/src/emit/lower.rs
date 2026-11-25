@@ -303,6 +303,12 @@ struct Lower<'a> {
     last_pass_loops: HashSet<usize>,
     /// Those scalars as that code reads them, with their loop's block.
     last_pass: HashMap<Value, (usize, Val)>,
+    /// Values made from image descriptor dwords read as data (see [`Dim`]).
+    dims: HashMap<Value, Dim>,
+    /// The site a join stands for that takes dwords of the descriptors
+    /// loaded at these sites, by block and incoming edge (see
+    /// [`Lower::phi_dim`]).
+    phi_sites: HashMap<(usize, Vec<Site>), Site>,
     #[cfg(test)]
     halves_barriers: u32,
 }
@@ -689,6 +695,115 @@ struct Bounding {
     budget: usize,
 }
 
+/// What a value made from the dwords of an image descriptor read as data
+/// holds. The host's dwords describe the view as a texture of its own: its
+/// first level's size, BASE_LEVEL 0 (see `descriptor_data`); the console's,
+/// the size of the texture's first level and the view's first level. The
+/// console compiler takes `GetDimensions` as (WIDTH + 1) >> BASE_LEVEL, and
+/// the same of HEIGHT, unclamped: both give the size of the view's first
+/// level that way, except where the console's comes out 0 (a view whose
+/// first level is past that side's last, 1 on the host). That size and bits
+/// of it are numbers like any other; any other read of WIDTH, HEIGHT or
+/// BASE_LEVEL is refused ([`FIELDS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dim {
+    Bits(Bits),
+    /// WIDTH or HEIGHT of the descriptor loaded at a site, plus 1.
+    Size(Site),
+    /// That descriptor's BASE_LEVEL as an `s_bfe_u32` control's offset,
+    /// with a constant width.
+    Control(Site),
+    /// Spilled or joined with other values.
+    Joined,
+}
+
+/// Bits `start..start + len` of the image descriptor loaded at `site`, at
+/// bit `at` of a dword, the others 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bits {
+    site: Site,
+    start: u32,
+    len: u32,
+    at: u32,
+}
+
+impl Bits {
+    fn shr(self, n: u32) -> Bits {
+        match n.checked_sub(self.at) {
+            None => Bits {
+                at: self.at - n,
+                ..self
+            },
+            Some(k) => Bits {
+                start: self.start + k,
+                len: self.len.saturating_sub(k),
+                at: 0,
+                ..self
+            },
+        }
+    }
+
+    fn shl(self, n: u32) -> Bits {
+        let at = (self.at + n).min(32);
+        Bits {
+            len: self.len.min(32 - at),
+            at,
+            ..self
+        }
+    }
+
+    /// Bits `at..at + len` of these, in place.
+    fn field(self, at: u32, len: u32) -> Bits {
+        let low = self.shr(at);
+        Bits {
+            len: low.len.min(len.saturating_sub(low.at)),
+            ..low
+        }
+        .shl(at)
+    }
+
+    /// Two runs of bits that adjoin, in the descriptor and in the dword.
+    fn or(self, b: Bits) -> Option<Bits> {
+        let (lo, hi) = if self.at <= b.at {
+            (self, b)
+        } else {
+            (b, self)
+        };
+        match (lo.len, hi.len) {
+            (0, _) => Some(hi),
+            (_, 0) => Some(lo),
+            _ => (lo.site == hi.site && lo.at + lo.len == hi.at && lo.start + lo.len == hi.start)
+                .then_some(Bits {
+                    len: lo.len + hi.len,
+                    ..lo
+                }),
+        }
+    }
+
+    /// Exactly the field `(start, len)` of the descriptor.
+    fn is(self, (start, len): (u32, u32)) -> bool {
+        (self.start, self.len, self.at) == (start, len, 0)
+    }
+
+    /// Whether any of these is in the field `(start, len)`.
+    fn touches(self, (start, len): (u32, u32)) -> bool {
+        self.len > 0 && self.start < start + len && start < self.start + self.len
+    }
+}
+
+/// GFX10 image descriptor fields by first bit and width, as the console
+/// compiler extracts them.
+const WIDTH: (u32, u32) = (62, 16);
+const HEIGHT: (u32, u32) = (78, 16);
+const BASE_LEVEL: (u32, u32) = (108, 4);
+
+/// See [`Dim`].
+const FIELDS: Why =
+    "an image's size or first level read from its descriptor other than as its first level's size";
+
+/// The values an instruction writes, each with its [`Dim`] (none: a number).
+type Dims = Vec<(Value, Option<Dim>)>;
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, split: Split, lanes: bool) -> Self {
         let p = x.p;
@@ -900,6 +1015,8 @@ impl<'a> Lower<'a> {
             ballot_fail: HashMap::new(),
             last_pass_loops: HashSet::new(),
             last_pass: HashMap::new(),
+            dims: HashMap::new(),
+            phi_sites: HashMap::new(),
             #[cfg(test)]
             halves_barriers: 0,
         }
@@ -1151,6 +1268,9 @@ impl<'a> Lower<'a> {
         let inst = &self.x.p.blocks[b].insts[i];
         if self.lockstep() && matches!(inst.fields, Fields::Sop { .. }) {
             return self.inst(b, i);
+        }
+        if inst.reads.iter().any(|r| self.dims.contains_key(&r.1)) {
+            return Err(unsupported(inst.machine.offset, FIELDS));
         }
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
@@ -1452,6 +1572,9 @@ impl<'a> Lower<'a> {
                     }
                 };
                 self.vals.insert(phi.value, val);
+                if let Some(d) = self.phi_dim(b, phi.value, &phi.args) {
+                    self.dims.insert(phi.value, d);
+                }
             }
             for phi in &p.blocks[b].phis {
                 self.ballot_where_written(phi.value);
@@ -2369,6 +2492,11 @@ impl<'a> Lower<'a> {
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
+        if let Atom::Uniform(v) | Atom::Opaque(v) = atom
+            && self.dims.contains_key(&v)
+        {
+            return Err(FIELDS);
+        }
         match atom {
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
@@ -3713,32 +3841,41 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        let r = match &inst.fields {
-            Fields::Sop { .. } => self.sop(inst),
-            Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
-            Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-                Ok(())
-            }
-            Fields::Sopp { .. } => Ok(()),
-            Fields::Smem { .. } => self.smem(inst, (b, i)),
-            Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
-            Fields::Valu(_) => self.valu(inst, b, i),
-            Fields::Vintrp { .. } => self.interp(inst, (b, i)),
-            Fields::Image { .. } => self.image(inst, b, i),
-            Fields::Buffer { .. } => self.buffer(inst, b, i),
-            Fields::Exp { .. } => self.export(b, i),
-            Fields::Ds { .. } => self.ds(inst, b, i),
-            Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
-            Fields::Flat { .. } => Err("flat memory"),
-        };
+        let dims = self.field_use(inst, self.x.st.guards[b][i].is_some());
+        let r = dims
+            .as_ref()
+            .map_err(|&w| w)
+            .and_then(|_| match &inst.fields {
+                Fields::Sop { .. } => self.sop(inst),
+                Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => {
+                    Ok(())
+                }
+                Fields::Sopp { .. } if name == "s_barrier" => {
+                    // Thread-group sync with a shared-memory fence, and a UAV
+                    // fence when the program writes UAVs (the waits before an
+                    // s_barrier make those writes visible on the console).
+                    let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                    let mode = self.s.m.i32(mode);
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                    Ok(())
+                }
+                Fields::Sopp { .. } => Ok(()),
+                Fields::Smem { .. } => self.smem(inst, (b, i)),
+                Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
+                Fields::Valu(_) => self.valu(inst, b, i),
+                Fields::Vintrp { .. } => self.interp(inst, (b, i)),
+                Fields::Image { .. } => self.image(inst, b, i),
+                Fields::Buffer { .. } => self.buffer(inst, b, i),
+                Fields::Exp { .. } => self.export(b, i),
+                Fields::Ds { .. } => self.ds(inst, b, i),
+                Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
+                Fields::Flat { .. } => Err("flat memory"),
+            });
+        if let (Ok(()), Ok(Some(outs))) = (&r, dims) {
+            self.field_outputs(inst, &outs);
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -4687,7 +4824,18 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                Some(&(_, x)) => {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                    if let (Some(v), Some(_)) = (inst.write(Reg::S(code + k as u8)), image) {
+                        let bits = Bits {
+                            site,
+                            start: 32 * rel,
+                            len: 32,
+                            at: 0,
+                        };
+                        self.dims.insert(v, Dim::Bits(bits));
+                    }
+                }
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
@@ -4696,6 +4844,312 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// What `inst` makes of image descriptor dwords it reads as data (see
+    /// [`Dim`]): none when it reads none, else each value it writes with its
+    /// own [`Dim`] (none: a number like any other); or [`FIELDS`]. Steps let
+    /// through: copies and spills, bit extractions at constant positions (a
+    /// field but WIDTH, HEIGHT and BASE_LEVEL is a number), WIDTH or HEIGHT
+    /// plus 1, and that shifted right by its descriptor's BASE_LEVEL or bits
+    /// of it from there (the size of the view's first level).
+    fn field_use(&mut self, inst: &Inst, guarded: bool) -> Result<Option<Dims>, Why> {
+        if self.dims.is_empty() {
+            return Ok(None);
+        }
+        let regs = |op: &Operand| match *op {
+            Operand::Scalar { code, dwords } => (0..dwords).map(|k| Reg::S(code + k)).collect(),
+            Operand::Vector { reg, dwords } => (0..dwords).map(|k| Reg::V(reg + k)).collect(),
+            _ => Vec::new(),
+        };
+        let src: Vec<Reg> = match &inst.fields {
+            Fields::Sop { src, .. } => src.iter().flat_map(regs).collect(),
+            Fields::Valu(v) => v.src.iter().flat_map(regs).collect(),
+            _ => Vec::new(),
+        };
+        // A VGPR write reads the register's old value for the lanes or bits
+        // it keeps: a guarded write's, an SDWA field's, and those of writes
+        // that merge into the register; no other's.
+        let old: Vec<Reg> = match &inst.fields {
+            Fields::Valu(v)
+                if !guarded
+                    && v.dpp.is_none()
+                    && Self::sdwa_dst(inst).is_none_or(|(_, unused)| unused != 2)
+                    && !["mac", "dot", "lane", "rel"]
+                        .iter()
+                        .any(|k| inst.name().contains(k)) =>
+            {
+                (inst.writes.iter())
+                    .map(|w| w.0)
+                    .filter(|r| matches!(r, Reg::V(_)) && !src.contains(r))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        // What an access takes as its resource or sampler is no data.
+        let held: Vec<Reg> = match &inst.fields {
+            Fields::Image { rsrc, sampler, .. } => {
+                let mut r = regs(rsrc);
+                r.extend(sampler.iter().flat_map(regs));
+                r
+            }
+            Fields::Buffer { rsrc, .. } => regs(rsrc),
+            Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_load") => regs(base),
+            _ => Vec::new(),
+        };
+        if !(inst.reads.iter())
+            .any(|(r, v)| !held.contains(r) && !old.contains(r) && self.dims.contains_key(v))
+        {
+            return Ok(None);
+        }
+        // An operand that has failed fails the instruction for its reason
+        // (one a retry may clear).
+        let failed =
+            (src.iter().filter_map(|&r| inst.read(r))).find_map(|v| match self.vals.get(&v) {
+                Some(&Val::Missing(why)) => Some(why),
+                _ => None,
+            });
+        let r = failed.map_or_else(|| self.field_step(inst), Err);
+        if let Err(why) = r {
+            for &(_, w) in &inst.writes {
+                self.lane_fail.insert(w, why);
+            }
+        }
+        r.map(Some)
+    }
+
+    /// [`Lower::field_use`] of an instruction that reads such dwords.
+    fn field_step(&mut self, inst: &Inst) -> Result<Dims, Why> {
+        let name = inst.name();
+        let (src, dst, sdwa) = match &inst.fields {
+            Fields::Sop { dst, src, .. } => (src, dst, None),
+            Fields::Valu(v)
+                if v.abs | v.neg | v.opsel == 0 && !v.clamp && v.omod == 0 && v.dpp.is_none() =>
+            {
+                (&v.src, &v.dst, v.sdwa)
+            }
+            _ => return Err(FIELDS),
+        };
+        let reg = |op: &Operand| match *op {
+            Operand::Scalar { code, .. } => Some(Reg::S(code)),
+            Operand::Vector { reg, .. } => Some(Reg::V(reg)),
+            _ => None,
+        };
+        let out = |r: Option<Reg>| r.and_then(|r| inst.write(r)).ok_or(FIELDS);
+        let dim_of = |l: &Self, v: Value| l.dims.get(&v).copied();
+        if name == "s_mov_b64" {
+            let (Some(Operand::Scalar { code: d, .. }), [Operand::Scalar { code: s, .. }]) =
+                (dst, &src[..])
+            else {
+                return Err(FIELDS);
+            };
+            return (0..2)
+                .map(|k| {
+                    let from = inst.read(Reg::S(s + k)).and_then(|v| dim_of(self, v));
+                    Ok((out(Some(Reg::S(d + k)))?, from))
+                })
+                .collect();
+        }
+        let dst = out(dst.as_ref().and_then(reg))?;
+        // Each operand's dim, through its SDWA select.
+        let mut dims = Vec::new();
+        for (k, op) in src.iter().enumerate() {
+            let d = reg(op)
+                .and_then(|r| inst.read(r))
+                .and_then(|v| dim_of(self, v));
+            dims.push(match (sdwa, d) {
+                (_, None) | (None, _) => d,
+                (Some(s), Some(Dim::Bits(b))) if s.dst_sel == 6 && s.sext >> k & 1 == 0 => {
+                    let sel = u32::from(s.src_sel.get(k).copied().unwrap_or(6));
+                    Some(Dim::Bits(match sel {
+                        0..=3 => b.shr(8 * sel).field(0, 8),
+                        4 | 5 => b.shr(16 * (sel - 4)).field(0, 16),
+                        _ => b,
+                    }))
+                }
+                _ => return Err(FIELDS),
+            });
+        }
+        let konst = |l: &mut Self, k: usize| {
+            let x = l.operand(inst, &src[k]).ok()?;
+            if let Some(c) = l.s.m.int_value(x) {
+                return Some(c as u32);
+            }
+            // A join of the same constant on every edge into it (a mask each
+            // way into a loop's body sets).
+            let v = reg(&src[k]).and_then(|r| inst.read(r))?;
+            let &(b, i) = l.phi_at.get(&v)?;
+            let p = l.x.p;
+            let mut c = None;
+            for (n, &a) in p.blocks[b].phis[i].args.iter().enumerate() {
+                if a == v || l.block[p.blocks[b].preds[n]].is_none() {
+                    continue;
+                }
+                let Some(&Val::I32(x)) = l.vals.get(&a) else {
+                    return None;
+                };
+                let y = l.s.m.int_value(x)?;
+                if c.is_some_and(|c| c != y) {
+                    return None;
+                }
+                c = Some(y);
+            }
+            c.map(|c| c as u32)
+        };
+        let same = |l: &Self, a: Site, b: Site| a == b || l.same_address(a, b);
+        let next = match (name, &dims[..]) {
+            ("s_mov_b32" | "v_mov_b32" | "v_readfirstlane_b32", &[d]) => d,
+            // A spill: the lane's scalar comes back where `v_readlane_b32`
+            // restores it.
+            ("v_writelane_b32", _) => Some(Dim::Joined),
+            ("v_readlane_b32", _) => match self.restored(inst) {
+                Some(Moved::Value(v)) => dim_of(self, v),
+                _ => return Err(FIELDS),
+            },
+            (
+                "s_add_u32" | "s_add_i32" | "v_add_nc_u32" | "v_add_u32" | "v_add_co_u32",
+                &[a, b],
+            ) => {
+                let (f, k) = match (a, b) {
+                    (Some(Dim::Bits(f)), None) => (f, 1),
+                    (None, Some(Dim::Bits(f))) => (f, 0),
+                    _ => return Err(FIELDS),
+                };
+                if !(f.is(WIDTH) || f.is(HEIGHT)) || konst(self, k) != Some(1) {
+                    return Err(FIELDS);
+                }
+                Some(Dim::Size(f.site))
+            }
+            ("s_lshr_b32", &[Some(Dim::Size(s)), Some(Dim::Bits(b))])
+            | ("v_lshrrev_b32", &[Some(Dim::Bits(b)), Some(Dim::Size(s))])
+            | ("v_bfe_u32", &[Some(Dim::Size(s)), Some(Dim::Bits(b)), None])
+                if b.is(BASE_LEVEL) && same(self, s, b.site) =>
+            {
+                None
+            }
+            ("s_bfe_u32", &[Some(Dim::Size(s)), Some(Dim::Control(c))]) if same(self, s, c) => None,
+            ("s_or_b32", &[Some(Dim::Bits(b)), None] | &[None, Some(Dim::Bits(b))])
+                if b.is(BASE_LEVEL)
+                    && konst(self, usize::from(dims[0].is_some()))
+                        .is_some_and(|c| c & 0xFFFF == 0) =>
+            {
+                Some(Dim::Control(b.site))
+            }
+            _ => {
+                // A bit extraction at constant positions.
+                let bits = |k: usize| match dims.get(k) {
+                    Some(&Some(Dim::Bits(b))) => Some(b),
+                    _ => None,
+                };
+                let b = match (name, dims.len()) {
+                    ("s_lshr_b32", 2) => bits(0).zip(konst(self, 1)).map(|(b, n)| b.shr(n & 31)),
+                    ("v_lshrrev_b32", 2) => bits(1).zip(konst(self, 0)).map(|(b, n)| b.shr(n & 31)),
+                    ("s_lshl_b32", 2) => bits(0).zip(konst(self, 1)).map(|(b, n)| b.shl(n & 31)),
+                    ("v_lshlrev_b32", 2) => bits(1).zip(konst(self, 0)).map(|(b, n)| b.shl(n & 31)),
+                    ("s_and_b32" | "v_and_b32" | "s_or_b32" | "v_or_b32", 2) => {
+                        match (bits(0), bits(1)) {
+                            (Some(a), Some(b)) if name.contains("or") => {
+                                let site = if same(self, a.site, b.site) {
+                                    a.site
+                                } else {
+                                    b.site
+                                };
+                                a.or(Bits { site, ..b })
+                            }
+                            (Some(b), None) | (None, Some(b)) => {
+                                let m =
+                                    konst(self, usize::from(bits(0).is_some())).ok_or(FIELDS)?;
+                                let at = m.trailing_zeros().min(32);
+                                let len = m.checked_shr(at).unwrap_or(0).trailing_ones();
+                                match (name.contains("and"), m) {
+                                    (false, 0) => Some(b),
+                                    (true, _) if m.checked_shr(at + len).unwrap_or(0) == 0 => {
+                                        Some(b.field(at, len))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    ("s_bfe_u32", 2) => bits(0)
+                        .zip(konst(self, 1))
+                        .map(|(b, x)| b.shr(x & 31).field(0, x >> 16 & 0x7F)),
+                    ("v_bfe_u32", 3) => match (bits(0), konst(self, 1), konst(self, 2)) {
+                        (Some(b), Some(o), Some(w)) => Some(b.shr(o & 31).field(0, w & 31)),
+                        _ => None,
+                    },
+                    ("v_alignbit_b32", 3) => match (bits(0), bits(1), konst(self, 2)) {
+                        (Some(_), Some(lo), Some(0)) => Some(lo),
+                        (Some(hi), Some(lo), Some(n)) => lo.shr(n & 31).or(hi.shl(32 - (n & 31))),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let b = b.ok_or(FIELDS)?;
+                ([WIDTH, HEIGHT, BASE_LEVEL].into_iter())
+                    .any(|f| b.touches(f))
+                    .then_some(Dim::Bits(b))
+            }
+        };
+        Ok(vec![(dst, next)])
+    }
+
+    /// The [`Dim`] of a join whose every other incoming value has one, the
+    /// same but for the descriptor: that of each edge's, a site of its own
+    /// where they differ. None where an incoming value is not yet lowered (a
+    /// loop's), so that a read of the join is refused in `fill_phis`.
+    fn phi_dim(&mut self, b: usize, value: Value, args: &[Value]) -> Option<Dim> {
+        let preds = &self.x.p.blocks[b].preds;
+        let mut kind = None;
+        let mut sites = Vec::new();
+        for (n, &arg) in args.iter().enumerate() {
+            if arg == value || self.block[preds[n]].is_none() {
+                continue;
+            }
+            let (site, k) = match *self.dims.get(&arg)? {
+                Dim::Bits(x) => (x.site, Dim::Bits(Bits { site: (0, 0), ..x })),
+                Dim::Size(s) => (s, Dim::Size((0, 0))),
+                Dim::Control(s) => (s, Dim::Control((0, 0))),
+                Dim::Joined => return None,
+            };
+            if kind.is_some_and(|d| d != k) {
+                return None;
+            }
+            kind = Some(k);
+            sites.push(site);
+        }
+        let kind = kind?;
+        let site = if sites.iter().all(|&s| s == sites[0]) {
+            sites[0]
+        } else {
+            let next = (usize::MAX, self.phi_sites.len());
+            *self.phi_sites.entry((b, sites)).or_insert(next)
+        };
+        Some(match kind {
+            Dim::Bits(x) => Dim::Bits(Bits { site, ..x }),
+            Dim::Size(_) => Dim::Size(site),
+            Dim::Control(_) => Dim::Control(site),
+            Dim::Joined => Dim::Joined,
+        })
+    }
+
+    /// After `inst` lowered: the dims [`Lower::field_use`] gave the values
+    /// it writes. Any other value it writes (SCC, a carry) is data refused.
+    fn field_outputs(&mut self, inst: &Inst, outs: &[(Value, Option<Dim>)]) {
+        for &(_, w) in &inst.writes {
+            match outs.iter().find(|o| o.0 == w) {
+                Some(&(_, Some(d))) => {
+                    self.dims.insert(w, d);
+                }
+                Some(_) => {}
+                None => {
+                    self.vals.insert(w, Val::Missing(FIELDS));
+                    self.lane_bits.remove(&w);
+                    self.lane_fail.insert(w, FIELDS);
+                }
+            }
+        }
     }
 
     /// Whether the scalar loads at `a` and `b` read the same address: the
@@ -9647,6 +10101,10 @@ impl<'a> Lower<'a> {
                     l.read_phis.contains(&phi.value)
                         && !l.unread_from(phi.value, b, n, &[], &mut 256)
                 };
+                if self.dims.contains_key(&arg) && !self.dims.contains_key(&phi.value) && read(self)
+                {
+                    return Err(Stop::Retry(phi.value, FIELDS));
+                }
                 let got = match self.last_pass.get(&arg) {
                     Some(&(l, val)) if l != q => Some(val),
                     _ => self.vals.get(&arg).copied(),
@@ -10020,9 +10478,10 @@ mod tests {
     }
 
     /// Each lane's texture (table entry lane & 1) read in a waterfall loop
-    /// that only takes its height from the descriptor, then sampled through
-    /// the same entry in a second one; the height is copied to v17 `inside`
-    /// the first loop, else after it from the SGPR the loop leaves.
+    /// that only takes its height from the descriptor, as `GetDimensions`
+    /// does, then sampled through the same entry in a second one; the height
+    /// is copied to v17 `inside` the first loop, else after it from the SGPR
+    /// the loop leaves.
     fn height_then_sample(inside: bool) -> Vec<u32> {
         let copy = 0x7E22_0220; // v_mov_b32 v17, s32
         let mut w = vec![
@@ -10049,13 +10508,18 @@ mod tests {
             0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
             0x93A0_FF1A,
             0x0010_000E, // s_bfe_u32 s32, s26, 0x10000e (height - 1)
+            0x8020_8120, // s_add_u32 s32, s32, 1
+            0x93A1_FF1B,
+            0x0004_000C, // s_bfe_u32 s33, s27, 0x4000c (BASE_LEVEL)
+            0x9020_2120, // s_lshr_b32 s32, s32, s33
+            0x84A0_8120, // s_max_u32 s32, s32, 1
         ];
         if inside {
             w.push(copy);
         }
         w.extend([
             0xBE96_4716,                                    // s_andn2_wrexec_b32 s22, s22
-            if inside { 0xBF89_FFF6 } else { 0xBF89_FFF7 }, // s_cbranch_execnz -> 0x40
+            if inside { 0xBF89_FFF1 } else { 0xBF89_FFF2 }, // s_cbranch_execnz -> 0x40
             0xBEFE_0317,                                    // s_mov_b32 exec_lo, s23
         ]);
         if !inside {

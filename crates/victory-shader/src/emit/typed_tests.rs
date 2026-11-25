@@ -18,6 +18,30 @@ const LANES: u32 = 32;
 /// Lowers a wave32 program of 32 lanes with the resource heap at s0 and a
 /// table at s1 whose entry 0 is a UAV, with `more` used-resource entries.
 fn build(words: &[u32], more: &[UsedResource]) -> HostShader {
+    let lowered = lowered(words, more).expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        view_strides: lowered.view_strides,
+        heap_indices: Vec::new(),
+        heap_unknown: 0,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    } else {
+        eprintln!("no dxil.dll; validation skipped");
+    }
+    shader
+}
+
+/// [`build`]'s lowering.
+fn lowered(words: &[u32], more: &[UsedResource]) -> Result<lower::Lowered, crate::ShaderError> {
     let param = |root, user_data: u8| RootParam {
         root,
         table_offset_dwords: 0,
@@ -54,7 +78,7 @@ fn build(words: &[u32], more: &[UsedResource]) -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -65,26 +89,6 @@ fn build(words: &[u32], more: &[UsedResource]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
     })
-    .expect("lower");
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        view_strides: lowered.view_strides,
-        heap_indices: Vec::new(),
-        heap_unknown: 0,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
-    }
-    shader
 }
 
 /// Runs `shader` with `views` at heap indices 0.. on the hardware GPU and on
@@ -190,10 +194,12 @@ fn typed_stores_write_32_bit_formats() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// Each lane reads the width - 1 and height - 1 of the 2D texture at table
-/// entry 1 from its descriptor (a load whose dwords nothing accesses the
-/// texture through), loads texel (0, 0) through another load of the same
-/// entry, and stores the three and a zero at dword 4 * lane of the UAV.
+/// Each lane reads the width and height of the 2D texture at table entry 1
+/// from its descriptor as the console compiles `GetDimensions` (a load whose
+/// dwords nothing accesses the texture through): (WIDTH + 1) >> BASE_LEVEL,
+/// and HEIGHT + 1 from bit BASE_LEVEL on, as the mesh transforms take bits of
+/// it. Then it loads texel (0, 0) through another load of the same entry and
+/// stores the three and a zero at dword 4 * lane of the UAV.
 const SIZE_FROM_DESCRIPTOR: &[u32] = &[
     0xBE86_0301, // s_mov_b32 s6, s1 (the table)
     0xBE87_0380, // s_mov_b32 s7, 0
@@ -207,12 +213,20 @@ const SIZE_FROM_DESCRIPTOR: &[u32] = &[
     0x7E0A_0280, // v_mov_b32 v5, 0
     0x340C_0084, // v_lshlrev_b32 v6, 4, v0
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x9399_FF13,
+    0x0004_000C, // s_bfe_u32 s25, s19, 0x4000c (BASE_LEVEL)
     0x9398_FF12,
     0x0010_000E, // s_bfe_u32 s24, s18, 0x10000e (height - 1)
+    0x8018_8118, // s_add_u32 s24, s24, 1
+    0x881A_FF19,
+    0x0010_0000, // s_or_b32 s26, s25, 0x100000
+    0x9398_1A18, // s_bfe_u32 s24, s24, s26
     0xD54E_0001,
     0x0278_2212, // v_alignbit_b32 v1, s18, s17, 30
     0x3602_02FF,
-    0x0000_3FFF, // v_and_b32 v1, 0x3fff, v1 (width - 1)
+    0x0000_FFFF, // v_and_b32 v1, 0xffff, v1 (width - 1)
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0x2C02_0219, // v_lshrrev_b32 v1, s25, v1
     0x7E04_0218, // v_mov_b32 v2, s24
     0xF000_1108,
     0x0008_0304, // image_load v3, v[4:5], s[32:39] dim:SQ_RSRC_IMG_2D unorm
@@ -222,27 +236,56 @@ const SIZE_FROM_DESCRIPTOR: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// The 2D texture at table entry 1.
+const TEXTURE: UsedResource = UsedResource {
+    kind: ResourceType::Srv,
+    root: RootType::Table,
+    table_offset_dwords: 8,
+    lower_bound: 0,
+    stride: 0,
+    dwords: 8,
+    user_data: 1,
+    slot: 1,
+};
+
 /// A descriptor load read only as data takes its view's kind from a load of
 /// the same address that the program accesses the view through.
 #[test]
 fn an_image_size_read_from_a_descriptor_loaded_twice_is_the_views() {
-    let texture = UsedResource {
-        kind: ResourceType::Srv,
-        root: RootType::Table,
-        table_offset_dwords: 8,
-        lower_bound: 0,
-        stride: 0,
-        dwords: 8,
-        user_data: 1,
-        slot: 1,
-    };
-    let shader = build(SIZE_FROM_DESCRIPTOR, &[texture]);
+    let shader = build(SIZE_FROM_DESCRIPTOR, &[TEXTURE]);
     let texels: Vec<[f32; 4]> = (0..15).map(|i| [0.25 + i as f32, 0.0, 0.0, 1.0]).collect();
     let views = [View::RawUav(4 * LANES), View::Texture(5, 3, &texels)];
     let want: Vec<u32> = (0..LANES)
-        .flat_map(|_| [4, 2, 0.25f32.to_bits(), 0])
+        .flat_map(|_| [5, 3, 0.25f32.to_bits(), 0])
         .collect();
     for (label, uavs) in run(&shader, &views) {
         assert_eq!(uavs[0], want, "{label}");
+    }
+}
+
+/// The console's descriptor holds the size of the texture's first level and
+/// the view's first level, the host's the view's own size and first level 0:
+/// a read of BASE_LEVEL, WIDTH or HEIGHT other than as the size of the
+/// view's first level ([`SIZE_FROM_DESCRIPTOR`]'s) is refused.
+#[test]
+fn image_fields_read_other_than_as_a_levels_size_are_refused() {
+    const NOP: u32 = 0xBF80_0000;
+    for (what, from, to) in [
+        ("the first level as a number", 0x7E04_0218, 0x7E04_0219), // v_mov_b32 v2, s25
+        ("a width not shifted by the first level", 0x2C02_0219, NOP),
+        ("the level as a left shift", 0x2C02_0219, 0x3402_0219), // v_lshlrev_b32 v1, s25, v1
+    ] {
+        let words: Vec<u32> = (SIZE_FROM_DESCRIPTOR.iter())
+            .map(|&w| if w == from { to } else { w })
+            .collect();
+        match lowered(&words, &[TEXTURE]) {
+            Err(crate::ShaderError::Unsupported { what: why, .. }) => assert_eq!(
+                why,
+                "an image's size or first level read from its descriptor other than as its first level's size",
+                "{what}"
+            ),
+            Err(e) => panic!("{what}: {e}"),
+            Ok(_) => panic!("{what}: lowered"),
+        }
     }
 }
