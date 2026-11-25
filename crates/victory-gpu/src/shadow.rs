@@ -25,7 +25,8 @@
 //! the title reads what shaders wrote, with nothing to refresh, watch or
 //! copy back. The world's big buffers, copied, cost ~1 s per frame
 //! (dozens of overlapping 174 MB ranges per submission).
-//! `VICTORY_COPY_TITLE_MEMORY=1` turns this off.
+//! `VICTORY_COPY_TITLE_MEMORY=1` turns this off. With VRAM twins, those of
+//! at least [`IN_PLACE_TWIN_MIN`] bytes get one ([`in_place_twins_on`]).
 //!
 //! Title memory outside buffers (loose memory) has one host copy, the
 //! mirror ([`mirror`]): reserved buffers ("slabs") of [`SLAB`] bytes of
@@ -95,6 +96,9 @@ pub(crate) struct Shadow {
     armed: Mutex<Vec<(usize, usize, u64)>>,
     kept: Mutex<BTreeMap<usize, Vec<u8>>>,
     /// The buffer is title memory itself ([`in_place`]): nothing to copy.
+    /// With a twin ([`in_place_twins_on`]), the twin takes the pages the
+    /// title writes, and the compare stores the words shaders changed into
+    /// title memory itself.
     in_place: bool,
     /// With [`audit_on`] (diagnostics): the copy's bytes of the ranges
     /// armed, by offset, as eager snapshots hold them ([`Shadow::audit`]).
@@ -330,7 +334,7 @@ impl Shadow {
         len: u64,
         in_place: bool,
     ) -> Shadow {
-        let pages = match in_place {
+        let pages = match in_place && twin.is_none() {
             true => 0,
             false => (start + len).div_ceil(PAGE as u64) - start / PAGE as u64,
         };
@@ -486,7 +490,7 @@ impl Shadow {
         };
         if own {
             r.system = len;
-        } else if self.in_place {
+        } else if self.in_place && self.twin.is_none() {
             r.in_place = len;
         } else if !self.mirror() {
             if self.twin.is_some() {
@@ -751,10 +755,39 @@ impl Shadow {
         let merged = self.merged(declared);
         let start = self.start as usize;
         if self.in_place {
-            // Shaders wrote title memory; copies and textures of it that
-            // the kernel's watch cannot tell (no CPU wrote) take it again.
+            // Shaders wrote title memory (with a twin, the compare stored
+            // what they changed there); copies and textures of it that the
+            // kernel's watch cannot tell (no CPU wrote) take it again. The
+            // twin holds it already: of the pages it had taken, it takes
+            // again only those the title wrote since (`title`); the others
+            // count as taken at our write, the earliest asking the watch
+            // has for the range after it (a later one is the title's).
             for (from, to) in merged {
-                crate::watch::wrote(start + from, start + to);
+                let (a, b) = (start + from, start + to);
+                let title = self
+                    .twin
+                    .as_ref()
+                    .and_then(|_| crate::watch::writes(a, b, true));
+                crate::watch::wrote(a, b);
+                let (Some((_, title)), Some((_, ours))) = (title, crate::watch::writes(a, b, true))
+                else {
+                    continue;
+                };
+                let Some(at) = ours.iter().map(|w| w.1).min() else {
+                    continue;
+                };
+                let (base, end) = (start / PAGE, start + self.len as usize);
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                for &(page, _) in &ours {
+                    let wrote = title
+                        .binary_search_by_key(&page, |w| w.0)
+                        .map_or(0, |i| title[i].1);
+                    let whole = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= b;
+                    let taken = &mut copied[page - base];
+                    if whole && *taken != 0 && wrote <= *taken {
+                        *taken = at;
+                    }
+                }
             }
             return 0;
         }
@@ -1033,7 +1066,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        if self.in_place {
+        if self.in_place && self.twin.is_none() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -1182,9 +1215,12 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        for (at, host, n) in self.pieces(from - start, to - start, true) {
-            if !host.is_null() {
-                crate::host::copy_mapped(host, (start + at) as *const u8, n, false);
+        // Title memory used in place is the copy: only its twin takes it.
+        if !self.in_place {
+            for (at, host, n) in self.pieces(from - start, to - start, true) {
+                if !host.is_null() {
+                    crate::host::copy_mapped(host, (start + at) as *const u8, n, false);
+                }
             }
         }
         if self.twin.is_some() {
@@ -1308,13 +1344,35 @@ fn buffer(address: u64, end: u64) -> Option<Option<Arc<Shadow>>> {
         crate::host::name(&buffer, || {
             format!("title memory in place {start:#x}+{len:#x}")
         });
+        let twin = (twins_on()
+            && twin_compare_on()
+            && in_place_twins_on()
+            && len as u64 >= IN_PLACE_TWIN_MIN)
+            .then(|| vram_buffer(len as u64))
+            .flatten();
+        if let Some(twin) = &twin {
+            crate::host::name(twin, || {
+                format!("title memory in place twin {start:#x}+{len:#x}")
+            });
+        }
+        let twinned = twin.is_some();
         if len >= 16 << 20 {
-            tracing::info!(start = format_args!("{start:#x}"), len, "large buffer used in place");
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                len,
+                twinned,
+                "large buffer used in place"
+            );
         } else {
-            tracing::debug!(start = format_args!("{start:#x}"), len, "buffer used in place");
+            tracing::debug!(
+                start = format_args!("{start:#x}"),
+                len,
+                twinned,
+                "buffer used in place"
+            );
         }
         let memory = Memory::Linear(start as *mut u8);
-        let shadow = Shadow::new(buffer, None, memory, start as u64, len as u64, true);
+        let shadow = Shadow::new(buffer, twin, memory, start as u64, len as u64, true);
         #[cfg(feature = "diagnostics")]
         made(shadow.gpu, len as u64, start as u64, len as u64);
         entry.shadow = Some(Arc::new(shadow));
@@ -1406,6 +1464,36 @@ fn written_at(address: u64) -> Option<Arc<Shadow>> {
 /// The smallest title buffer used in place: below it a copy is cheap, and
 /// each heap opened locks its pages.
 pub(crate) const IN_PLACE_MIN: u64 = 1 << 20;
+
+/// The smallest title buffer used in place that gets a VRAM twin
+/// ([`in_place_twins_on`]): run 79's hair strands write two, of 90 and 24
+/// MiB. Smaller ones stay without, so the title's writes into those it
+/// rewrites each frame cost no guard faults or uploads.
+const IN_PLACE_TWIN_MIN: u64 = 16 << 20;
+
+/// Whether title buffers used in place of at least [`IN_PLACE_TWIN_MIN`]
+/// bytes get VRAM twins: shaders reach title memory in place at system
+/// memory's speed (run 79's hair strands: ~90 ms of GPU a frame, most of
+/// it their stores). The twin takes the pages the title writes before each
+/// submission ([`Shadow::update`]), and after it the compare stores the
+/// words shaders changed into title memory itself ([`compare_twins`]), so
+/// copy-back has nothing to write. Only with the compare: copied down whole
+/// ([`download_twins`]), the twin's ranges put back over title memory what
+/// the title wrote there while the submission ran, as they still do in a
+/// submission whose ranges pass [`KEEP_MAX`] or the VRAM the host gives.
+/// `VICTORY_NO_IN_PLACE_TWINS` turns it off.
+fn in_place_twins_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_IN_PLACE_TWINS").is_none();
+        if !on {
+            tracing::info!(
+                "title buffers used in place have no VRAM twins (VICTORY_NO_IN_PLACE_TWINS)"
+            );
+        }
+        on
+    })
+}
 
 /// A host buffer that is title memory `[start, start + len)` itself
 /// (whole 64 KiB pages around it): the buffer, its first address and its
@@ -3803,6 +3891,87 @@ pub(crate) mod tests {
         }
         drop(s);
         unregister(usize::MAX - 19, at as u64);
+        release(at);
+    }
+
+    /// A big title buffer used in place has a twin: what shaders write in
+    /// it reaches title memory through the compare, and the twin takes the
+    /// title's writes after, not the words it wrote itself.
+    #[test]
+    fn a_buffer_used_in_place_takes_what_shaders_write_through_its_twin() {
+        let _serial = crate::watch::serial();
+        if !gpu() || !twins_on() || !twin_compare_on() || !in_place_twins_on() {
+            return;
+        }
+        let host = host().unwrap();
+        let at = title_memory(1100, 256 * MIB, 32 * MIB, 32 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 23, at as u64, 32 << 20);
+        let s = find(at as u64, 32 << 20).unwrap();
+        if !s.in_place {
+            eprintln!("no heap on title memory: skipped");
+            drop(s);
+            unregister(usize::MAX - 23, at as u64);
+            release(at);
+            return;
+        }
+        assert!(s.twin.is_some() && s.start == at as u64);
+        let twin = s.resource().clone();
+        let (upload, data) = host.upload_buffer(4096).unwrap();
+        // SAFETY: our mapped upload buffer.
+        unsafe { data.cast::<u32>().write(0xfeed_f00d) };
+        let up = || crate::host::TWINS[1].load(Ordering::Relaxed);
+        // The GPU writes a word of the second block.
+        let list = host.new_list().unwrap();
+        s.refresh(&list, at as u64, 32 << 20);
+        s.gpu_writes(&list, at as u64, MIB as u64);
+        // SAFETY: an open list; live buffers holding the ranges.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&twin, (PAGE + 8) as u64, &upload, 0, 4)
+        };
+        list.close();
+        let first = up();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(
+            up() - first,
+            32 << 20,
+            "the twin takes the buffer whole first"
+        );
+        // SAFETY: committed test memory.
+        let read = |w: usize| unsafe { (w as *const u32).read_volatile() };
+        assert_eq!(read(at + PAGE + 8), 0xfeed_f00d);
+        assert_eq!(read(at + PAGE + 12), word(at + PAGE + 12));
+        // The title writes a word of the fourth block: the twin takes that
+        // block, and not the MiB shaders were given.
+        // SAFETY: as above.
+        unsafe { ((at + 3 * PAGE + 16) as *mut u32).write(0x1234_5678) };
+        let (back, got) = host.shared_buffer(1 << 16).unwrap();
+        let list = host.new_list().unwrap();
+        s.refresh(&list, at as u64, 32 << 20);
+        // SAFETY: an open list; live buffers holding the ranges.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&back, 0, &twin, (PAGE + 8) as u64, 4);
+            list.list
+                .CopyBufferRegion(&back, 4, &twin, (3 * PAGE + 16) as u64, 4);
+        }
+        list.close();
+        let second = up();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(up() - second, PAGE as u64, "bytes copied into the twin");
+        // SAFETY: the mapped buffer the finished copies wrote.
+        let twin_words = unsafe {
+            [
+                got.cast::<u32>().read_volatile(),
+                got.cast::<u32>().add(1).read_volatile(),
+            ]
+        };
+        assert_eq!(twin_words, [0xfeed_f00d, 0x1234_5678]);
+        drop((s, list));
+        unregister(usize::MAX - 23, at as u64);
         release(at);
     }
 
