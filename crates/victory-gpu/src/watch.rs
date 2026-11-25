@@ -122,7 +122,9 @@ pub(crate) fn wrote(start: usize, end: usize) -> u64 {
 /// asked about since [`forget_asked`] are not asked about again). `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    asked_writes(start, end, guarded, true)
+    writes_with(start, end, guarded, |now, written| {
+        (now, written.map(|(&p, &w)| (p, w)).collect())
+    })
 }
 
 /// [`writes`] of guarded and write-watched memory for copy-back, which may
@@ -130,17 +132,33 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// about, and none counts as asked for the submission being prepared
 /// (whose own asking must still take what the title writes until then).
 pub(crate) fn writes_now(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
-    asked_writes(start, end, true, false)
+    asked_writes(start, end, true, false, |now, written| {
+        (now, written.map(|(&p, &w)| (p, w)).collect())
+    })
 }
 
-/// [`writes`]; with `fresh`, ranges asked about since [`forget_asked`] are
+/// [`writes`], the latest asking and the journal's pages of the range
+/// handed to `visit` while the journal is held instead of collected: run
+/// 85's refreshes spent about a third of their time collecting and dropping
+/// them.
+pub(crate) fn writes_with<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    visit: impl FnOnce(u64, std::collections::btree_map::Range<'_, usize, u64>) -> T,
+) -> Option<T> {
+    asked_writes(start, end, guarded, true, visit)
+}
+
+/// [`writes_with`]; with `fresh`, ranges asked about since [`forget_asked`] are
 /// not asked again and those asked now are noted.
-fn asked_writes(
+fn asked_writes<T>(
     start: usize,
     end: usize,
     guarded: bool,
     fresh: bool,
-) -> Option<(u64, Vec<(usize, u64)>)> {
+    visit: impl FnOnce(u64, std::collections::btree_map::Range<'_, usize, u64>) -> T,
+) -> Option<T> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -232,13 +250,7 @@ fn asked_writes(
             j.written.insert(page, now);
         }
     }
-    Some((
-        j.asked,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some(visit(j.asked, j.written.range(first..last)))
 }
 
 /// `VirtualQuery` of `at` into `info`: what the system reports of the

@@ -1215,15 +1215,28 @@ impl Shadow {
     /// Copies the pages of `[from, to)` the watch says changed since they
     /// were copied; `None` if it cannot tell for the range.
     fn update_watched(&self, from: usize, to: usize) -> Option<usize> {
-        let (now, written) = crate::watch::writes(from, to, true)?;
-        let copied = self.copy_stale(from, to, now, &written);
+        // Before the journal, as arming takes them.
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let mut started = None;
+        let stale = crate::watch::writes_with(from, to, true, |now, written| {
+            #[cfg(feature = "diagnostics")]
+            {
+                started = Some(std::time::Instant::now());
+            }
+            self.stale(&mut copied, from, to, now, written)
+        })?;
+        let bytes = stale.into_iter().map(|(a, b)| self.copy(a, b)).sum();
         #[cfg(feature = "diagnostics")]
         {
-            use crate::copystat::{C, add};
+            use crate::copystat::{C, Op, add, cost};
+            if let Some(started) = started {
+                cost(Op::Copy, started, from, bytes as u64);
+            }
             add(C::Checked, (to - from) as u64);
-            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+            add(C::Unchanged, (to - from).saturating_sub(bytes) as u64);
         }
-        Some(copied)
+        Some(bytes)
     }
 
     /// [`Shadow::update`] in a mirror slab, which spans title memory of
@@ -1266,20 +1279,24 @@ impl Shadow {
         copied
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
+    /// The pages of `[from, to)` written after their last copy (`written`:
+    /// last writes by page, in page order; `now`: this asking), noted
+    /// `copied` now: the runs to copy, whole pages within the buffer.
+    fn stale(
+        &self,
+        copied: &mut [u64],
+        from: usize,
+        to: usize,
+        now: u64,
+        written: std::collections::btree_map::Range<'_, usize, u64>,
+    ) -> Vec<(usize, usize)> {
         let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let mut writes = written.peekable();
+        let (mut runs, mut run) = (Vec::new(), None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
+                Some(&(&p, &w)) if p == page => {
                     writes.next();
                     w
                 }
@@ -1295,16 +1312,14 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
         }
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::cost(crate::copystat::Op::Copy, started, from, bytes as u64);
-        bytes
+        runs
     }
 
     /// [`Shadow::copy`] of memory nothing can tell the changes of.
