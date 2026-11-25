@@ -203,6 +203,56 @@ fn table_at_a_join(cmp: u8) -> Vec<u32> {
     w
 }
 
+/// Every lane stores a dword of a table after the code, read with
+/// `s_load_dword` through `s_getpc_b64` at a join: dword 1, its address
+/// added in VGPRs and read back with `v_readfirstlane_b32`, on the path
+/// `s_cmp_<cmp>_u32 s0, 0` (s0 is 0) falls through to the load on; dword 9,
+/// added in SGPRs, on the path that branches back to it (as the
+/// reconstruct-raymarch scattering programs do). The table's dwords are
+/// 1000 and on.
+fn scalar_table_at_a_join(cmp: u8) -> Vec<u32> {
+    // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0; v4 = v0 * 4.
+    let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
+    w.push(vop2(0x1A, 4, u16::from(TWO), 0));
+    // s_getpc_b64 s[16:17] (the next instruction's byte); s16 += the table's
+    // distance from it; s_addc_u32 s17, s17, 0.
+    let pc = 4 * (w.len() + 1);
+    w.extend([sop1(0x1F, 16, 0), sop2(0x00, 16, 16, LITERAL), 0]);
+    let distance = w.len() - 1;
+    w.push(sop2(0x04, 17, 17, ZERO));
+    // s_cmp_<cmp>_u32 s0, 0; s_cbranch_scc0 back.
+    w.push(sopc(cmp, 0, ZERO));
+    let skip = w.len();
+    w.push(0);
+    // v2 = 4; v_add_co_u32 v5, vcc, v2, s16; v_add_co_ci_u32 v6, vcc, 0,
+    // s17, vcc; v_readfirstlane_b32 s2, v5; v_readfirstlane_b32 s3, v6.
+    w.push(vop1(0x01, 2, 128 + 4));
+    for [w0, w1] in [
+        vop3(0x30F, 5, v(2), 16, 0),
+        vop3(0x128, 6, u16::from(ZERO), 17, u16::from(VCC_LO)),
+    ] {
+        w.extend([w0 | u32::from(VCC_LO) << 8, w1]);
+    }
+    w.extend([vop1(0x02, 2, v(5)), vop1(0x02, 3, v(6))]);
+    // s_load_dword s4, s[2:3], null; s_waitcnt lgkmcnt(0); v7 = s4;
+    // buffer_store_dword v7, v4, s[8:11], 0 offen.
+    let load = w.len();
+    w.extend([0xF400_0101, 0xFA00_0000, 0xBF8C_C07F, vop1(0x01, 7, 4)]);
+    w.extend([
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 7 << 8 | 4,
+    ]);
+    w.push(S_ENDPGM);
+    // s_add_u32 s2, s16, 36; s_addc_u32 s3, s17, 0; s_branch load.
+    let back = w.len();
+    w[skip] = sopp(0x04, skip, back);
+    w.extend([sop2(0x00, 2, 16, 128 + 36), sop2(0x04, 3, 17, ZERO)]);
+    w.push(sopp(0x02, w.len(), load));
+    w[distance] = (4 * w.len() - pc) as u32;
+    w.extend(1000..1016);
+    w
+}
+
 /// Lowers a wave64 compute program of one wave whose UAV table is at s0.
 fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
     let native = NativeProgram {
@@ -357,6 +407,17 @@ fn a_table_address_joined_from_two_paths_reads_each_paths_dword() {
     for (cmp, first) in [(0x06, 1000), (0x07, 1008)] {
         let shader = lower_cs(&table_at_a_join(cmp)).expect("lower");
         let want: Vec<u32> = (0..THREADS).map(|l| first + (l & 7)).collect();
+        for (label, got) in run(&shader) {
+            assert_eq!(got, want, "{label}, s_cmp {cmp:#x}");
+        }
+    }
+}
+
+#[test]
+fn a_scalar_table_address_joined_from_two_paths_reads_each_paths_dword() {
+    for (cmp, dword) in [(0x06, 1001), (0x07, 1009)] {
+        let shader = lower_cs(&scalar_table_at_a_join(cmp)).expect("lower");
+        let want = vec![dword; THREADS as usize];
         for (label, got) in run(&shader) {
             assert_eq!(got, want, "{label}, s_cmp {cmp:#x}");
         }

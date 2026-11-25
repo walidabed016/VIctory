@@ -139,10 +139,10 @@ pub struct Resources {
     /// one (`s_load_*`), as a [`Linear`] function of a root parameter, or
     /// why it is none (an index loaded from memory, say).
     pub terms: Vec<(Site, Result<Linear, &'static str>)>,
-    /// Global accesses whose address a phi joins: the phi's block and the
-    /// address each of its predecessors brings, in [`Block::preds`]
-    /// order. Their [`Resources::scalar`] entry has the least of those
-    /// offsets and the phi as its dynamic term.
+    /// Global and scalar accesses whose address a phi joins: the phi's
+    /// block and the address each of its predecessors brings, in
+    /// [`Block::preds`] order. Their [`Resources::scalar`] entry has the
+    /// least of those offsets and the phi as its dynamic term.
     ///
     /// [`Block::preds`]: crate::ir::Block::preds
     pub joined: Vec<(Site, usize, Vec<Address>)>,
@@ -258,6 +258,9 @@ pub fn track(
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    if let Some((block, _, addresses)) = t.joined(inst).map_err(fail)? {
+                        out.joined.push((site, block, addresses));
+                    }
                     if let Some(d) = address.dynamic {
                         out.terms.push((site, t.linear(Term::Value(d), 0)));
                     }
@@ -272,10 +275,7 @@ pub fn track(
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
-                    if let Some((block, _, addresses)) = t
-                        .joined(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?
-                    {
+                    if let Some((block, _, addresses)) = t.joined(inst).map_err(fail)? {
                         out.joined.push((site, block, addresses));
                     }
                     out.scalar.push((site, address));
@@ -344,6 +344,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -684,13 +685,8 @@ impl<'a> Tracer<'a> {
                 self.address(lo, hi, extra)
             }
             _ => {
-                if let Some((_, phi, addresses)) = self.joined(inst, addr, saddr, offset)? {
-                    let least = addresses.iter().map(|a| a.offset).min();
-                    return Ok(Address {
-                        param: addresses[0].param,
-                        offset: least.ok_or("a global address from a phi")?,
-                        dynamic: Some(phi),
-                    });
+                if let Some(a) = self.joined_address(inst)? {
+                    return Ok(a);
                 }
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
@@ -709,25 +705,39 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    /// The addresses a phi joins into a global access's VGPR pair (its low
-    /// dword a phi; its high one a phi of the same block, or the same on
-    /// every edge): the phi's block, the phi, and per predecessor the
-    /// address it brings, `offset` added. `None` for other addresses.
-    fn joined(
-        &self,
-        inst: &Inst,
-        addr: Option<&Operand>,
-        saddr: Option<&Operand>,
-        offset: i16,
-    ) -> Result<Option<Joined>, &'static str> {
-        let Some(&Operand::Vector { reg, .. }) = addr else {
-            return Ok(None);
+    /// The addresses a phi joins into an access's address pair, a global
+    /// access's VGPRs or a scalar access's SGPRs (its low dword a phi; its
+    /// high one a phi of the same block, or the same on every edge): the
+    /// phi's block, the phi, and per predecessor the address it brings plus
+    /// what the access adds. `None` for other addresses.
+    fn joined(&self, inst: &Inst) -> Result<Option<Joined>, &'static str> {
+        let (lo, hi, extra) = match inst.fields {
+            Fields::Flat {
+                addr: Some(Operand::Vector { reg, .. }),
+                saddr,
+                offset,
+                ..
+            } if !matches!(saddr, Some(Operand::Scalar { code, .. }) if code != NULL) => {
+                let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
+                let extra = Sum {
+                    base: None,
+                    offset: offset as i32 as u32,
+                    dynamic: None,
+                };
+                (word(0), word(1), extra)
+            }
+            Fields::Smem {
+                base: Operand::Scalar { code, .. },
+                offset,
+                soffset,
+                ..
+            } => {
+                let word = |k| inst.read(Reg::S(code + k)).map(|v| self.origin(v));
+                (word(0), word(1), self.smem_extra(inst, offset, &soffset)?)
+            }
+            _ => return Ok(None),
         };
-        if matches!(saddr, Some(&Operand::Scalar { code, .. }) if code != NULL) {
-            return Ok(None);
-        }
-        let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
-        let (Some(Term::Value(lo)), Some(hi)) = (word(0), word(1)) else {
+        let (Some(Term::Value(lo)), Some(hi)) = (lo, hi) else {
             return Ok(None);
         };
         let Some((block, i)) = self.phis[lo.0 as usize] else {
@@ -738,7 +748,7 @@ impl<'a> Tracer<'a> {
             Term::Const(_) => None,
         };
         if hi_phi.is_some_and(|(b, _)| b != block) {
-            return Err("a global address joined in two blocks");
+            return Err("an address joined in two blocks");
         }
         let phis = &self.p.blocks[block].phis;
         let addresses = phis[i]
@@ -747,18 +757,27 @@ impl<'a> Tracer<'a> {
             .enumerate()
             .map(|(j, &arg)| {
                 let hi = hi_phi.map_or(hi, |(_, h)| self.vorigin(phis[h].args[j]));
-                let extra = Sum {
-                    base: None,
-                    offset: offset as i32 as u32,
-                    dynamic: None,
-                };
                 self.address(self.vorigin(arg), hi, extra)
             })
             .collect::<Result<Vec<_>, _>>()?;
         if addresses.iter().any(|a| a.param != addresses[0].param) {
-            return Err("a global address joined from two root parameters");
+            return Err("an address joined from two root parameters");
         }
         Ok(Some((block, lo, addresses)))
+    }
+
+    /// The address of an access whose address a phi joins ([`Self::joined`]):
+    /// the least of the joined offsets, the phi its computed term.
+    fn joined_address(&self, inst: &Inst) -> Result<Option<Address>, &'static str> {
+        let Some((_, phi, addresses)) = self.joined(inst)? else {
+            return Ok(None);
+        };
+        let least = addresses.iter().map(|a| a.offset).min();
+        Ok(Some(Address {
+            param: addresses[0].param,
+            offset: least.ok_or("an address from a phi")?,
+            dynamic: Some(phi),
+        }))
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
@@ -1178,6 +1197,20 @@ impl<'a> Tracer<'a> {
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
+        if let Some(a) = self.joined_address(inst)? {
+            // Only a load from the code reads its joined address as such.
+            return if a.param == CODE {
+                Ok(a)
+            } else {
+                Err("an address from a phi")
+            };
+        }
+        self.address(lo, hi, self.smem_extra(inst, offset, soffset)?)
+    }
+
+    /// What a scalar memory access adds to its base: the offset register's
+    /// value and the immediate.
+    fn smem_extra(&self, inst: &Inst, offset: i32, soffset: &Operand) -> Result<Sum, &'static str> {
         let mut extra = self.sum(
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,
@@ -1186,7 +1219,7 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        Ok(extra)
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.

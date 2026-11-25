@@ -936,7 +936,7 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let Some(tail) = self.tail[q] else {
-                return Err("a global address joined by a loop");
+                return Err("an address joined by a loop");
             };
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
             let here = std::mem::replace(&mut self.cur, at);
@@ -949,7 +949,7 @@ impl<'a> Lower<'a> {
             d?;
             incoming.push((off, at));
         }
-        let join = self.block[block].ok_or("a global address joined in a block not lowered")?;
+        let join = self.block[block].ok_or("an address joined in a block not lowered")?;
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
@@ -4110,7 +4110,7 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
-            return self.code_smem(inst, a);
+            return self.code_smem(inst, site, a);
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == BVH) {
             let (Some(Operand::Scalar { code, dwords }), true) =
@@ -4574,7 +4574,7 @@ impl<'a> Lower<'a> {
     }
 
     /// `s_load_dword*` from the program's constant table.
-    fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+    fn code_smem(&mut self, inst: &Inst, site: Site, a: Address) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -4592,7 +4592,11 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        let x = self.x;
+        if let Some((_, block, addresses)) = x.res.joined.iter().find(|j| j.0 == site) {
+            let d = self.joined_offset(*block, addresses, a.offset)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        } else if let Some(d) = a.dynamic {
             let d = self.i32_of(d)?;
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
