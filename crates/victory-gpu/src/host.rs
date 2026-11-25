@@ -611,7 +611,7 @@ fn timing_label(note: &str) -> String {
 /// Shader names by hash from `VICTORY_SHADER_NAMES` (a hash list of
 /// `HASH <hash> @<offset> <name>` lines), for the GPU time lines.
 #[cfg(feature = "diagnostics")]
-fn shader_names() -> &'static std::collections::HashMap<String, String> {
+pub(crate) fn shader_names() -> &'static std::collections::HashMap<String, String> {
     static NAMES: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
         let Some(path) = std::env::var_os("VICTORY_SHADER_NAMES") else {

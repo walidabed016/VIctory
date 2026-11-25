@@ -482,6 +482,78 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Device methods 0x1c8 and 0x218 (Grand Theft Auto VI calls each once at
+/// startup, title+0x2477578 and title+0x24800d5): a plain compute or
+/// graphics description, both the root signature then a shader, told apart
+/// by that shader's DXIL kind. The first pipeline of each is logged.
+fn create_plain(
+    slot: usize,
+    this: This,
+    desc: *const ComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(head) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let code = &head.stage;
+    let kind = (!code.code.is_null())
+        .then(|| {
+            // SAFETY: the title passes `size` bytes of shader code.
+            unsafe { std::slice::from_raw_parts(code.code, code.size) }
+        })
+        .and_then(|bytes| {
+            let container = victory_shader::Container::parse(bytes).ok()?;
+            let version = container
+                .part(victory_shader::FourCC::DXIL)?
+                .data
+                .get(..4)?;
+            Some(u32::from_le_bytes(version.try_into().ok()?) >> 16)
+        });
+    let (stage, hr) = match kind {
+        Some(5) => ("compute", create_compute(this, desc, iid, out)),
+        Some(1) => ("vertex", create_graphics(this, desc.cast(), iid, out)),
+        _ => {
+            tracing::warn!(slot = %format!("{slot:#x}"), ?kind, "plain pipeline description without a compute or vertex shader");
+            return E_INVALIDARG;
+        }
+    };
+    static LOGGED: [std::sync::atomic::AtomicBool; 2] =
+        [const { std::sync::atomic::AtomicBool::new(false) }; 2];
+    if !LOGGED[usize::from(slot == 0x218)].swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let hash = copy(stage, code)
+            .map(|s| s.hash.clone())
+            .unwrap_or_default();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let name = crate::host::shader_names().get(&hash).cloned();
+        #[cfg(not(all(windows, feature = "diagnostics")))]
+        let name: Option<String> = None;
+        tracing::info!(slot = %format!("{slot:#x}"), stage, hash, name = name.as_deref().unwrap_or("?"), hr, "pipeline from a plain description");
+    }
+    hr
+}
+
+/// Device method 0x1c8: see [`create_plain`].
+pub(crate) extern "system" fn create_plain_1c8(
+    this: This,
+    desc: *const ComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_plain(0x1c8, this, desc, iid, out)
+}
+
+/// Device method 0x218: see [`create_plain`].
+pub(crate) extern "system" fn create_plain_218(
+    this: This,
+    desc: *const ComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_plain(0x218, this, desc, iid, out)
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -669,6 +741,51 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[test]
+    fn plain_descriptions_route_on_the_shader_kind() {
+        let container = |kind: u32| {
+            let words = |w: &[u32]| w.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let mut c = b"DXBC".to_vec();
+            c.extend([0; 16]);
+            c.extend(words(&[1, 52, 1, 36]));
+            c.extend(b"DXIL");
+            c.extend(words(&[8, (kind << 16) | 0x66, 2]));
+            c
+        };
+        let code = |c: &[u8]| Bytecode {
+            code: c.as_ptr(),
+            size: c.len(),
+        };
+        let none = || code(&[]);
+        let (cs, vs, ps) = (container(5), container(1), container(0));
+        let mut p = std::ptr::null();
+        let compute = ComputeHead {
+            root: std::ptr::null(),
+            stage: code(&cs),
+        };
+        let hr = create_plain_1c8(std::ptr::null(), &compute, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, S_OK);
+        assert_eq!(shaders(p), [("compute", cs.clone())]);
+        let graphics = GraphicsHead {
+            root: std::ptr::null(),
+            stages: [code(&vs), code(&ps), none(), none(), none()],
+        };
+        let hr = create_plain_218(
+            std::ptr::null(),
+            (&raw const graphics).cast(),
+            &PIPELINE_IIDS[0],
+            &mut p,
+        );
+        assert_eq!(hr, S_OK);
+        assert_eq!(shaders(p), [("vertex", vs.clone()), ("pixel", ps.clone())]);
+        let pixel_first = ComputeHead {
+            root: std::ptr::null(),
+            stage: code(&ps),
+        };
+        let hr = create_plain_1c8(std::ptr::null(), &pixel_first, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, E_INVALIDARG);
     }
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
