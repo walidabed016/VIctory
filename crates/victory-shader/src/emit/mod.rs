@@ -180,6 +180,30 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether the change `name` ported from Belobug's fork is on: each is
+/// unless `VICTORY_NO_BELOBUG` lists it (names separated by commas) or is
+/// `1` or `all`, which translates as before them. The value is part of
+/// the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn belobug(name: &str) -> bool {
+    !belobug_off(no_belobug(), name)
+}
+
+/// `VICTORY_NO_BELOBUG`'s value, empty when it is unset.
+pub fn no_belobug() -> &'static str {
+    static OFF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OFF.get_or_init(|| std::env::var("VICTORY_NO_BELOBUG").unwrap_or_default())
+}
+
+/// Whether `value` (`VICTORY_NO_BELOBUG`'s) turns `name` off. Pure, for
+/// testing.
+fn belobug_off(value: &str, name: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|v| v == name || v == "1" || v == "all")
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -551,6 +575,15 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn the_belobug_switch_turns_off_what_it_lists() {
+        assert!(!super::belobug_off("", "quad"));
+        assert!(super::belobug_off("readfirstlane, quad", "quad"));
+        assert!(!super::belobug_off("quadruple", "quad"));
+        assert!(super::belobug_off("1", "quad"));
+        assert!(super::belobug_off("all", "readfirstlane"));
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
