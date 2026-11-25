@@ -2091,16 +2091,27 @@ pub(crate) struct Compare {
     notes: Option<(u64, usize)>,
 }
 
-/// System memory where the compare notes the 64 KiB blocks of title memory
-/// it found a changed word in, a word per block: the buffer, its GPU
-/// address, its mapping and its words.
-struct Notes(Option<(ID3D12Resource, u64, usize, usize)>);
+/// Where the compare notes the 64 KiB blocks of title memory it found a
+/// changed word in, a word per block: in VRAM while it runs (its groups'
+/// stores into a word of system memory cost ~25 ms per million), then
+/// copied down for copy-back.
+struct Notes {
+    /// The VRAM buffer and its GPU address.
+    vram: ID3D12Resource,
+    gpu: u64,
+    /// The system memory buffer and its mapping.
+    down: ID3D12Resource,
+    data: usize,
+    /// Words held, and words the submission being prepared uses.
+    words: usize,
+    used: usize,
+}
 
 // SAFETY: D3D12 resources are free-threaded; the mapping is written and
 // read only by the submitting thread, around the submission.
 unsafe impl Send for Notes {}
 
-static NOTES: Mutex<Notes> = Mutex::new(Notes(None));
+static NOTES: Mutex<Option<Notes>> = Mutex::new(None);
 
 /// VRAM the twins' ranges are kept in before a submission: the buffer,
 /// its GPU address and size.
@@ -2208,7 +2219,7 @@ pub(crate) fn snapshot_twins(
     let (kept, gpu, _) = keep.0.as_ref()?;
     let blocks = |title: usize, bytes: u64| (title + bytes as usize - 1) / PAGE - title / PAGE + 1;
     let words: usize = ranges.iter().map(|r| blocks(r.5, r.4)).sum();
-    let notes = twin_skip_on().then(|| notes(words)).flatten();
+    let notes = twin_skip_on().then(|| notes(list, words)).flatten();
     let (mut at, mut word) = (0, 0);
     let mut compares = Vec::with_capacity(ranges.len());
     for (source, offset, twin, host, bytes, title, of) in ranges {
@@ -2229,24 +2240,38 @@ pub(crate) fn snapshot_twins(
     Some(compares)
 }
 
-/// The GPU address of [`NOTES`] with `words` words cleared, made or grown
-/// first if needed; none if the host gives no memory for them.
-fn notes(words: usize) -> Option<u64> {
+/// The GPU address of [`NOTES`] in VRAM, made or grown first if needed,
+/// with `words` words cleared by a copy recorded into `list`; none if the
+/// host gives no memory for them.
+fn notes(list: &ID3D12GraphicsCommandList, words: usize) -> Option<u64> {
     let mut notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
-    if notes.0.as_ref().is_none_or(|n| n.3 < words) {
-        // The last submission has run: the smaller buffer can go.
-        notes.0 = None;
+    if notes.as_ref().is_none_or(|n| n.words < words) {
+        // The last submission has run: the smaller buffers can go.
+        *notes = None;
         let len = (4 * words as u64).next_multiple_of(64 << 10);
-        let (buffer, data) = host()?.shared_buffer(len)?;
-        crate::host::name(&buffer, || "blocks the twin compare found changed".into());
+        let vram = vram_buffer(len)?;
+        let (down, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&vram, || "blocks the twin compare found changed".into());
         // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        notes.0 = Some((buffer, gpu, data as usize, len as usize / 4));
+        let gpu = unsafe { vram.GetGPUVirtualAddress() };
+        *notes = Some(Notes {
+            vram,
+            gpu,
+            down,
+            data: data as usize,
+            words: len as usize / 4,
+            used: 0,
+        });
     }
-    let &(_, gpu, data, _) = notes.0.as_ref()?;
-    // SAFETY: the mapping holds the words; no submission runs.
-    unsafe { std::ptr::write_bytes(data as *mut u32, 0, words) };
-    Some(gpu)
+    let n = notes.as_mut()?;
+    n.used = words;
+    // SAFETY: the mapping holds the words; no submission runs. An open
+    // list; both buffers hold them.
+    unsafe {
+        std::ptr::write_bytes(n.data as *mut u32, 0, words);
+        list.CopyBufferRegion(&n.vram, 0, &n.down, 0, 4 * words as u64);
+    }
+    Some(n.gpu)
 }
 
 /// After the submission ran with its compare: by copy of `back` (indexed
@@ -2260,7 +2285,7 @@ pub(crate) fn unchanged(
     let mut covered = vec![std::collections::HashSet::new(); copies];
     let mut changed = vec![std::collections::HashSet::new(); copies];
     let notes = NOTES.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, _, data, _)) = notes.0.as_ref() else {
+    let Some(data) = notes.as_ref().map(|n| n.data) else {
         return covered;
     };
     for c in compares {
@@ -2300,9 +2325,9 @@ pub(crate) fn compare_twins(list: &ID3D12GraphicsCommandList, compares: &[Compar
     }
     let mut bytes = 0;
     for c in compares {
-        let groups = c.bytes.div_ceil(16 * 64).min(65535) as u32;
+        let groups = c.bytes.div_ceil(1024).min(65535) as u32;
         let first = (c.title % PAGE) as u32;
-        let constants = [c.bytes as u32, 64 * groups, first, c.notes.is_some().into()];
+        let constants = [c.bytes as u32, groups, first, c.notes.is_some().into()];
         // SAFETY: an open list; the addresses hold the range, the twin's and
         // the kept bytes in VRAM, and its blocks' notes (unused without).
         unsafe {
@@ -2315,44 +2340,56 @@ pub(crate) fn compare_twins(list: &ID3D12GraphicsCommandList, compares: &[Compar
         }
         bytes += c.bytes;
     }
+    // The notes come down for copy-back.
+    if compares.iter().any(|c| c.notes.is_some())
+        && let Some(n) = NOTES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+    {
+        // SAFETY: an open list; both buffers hold the words.
+        unsafe {
+            list.ResourceBarrier(&[crate::host::transition(
+                &n.vram,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&n.down, 0, &n.vram, 0, 4 * n.used as u64);
+        }
+    }
     bytes
 }
 
-/// The compare of [`compare_twins`]: each thread takes 16 bytes at a time,
-/// and stores only the words that changed, one at a time (16-byte stores
-/// to system memory run at ~0.08 GB/s, 4-byte ones at ~13). With `noting`
+/// The compare of [`compare_twins`]. A group takes 1 KiB at a time, its
+/// threads a word each in turn, and stores the words that changed: the
+/// group's stores land on consecutive words of system memory (stores 16
+/// bytes apart ran at ~0.7 GB/s, 16-byte stores at ~0.08). With `noting`
 /// it notes the 64 KiB blocks of title memory (`first`: the range's offset
-/// in its first) the 16 bytes lie in where one changed.
+/// in its first) the KiB has a changed word in, once per KiB and block.
 const COMPARE: &str = r#"
 #define RS "SRV(t0), SRV(t1), UAV(u0), UAV(u1), RootConstants(num32BitConstants=4, b0)"
-cbuffer Range : register(b0) { uint bytes; uint threads; uint first; uint noting; };
+cbuffer Range : register(b0) { uint bytes; uint groups; uint first; uint noting; };
 ByteAddressBuffer twin : register(t0);
 ByteAddressBuffer kept : register(t1);
 RWByteAddressBuffer host : register(u0);
 RWByteAddressBuffer notes : register(u1);
+groupshared uint seen[2];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    for (uint at = id.x * 16; at < bytes; at += threads * 16) {
-        bool changed = false;
-        if (at + 16 <= bytes) {
-            uint4 now = twin.Load4(at);
-            uint4 was = kept.Load4(at);
-            if (now.x != was.x) { host.Store(at, now.x); changed = true; }
-            if (now.y != was.y) { host.Store(at + 4, now.y); changed = true; }
-            if (now.z != was.z) { host.Store(at + 8, now.z); changed = true; }
-            if (now.w != was.w) { host.Store(at + 12, now.w); changed = true; }
-        } else {
-            for (uint w = at; w < bytes; w += 4) {
-                uint now = twin.Load(w);
-                if (now != kept.Load(w)) { host.Store(w, now); changed = true; }
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    for (uint base = group.x * 1024; base < bytes; base += groups * 1024) {
+        uint block = (first + base) >> 16;
+        if (lane < 2) seen[lane] = 0;
+        GroupMemoryBarrierWithGroupSync();
+        [unroll] for (uint k = 0; k < 4; k++) {
+            uint at = base + k * 256 + lane * 4;
+            if (at < bytes) {
+                uint now = twin.Load(at);
+                if (now != kept.Load(at)) {
+                    host.Store(at, now);
+                    seen[((first + at) >> 16) - block] = 1;
+                }
             }
         }
-        if (changed && noting != 0) {
-            uint a = (first + at) >> 16, b = (first + min(at + 16, bytes) - 1) >> 16;
-            notes.Store(a * 4, 1);
-            if (b != a) notes.Store(b * 4, 1);
-        }
+        GroupMemoryBarrierWithGroupSync();
+        if (noting != 0 && lane < 2 && seen[lane] != 0) notes.Store((block + lane) * 4, 1);
     }
 }
 "#;
@@ -3541,6 +3578,101 @@ pub(crate) mod tests {
         drop(s);
         unregister(usize::MAX - 19, at as u64);
         release(at);
+    }
+
+    /// What the twins' compare costs on the GPU: 256 MiB with no word
+    /// changed, one word in 64, and a tenth of the 64 KiB blocks whole,
+    /// without and with notes. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture twin_compare_costs`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn twin_compare_costs() {
+        let _serial = crate::watch::serial();
+        if !gpu() || compare_pipeline().is_none() {
+            return;
+        }
+        let host = host().unwrap();
+        const LEN: usize = 256 * MIB;
+        let (twin, kept) = (
+            vram_buffer(LEN as u64).unwrap(),
+            vram_buffer(LEN as u64).unwrap(),
+        );
+        let (out, got) = host.shared_buffer(LEN as u64).unwrap();
+        let (source, data) = host.shared_buffer(LEN as u64).unwrap();
+        let fill = |f: &dyn Fn(usize) -> u32| {
+            for i in 0..LEN / 4 {
+                // SAFETY: inside the mapped buffer.
+                unsafe { data.cast::<u32>().add(i).write(f(i)) };
+            }
+        };
+        let run = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+            let list = host.new_list().unwrap();
+            record(&list.list);
+            list.close();
+            let started = std::time::Instant::now();
+            host.execute(&[&list]);
+            started.elapsed()
+        };
+        let copy = |to: &ID3D12Resource| {
+            run(&|l| {
+                // SAFETY: an open list; live buffers holding the range.
+                unsafe { l.CopyBufferRegion(to, 0, &source, 0, LEN as u64) }
+            })
+        };
+        fill(&|i| i as u32);
+        copy(&kept);
+        // References: a submission's own cost, and a copy within VRAM.
+        let best = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+            let took = (0..3).map(|_| run(record)).min().unwrap();
+            took.as_secs_f64() * 1e3
+        };
+        let within = |len: u64| {
+            best(&|l| {
+                // SAFETY: an open list; live buffers holding the range.
+                unsafe { l.CopyBufferRegion(&twin, 0, &kept, 0, len) }
+            })
+        };
+        let (empty, within) = (within(4), within(LEN as u64));
+        println!("a submission: {empty:.1} ms; 256 MiB copied within VRAM: {within:.1} ms");
+        // SAFETY: live buffers.
+        let gpu = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let cases: [(&str, &dyn Fn(usize) -> bool); 3] = [
+            ("no word changed", &|_| false),
+            ("one word in 64 changed", &|i| i.is_multiple_of(64)),
+            ("a tenth of the blocks changed", &|i| {
+                (4 * i / PAGE).is_multiple_of(10)
+            }),
+        ];
+        for (what, changed) in cases {
+            fill(&|i| if changed(i) { !(i as u32) } else { i as u32 });
+            copy(&twin);
+            for noting in [false, true] {
+                let c = Compare {
+                    twin: gpu(&twin),
+                    kept: gpu(&kept),
+                    host: gpu(&out),
+                    bytes: LEN as u64,
+                    title: 0,
+                    of: 0,
+                    notes: noting.then(|| {
+                        let list = host.new_list().unwrap();
+                        let gpu = notes(&list.list, LEN / PAGE).unwrap();
+                        list.close();
+                        host.execute(&[&list]);
+                        (gpu, 0)
+                    }),
+                };
+                let took = best(&|l| _ = compare_twins(l, std::slice::from_ref(&c)));
+                println!("{what}, notes {noting}: {took:.1} ms for 256 MiB");
+            }
+            for i in (0..LEN / 4).step_by(4099) {
+                // SAFETY: inside the mapped buffer the compare wrote.
+                let word = unsafe { got.cast::<u32>().add(i).read_volatile() };
+                if changed(i) {
+                    assert_eq!(word, !(i as u32), "word {i}");
+                }
+            }
+        }
     }
 
     /// The word a copy holds for title address `at` (0 where it has no
