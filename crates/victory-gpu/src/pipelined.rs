@@ -124,6 +124,10 @@ struct Flight {
     /// completion (snapshots, fills) or only for the range's copy-back
     /// (refreshes).
     refreshes: Vec<(usize, usize, bool, Refresh)>,
+    /// Steps deferred to it so far, and of them those run
+    /// ([`step_fence`]).
+    deferred: u64,
+    ran: u64,
 }
 
 /// Why the title waited.
@@ -186,6 +190,9 @@ struct State {
     /// The newest submission steps were deferred to since the GPU was last
     /// told to wait ([`gpu_wait`]).
     gpu_wait: Option<u64>,
+    /// As `gpu_wait`, the step fence's value once the steps deferred since
+    /// have run ([`step_wait`]).
+    step_wait: Option<u64>,
     /// Per [`Why::index`]: waits and time waited.
     waits: [(u64, Duration); 10],
 }
@@ -208,10 +215,18 @@ struct Pipeline {
     /// Tells the GPU that a submission (its number) has completed, its
     /// copy-back done ([`newest_writing`]).
     copied: fn(u64),
+    /// Tells the GPU how far the steps deferred to submissions in flight
+    /// have run ([`step_value`]).
+    stepped: fn(u64),
 }
 
 impl Pipeline {
-    const fn new(hold: fn(usize), signal: fn(usize, u64), copied: fn(u64)) -> Self {
+    const fn new(
+        hold: fn(usize),
+        signal: fn(usize, u64),
+        copied: fn(u64),
+        stepped: fn(u64),
+    ) -> Self {
         Self {
             state: Mutex::new(State {
                 flying: VecDeque::new(),
@@ -225,6 +240,7 @@ impl Pipeline {
                 deferred: 0,
                 refreshed: [0; 5],
                 gpu_wait: None,
+                step_wait: None,
                 waits: [(0, Duration::ZERO); 10],
             }),
             completed: Condvar::new(),
@@ -233,6 +249,7 @@ impl Pipeline {
             hold,
             signal,
             copied,
+            stepped,
         }
     }
 
@@ -398,10 +415,16 @@ impl Pipeline {
     /// Defers step `by` of `[from, to)` to the newest submission in flight
     /// whose shaders write some of it: a refresh only while its copy-back
     /// has some left, other steps until it completes. Whether there was one.
+    #[cfg(test)]
     fn defer(&self, from: usize, to: usize, by: Writer, refresh: Refresh) -> bool {
+        self.defer_as(from, to, by, !matches!(by, Writer::Refresh), refresh)
+    }
+
+    /// As [`Pipeline::defer`]; `whole`: the step waits for the submission's
+    /// completion, else only for the range's copy-back.
+    fn defer_as(&self, from: usize, to: usize, by: Writer, whole: bool, refresh: Refresh) -> bool {
         let mut guard = self.lock();
         let s = &mut *guard;
-        let whole = !matches!(by, Writer::Refresh);
         let writes = |f: &&mut Flight| match whole {
             true => overlaps(&f.writes, from, to),
             false => overlaps(f.left.as_ref().unwrap_or(&f.writes), from, to),
@@ -410,7 +433,9 @@ impl Pipeline {
             return false;
         };
         f.refreshes.push((from, to, whole, refresh));
+        f.deferred += 1;
         s.gpu_wait = s.gpu_wait.max(Some(f.seq));
+        s.step_wait = s.step_wait.max(Some(step_value(f.seq, f.deferred)));
         s.refreshed[by as usize] += 1;
         true
     }
@@ -419,12 +444,14 @@ impl Pipeline {
     /// flight that its copy-back has no more left to write, up to the first
     /// that waits for more (the rest run as it retires).
     fn run_refreshes(&self) {
-        let ready: Vec<(usize, usize, bool, Refresh)> = {
+        let (seq, ran, ready): (u64, u64, Vec<(usize, usize, bool, Refresh)>) = {
             let mut s = self.lock();
             let Some(Flight {
+                seq,
                 writes,
                 left,
                 refreshes,
+                ran,
                 ..
             }) = s.flying.front_mut()
             else {
@@ -435,11 +462,16 @@ impl Pipeline {
                 .iter()
                 .take_while(|&&(from, to, whole, _)| !whole && !overlaps(left, from, to))
                 .count();
-            refreshes.drain(..ready).collect()
+            *ran += ready as u64;
+            (*seq, *ran, refreshes.drain(..ready).collect())
         };
+        if ready.is_empty() {
+            return;
+        }
         for (.., refresh) in ready {
             refresh();
         }
+        (self.stepped)(step_value(seq, ran));
     }
 
     /// The oldest submission in flight has only `left` of its writes left
@@ -498,6 +530,8 @@ impl Pipeline {
             lists,
             signals,
             refreshes: Vec::new(),
+            deferred: 0,
+            ran: 0,
         });
         // In order with the numbers: under the lock.
         if jobs.send(job).is_err() {
@@ -548,6 +582,7 @@ impl Pipeline {
         for &(fence, value) in &f.signals {
             (self.signal)(fence, value);
         }
+        (self.stepped)(step_value(f.seq, STEPS));
         (self.copied)(f.seq);
         s.done = f.seq;
         #[cfg(feature = "diagnostics")]
@@ -607,7 +642,26 @@ fn overlaps(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(first).is_some_and(|&(start, _)| start < to)
 }
 
-static PIPELINE: Pipeline = Pipeline::new(hold_fence, signal_fence, crate::host::copied_back);
+static PIPELINE: Pipeline = Pipeline::new(
+    hold_fence,
+    signal_fence,
+    crate::host::copied_back,
+    crate::host::steps_ran,
+);
+
+/// Bits of a step fence value that count a submission's steps run, below
+/// its number ([`step_value`]).
+pub(crate) const STEP_BITS: u32 = 20;
+
+/// A submission's steps run, at most: all of them (its completion).
+const STEPS: u64 = (1 << STEP_BITS) - 1;
+
+/// The step fence's value once submission `seq` has run `ran` of the steps
+/// deferred to it: rising as they run, and from one submission to the
+/// next, since only the oldest in flight runs steps.
+fn step_value(seq: u64, ran: u64) -> u64 {
+    seq << STEP_BITS | ran.min(STEPS)
+}
 
 fn hold_fence(fence: usize) {
     crate::object::add_ref(fence as This);
@@ -648,7 +702,12 @@ pub(crate) fn wait_writes(from: usize, to: usize, by: Writer) {
     if !on() {
         return;
     }
-    if matches!(by, Writer::Refresh) && early_refreshes() {
+    let ranged = match by {
+        Writer::Refresh => true,
+        Writer::Fill => step_fence(),
+        _ => false,
+    };
+    if ranged && early_refreshes() {
         PIPELINE.wait_copied(Why::Writes(by), from, to);
         return;
     }
@@ -683,10 +742,18 @@ pub(crate) fn copied_back_but(left: impl IntoIterator<Item = (usize, usize)>) {
 /// Title memory refreshes wait for copy-back to write
 /// ([`early_refreshes`]).
 pub(crate) fn wanted() -> Vec<(usize, usize)> {
-    match on() {
-        true => PIPELINE.lock().wanted.clone(),
-        false => Vec::new(),
+    if !on() {
+        return Vec::new();
     }
+    let s = PIPELINE.lock();
+    let mut wanted = s.wanted.clone();
+    if step_fence()
+        && let Some(f) = s.flying.front()
+    {
+        let steps = f.refreshes.iter().filter(|step| !step.2);
+        wanted.extend(steps.map(|&(from, to, ..)| (from, to)));
+    }
+    wanted
 }
 
 /// Whether a refresh of title memory a submission in flight has left to
@@ -763,7 +830,47 @@ pub(crate) fn defer(
         Writer::Fill => deferred_fills(),
         Writer::TitleCopy | Writer::Texture => false,
     };
-    on() && deferred && PIPELINE.defer(from, to, by, Box::new(step))
+    let whole = match by {
+        Writer::Refresh => false,
+        Writer::Fill => !step_fence(),
+        _ => true,
+    };
+    on() && deferred && PIPELINE.defer_as(from, to, by, whole, Box::new(step))
+}
+
+/// Whether the GPU waits for the steps deferred to submissions in flight
+/// ([`defer`]) on a fence the completion thread signals as they run
+/// ([`step_wait`]), instead of for those submissions' whole copy-backs
+/// ([`gpu_wait`]); fills then wait, like refreshes, only for their range's
+/// copy-back, and copy-back does the ranges of steps first ([`wanted`]). In
+/// run F1 the frame's second big submission was held on the GPU 24-29 ms a
+/// frame for the whole copy-back of the first. With [`deferred_refreshes`];
+/// `VICTORY_STEP_FENCE=1`.
+pub(crate) fn step_fence() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = deferred_refreshes()
+            && std::env::var_os("VICTORY_STEP_FENCE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the GPU waits for deferred steps, not whole copy-backs (VICTORY_STEP_FENCE)"
+            );
+        }
+        on
+    })
+}
+
+/// With [`step_fence`]: the step fence's value the GPU waits for before
+/// the submission being prepared runs, the steps deferred since the last
+/// call having run ([`crate::host::steps_ran`]); it takes the place of
+/// [`gpu_wait`].
+pub(crate) fn step_wait() -> Option<u64> {
+    if !on() || !step_fence() {
+        return None;
+    }
+    let mut s = PIPELINE.lock();
+    s.gpu_wait = None;
+    s.step_wait.take()
 }
 
 /// The newest submission whose copy-back refreshes were deferred to
@@ -846,6 +953,44 @@ pub(crate) fn wait_all() {
         #[cfg(feature = "diagnostics")]
         trace::waited_all(caller, started);
     }
+}
+
+/// Whether a remapping of title pages (the queue's page mapping batches)
+/// waits only for the submissions in flight that write or read the pages
+/// remapped ([`wait_remapped`]), instead of for every submission: in run
+/// F1 it waited for every one about every eighth frame, ~46 ms each time.
+/// `VICTORY_NARROW_REMAPS=1`.
+pub(crate) fn narrow_remaps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = on() && std::env::var_os("VICTORY_NARROW_REMAPS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "page remappings wait only for submissions touching them (VICTORY_NARROW_REMAPS)"
+            );
+        }
+        on
+    })
+}
+
+/// Before title memory `ranges` (`[from, to)`) are remapped: waits until
+/// the submissions queued have launched and none in flight writes or reads
+/// any of it (completions come in order: the newest that does).
+#[track_caller]
+pub(crate) fn wait_remapped(ranges: &[(usize, usize)]) {
+    if !on() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let (caller, started) = (std::panic::Location::caller(), Instant::now());
+    drained();
+    PIPELINE.wait_for(Why::All, |f| {
+        ranges
+            .iter()
+            .any(|&(from, to)| overlaps(&f.writes, from, to) || overlaps(&f.reads, from, to))
+    });
+    #[cfg(feature = "diagnostics")]
+    trace::waited_all(caller, started);
 }
 
 /// Before a host list is reset or let go: waits for its submissions.
@@ -1005,7 +1150,7 @@ mod tests {
     }
 
     fn pipeline() -> &'static Pipeline {
-        Box::leak(Box::new(Pipeline::new(|_| {}, record, |_| {})))
+        Box::leak(Box::new(Pipeline::new(|_| {}, record, |_| {}, |_| {})))
     }
 
     /// A job that completes once its sender is used (or dropped).
@@ -1228,6 +1373,76 @@ mod tests {
         assert!(!p.defer(150, 160, refresh, Box::new(|| {})));
         go.send(()).unwrap();
         assert_eq!(runs.recv_timeout(Duration::from_secs(10)), Ok("second"));
+    }
+
+    /// Fills deferred as refreshes are (`step_fence`) run once their range
+    /// is copied back, and each run of steps signals the step fence past
+    /// the steps run; the submission's completion signals past them all.
+    #[test]
+    fn deferred_steps_signal_the_step_fence_as_they_run() {
+        static STEPPED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let stepped = |value| STEPPED.lock().unwrap().push(value);
+        let p: &'static Pipeline =
+            Box::leak(Box::new(Pipeline::new(|_| {}, record, |_| {}, stepped)));
+        let signals = |n: usize| {
+            let started = Instant::now();
+            loop {
+                let values = STEPPED.lock().unwrap().clone();
+                if values.len() >= n {
+                    return values;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "not signalled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let (part, parted) = mpsc::channel::<()>();
+        let (go, gate) = mpsc::channel::<()>();
+        let (ran, runs) = mpsc::channel::<&'static str>();
+        p.launch(
+            vec![(100, 200), (300, 400)],
+            Vec::new(),
+            vec![9],
+            Box::new(move |_| {
+                let _ = parted.recv();
+                p.copied_back_but(vec![(300, 400)]);
+                let _ = gate.recv();
+            }),
+        );
+        let seq = p.lock().flying[0].seq;
+        let (first, second) = (ran.clone(), ran);
+        let fill = Writer::Fill;
+        assert!(p.defer_as(
+            150,
+            160,
+            fill,
+            false,
+            Box::new(move || first.send("first").unwrap())
+        ));
+        assert!(p.defer_as(
+            300,
+            350,
+            fill,
+            false,
+            Box::new(move || second.send("second").unwrap())
+        ));
+        assert_eq!(p.lock().step_wait.take(), Some(step_value(seq, 2)));
+        let quiet = Duration::from_millis(50);
+        assert!(
+            runs.recv_timeout(quiet).is_err(),
+            "ran before its copy-back"
+        );
+        assert!(STEPPED.lock().unwrap().is_empty());
+        part.send(()).unwrap();
+        assert_eq!(runs.recv_timeout(Duration::from_secs(10)), Ok("first"));
+        assert_eq!(signals(1), [step_value(seq, 1)]);
+        assert!(
+            runs.recv_timeout(quiet).is_err(),
+            "ran before its copy-back"
+        );
+        go.send(()).unwrap();
+        assert_eq!(runs.recv_timeout(Duration::from_secs(10)), Ok("second"));
+        assert_eq!(signals(2), [step_value(seq, 1), step_value(seq, STEPS)]);
+        assert!(step_value(seq, STEPS) < step_value(seq + 1, 0));
     }
 
     /// A snapshot of memory a submission in flight writes runs once that
