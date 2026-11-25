@@ -138,7 +138,6 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the program intersects rays (`image_bvh*_intersect_ray`),
     /// against the title's acceleration structures in title memory.
-    #[cfg(feature = "diagnostics")]
     pub(crate) rays: bool,
 }
 
@@ -149,7 +148,12 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container).and_then(|t| {
+                    match page_table_refuses(&t, &self.hash) {
+                        Some(why) => Err(why.to_owned()),
+                        None => Ok(t),
+                    }
+                });
                 match &done {
                     Ok(t) => {
                         tracing::info!(
@@ -240,7 +244,6 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             }),
         None => None,
     };
-    #[cfg(feature = "diagnostics")]
     let rays = native.as_ref().is_some_and(|p| {
         victory_shader::gfx10::decode(&p.code).is_ok_and(|insts| {
             insts
@@ -251,9 +254,151 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     Ok(Translated {
         host,
         used: native.map(|p| p.used).unwrap_or_default(),
-        #[cfg(feature = "diagnostics")]
         rays,
     })
+}
+
+/// `VICTORY_PAGE_TABLE`: which programs reach title memory at addresses
+/// they compute, through the page table (`crate::memory`). The others
+/// do not translate, as before the page table: their draws and dispatches
+/// are dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PageTable {
+    /// None.
+    Off,
+    /// All but ray programs and the BVH builders (the default).
+    NonRt,
+    /// All but ray programs: the BVH builders run.
+    NoRays,
+    All,
+}
+
+fn parse_page_table(value: &str) -> PageTable {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => PageTable::Off,
+        "" | "nonrt" => PageTable::NonRt,
+        "norays" => PageTable::NoRays,
+        "all" => PageTable::All,
+        other => {
+            tracing::warn!(
+                value = other,
+                "VICTORY_PAGE_TABLE expects off, nonrt, norays or all: nonrt"
+            );
+            PageTable::NonRt
+        }
+    }
+}
+
+#[cfg(windows)]
+fn page_table() -> PageTable {
+    static MODE: OnceLock<PageTable> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_page_table(&std::env::var("VICTORY_PAGE_TABLE").unwrap_or_default());
+        tracing::info!(?mode, "VICTORY_PAGE_TABLE");
+        mode
+    })
+}
+
+/// XboxBvhBuilder.dll's 52 programs (Grand Theft Auto VI 1.0.2.1), by
+/// container hash.
+const BVH_BUILDERS: [&str; 52] = [
+    "0dd520d405264736",
+    "0ddab4b63b1394e0",
+    "14394a322f6dd5c2",
+    "162216b9cfd91aaf",
+    "190fbf0ebe040169",
+    "198f6dfd2b81bcea",
+    "28918b7150a7aad5",
+    "35e51bb27a463294",
+    "39321a95223001ed",
+    "3b90165a77d95cdf",
+    "3cea4534bbc15632",
+    "3df629ffc3d0a2a6",
+    "4b5aedc0e96b0770",
+    "4ddd6f9702fab2a7",
+    "4f3227f524514cd8",
+    "5062bc7a48e842f8",
+    "5279ae36796c31fc",
+    "5326ef52f27f5a41",
+    "54b3e5465215e92e",
+    "5552dac6a2b7a1fd",
+    "5c09eb42b7a3c362",
+    "5e19e7c728d956df",
+    "5e68767498c57eb6",
+    "6b7cb8a6572efff1",
+    "6f6a359d1166bb27",
+    "77360df21e12ea43",
+    "7bb5b1b91d283a28",
+    "894c91654720595f",
+    "8bb4592836034757",
+    "9205d2655bf8cc88",
+    "93be497edd442293",
+    "9fc111d3be79364f",
+    "a197f50cd8481541",
+    "a63e2dfc25ba3155",
+    "b0fc38d36f25b863",
+    "bb55c842c391589f",
+    "be6862bb8ce8d9e9",
+    "c42a31951201f9a0",
+    "c85822de2e41cfaa",
+    "caa78b8ca62bc3d6",
+    "cb9647e77864cb3a",
+    "ce2fc10ab6471ab8",
+    "db36ed4ffef76056",
+    "e63d22c4def9ba6a",
+    "e95858837a9aa22d",
+    "eaaf3a4f6c87b080",
+    "eb89347fa4f5dc34",
+    "f28a33a89eaa2caa",
+    "f6e47efa50226beb",
+    "f6eb6498409ca974",
+    "f94e5d8bf4e1cf05",
+    "ffd93c8a029ff016",
+];
+
+/// Why `VICTORY_PAGE_TABLE` refuses translation `t` of the program
+/// `hash`, if it does.
+#[cfg(windows)]
+fn page_table_refuses(t: &Translated, hash: &str) -> Option<&'static str> {
+    if !t.host.memory && !t.rays {
+        return None;
+    }
+    let builder = BVH_BUILDERS.contains(&hash);
+    match page_table() {
+        PageTable::Off => Some("title memory at computed addresses (VICTORY_PAGE_TABLE=off)"),
+        PageTable::NonRt | PageTable::NoRays if t.rays => {
+            Some("a ray program (VICTORY_PAGE_TABLE is not all)")
+        }
+        PageTable::NonRt if builder => Some("a BVH builder (VICTORY_PAGE_TABLE=nonrt)"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod page_table_tests {
+    use super::{BVH_BUILDERS, PageTable, parse_page_table};
+
+    #[test]
+    fn the_page_table_switch_parses_or_falls_back_to_nonrt() {
+        assert_eq!(parse_page_table(""), PageTable::NonRt);
+        assert_eq!(parse_page_table(" OFF "), PageTable::Off);
+        assert_eq!(parse_page_table("norays"), PageTable::NoRays);
+        assert_eq!(parse_page_table("all"), PageTable::All);
+        assert_eq!(parse_page_table("rt"), PageTable::NonRt);
+    }
+
+    #[test]
+    fn builder_hashes_are_distinct_16_digit_hashes() {
+        let mut sorted = BVH_BUILDERS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), BVH_BUILDERS.len());
+        assert!(
+            BVH_BUILDERS
+                .iter()
+                .all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        );
+    }
 }
 
 #[repr(C)]
