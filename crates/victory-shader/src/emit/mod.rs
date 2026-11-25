@@ -1694,6 +1694,111 @@ mod tests {
             );
         }
     }
+
+    /// A mesh program may test whether a lane mask has a lane set, as a test
+    /// that a value is uniform does, but not read how many lanes it has: its
+    /// lanes run on host waves of another size.
+    #[test]
+    fn a_mesh_program_reads_whether_a_mask_has_a_lane_set_but_not_its_count() {
+        use crate::native::{MeshIo, Usage, VsOutput};
+        let el = |name: &str, index, kind, comp, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let osg1 = container::signature(
+            &[
+                el("SV_Position", 0, 3, 9, 0, 0, 4),
+                el("TEXCOORD", 0, 0, 9, 1, 0, 2),
+                el("TEXCOORD", 1, 0, 5, 1, 2, 2),
+            ],
+            false,
+        );
+        let lower = |w: &[u32]| {
+            let words: Vec<u32> = [
+                0xD765_000Bu32,
+                0x0001_00C1, // v_mbcnt_lo_u32_b32 v11, -1, 0
+                0xD766_000B,
+                0x0002_16C1, // v_mbcnt_hi_u32_b32 v11, -1, v11
+                0x7E06_02F2, // v_mov_b32 v3, 1.0
+                0x7E08_02F2, // v_mov_b32 v4, 1.0
+                0x7E0A_02F0, // v_mov_b32 v5, 0.5
+                0xBE80_107E, // s_bcnt1_i32_b64 s0, exec
+            ]
+            .iter()
+            .chain(w)
+            .chain(&[
+                0x7E18_0287, // v_mov_b32 v12, 7
+                0x7E1A_0289, // v_mov_b32 v13, 9
+                0x7E0E_02FF,
+                0x0020_0400, // v_mov_b32 v7, 0x200400 (vertices 0, 1, 2)
+                0x7D88_1683, // v_cmp_gt_u32 vcc, 3, v11
+                0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+                0xF800_020F,
+                0x0D0C_0403, // exp param0, v3, v4, v12, v13
+                0xF800_08CF,
+                0x0605_0403, // exp pos0, v3, v4, v5, v6 done
+                0x7D84_1680, // v_cmp_eq_u32 vcc, 0, v11
+                0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+                0xF800_0941,
+                0x0000_0007, // exp prim, v7, off, off, off done
+                0xBF81_0000, // s_endpgm
+            ])
+            .copied()
+            .collect();
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: true,
+                vgprs: 24,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(MeshIo {
+                    outputs: vec![VsOutput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        param: 0,
+                        fp16: false,
+                        pack2: false,
+                    }],
+                    clip_cntl: 0,
+                    threads: 64,
+                    max_vertices: 3,
+                    max_primitives: 1,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res)
+        };
+        let any_lane = lower(&[
+            0x8501_F0F2, // s_cselect_b32 s1, 1.0, 0.5
+            0x7E0C_0201, // v_mov_b32 v6, s1
+        ]);
+        if let Err(e) = any_lane {
+            panic!("{e:?}");
+        }
+        match lower(&[0x7E0C_0200]) {
+            // v_mov_b32 v6, s0
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "a lane mask read as data");
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+    }
 }
 
 #[cfg(test)]
