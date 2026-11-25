@@ -169,6 +169,84 @@ fn split<T: Send>(n: usize, len: usize, f: impl Fn(std::ops::Range<usize>) -> T 
         .collect()
 }
 
+/// The runs of words shaders wrote and the span of the words the copy takes
+/// from title memory ([`merge_words`]).
+type Merged = (Vec<(usize, usize)>, Option<(usize, usize)>);
+
+/// Puts the bytes shaders wrote into `title`, title memory as read back,
+/// and has the copy `host` take the result, by 4-byte word: a byte the GPU
+/// changed (`host` against `old`, what the copy held before) that the title
+/// does not already hold is the GPU's. Returns the runs of the words the GPU
+/// changed and the span of the words in which the copy takes bytes of the
+/// title's. 16 bytes at a time: word by word, with a slice compare and a
+/// copy per word, it took most of copy-back's samples in runs 79 and 85.
+fn merge_words(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Merged {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_andnot_si128, _mm_cmpeq_epi8, _mm_loadu_si128,
+        _mm_movemask_epi8, _mm_or_si128, _mm_storeu_si128,
+    };
+    assert!(host.len() == title.len() && old.len() == title.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut taken: Option<(usize, usize)> = None;
+    let mut word = |a: usize, b: usize, gpu: bool, titles: bool| {
+        if titles {
+            taken = Some((taken.map_or(a, |s| s.0), b));
+        }
+        match runs.last_mut() {
+            Some(run) if gpu && run.1 == a => run.1 = b,
+            _ if gpu => runs.push((a, b)),
+            _ => {}
+        }
+    };
+    let lanes = title.len() / 16 * 16;
+    for at in (0..lanes).step_by(16) {
+        // SAFETY: SSE2 is part of x86_64; 16 bytes at `at` in each slice,
+        // all as long as `title`.
+        let (keep, same, unwritten) = unsafe {
+            let t = _mm_loadu_si128(title.as_ptr().add(at).cast::<__m128i>());
+            let h = _mm_loadu_si128(host.as_ptr().add(at).cast::<__m128i>());
+            let o = _mm_loadu_si128(old.as_ptr().add(at).cast::<__m128i>());
+            let (same, unwritten) = (_mm_cmpeq_epi8(t, h), _mm_cmpeq_epi8(h, o));
+            // The title's bytes but where the GPU changed one the title
+            // lacks.
+            let keep = _mm_or_si128(same, unwritten);
+            let merged = _mm_or_si128(_mm_and_si128(keep, t), _mm_andnot_si128(keep, h));
+            _mm_storeu_si128(title.as_mut_ptr().add(at).cast::<__m128i>(), merged);
+            _mm_storeu_si128(host.as_mut_ptr().add(at).cast::<__m128i>(), merged);
+            (
+                _mm_movemask_epi8(keep) as u32,
+                _mm_movemask_epi8(same) as u32,
+                _mm_movemask_epi8(unwritten) as u32,
+            )
+        };
+        let (gpu, titles) = (!keep & 0xffff, !same & unwritten);
+        if gpu | titles != 0 {
+            for w in 0..4 {
+                let (bits, a) = (0xf << (4 * w), at + 4 * w);
+                word(a, a + 4, gpu & bits != 0, titles & bits != 0);
+            }
+        }
+    }
+    let words = title[lanes..]
+        .chunks_mut(4)
+        .zip(host[lanes..].chunks_mut(4))
+        .zip(old[lanes..].chunks(4));
+    for (k, ((t, h), o)) in words.enumerate() {
+        let mut gpu = false;
+        for ((t, h), o) in t.iter_mut().zip(h.iter()).zip(o) {
+            if *h != *o && *t != *h {
+                *t = *h;
+                gpu = true;
+            }
+        }
+        let a = lanes + 4 * k;
+        let titles = *h != *t;
+        h.copy_from_slice(t);
+        word(a, a + t.len(), gpu, titles);
+    }
+    (runs, taken)
+}
+
 /// What a copy held before a submission, for its copy-back: snapshots
 /// (offset, bytes), blocks kept (title block, bytes) and armed regions
 /// (from, to, asking; [`Shadow::arm`]).
@@ -996,32 +1074,7 @@ impl Shadow {
             // title's bytes in turn. Only the words the GPU changed go back:
             // the title writes the piece while we compare it, and writing it
             // whole put the bytes we read back over those writes.
-            // The GPU's runs, and the span of the words the copy takes.
-            let mut runs: Vec<(usize, usize)> = Vec::new();
-            let mut taken: Option<(usize, usize)> = None;
-            let words = title
-                .chunks_mut(4)
-                .zip(host.chunks_mut(4))
-                .zip(old.chunks(4));
-            for (k, ((t, h), o)) in words.enumerate() {
-                let mut gpu = false;
-                for ((t, h), o) in t.iter_mut().zip(h.iter()).zip(o) {
-                    if *h != *o && *t != *h {
-                        *t = *h;
-                        gpu = true;
-                    }
-                }
-                let (a, b) = (4 * k, 4 * k + t.len());
-                if *h != *t {
-                    taken = Some((taken.map_or(a, |s| s.0), b));
-                }
-                h.copy_from_slice(t);
-                match runs.last_mut() {
-                    Some(run) if gpu && run.1 == a => run.1 = b,
-                    _ if gpu => runs.push((a, b)),
-                    _ => {}
-                }
-            }
+            let (runs, taken) = merge_words(title, host, old);
             #[cfg(test)]
             if let Some(race) = BEFORE_WRITING
                 .lock()
@@ -3652,6 +3705,86 @@ pub(crate) mod tests {
 
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
     const MIB: usize = 1 << 20;
+
+    /// [`merge_words`] by lanes gives what merging word by word gave (title and
+    /// copy bytes, the GPU's runs, the span taken) on random pieces of every
+    /// length up to a few lanes, the GPU and the title writing little, much
+    /// or everything.
+    #[test]
+    fn merging_by_lanes_matches_merging_by_words() {
+        fn by_words(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Merged {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut taken: Option<(usize, usize)> = None;
+            let words = title
+                .chunks_mut(4)
+                .zip(host.chunks_mut(4))
+                .zip(old.chunks(4));
+            for (k, ((t, h), o)) in words.enumerate() {
+                let mut gpu = false;
+                for ((t, h), o) in t.iter_mut().zip(h.iter()).zip(o) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        gpu = true;
+                    }
+                }
+                let (a, b) = (4 * k, 4 * k + t.len());
+                if *h != *t {
+                    taken = Some((taken.map_or(a, |s| s.0), b));
+                }
+                h.copy_from_slice(t);
+                match runs.last_mut() {
+                    Some(run) if gpu && run.1 == a => run.1 = b,
+                    _ if gpu => runs.push((a, b)),
+                    _ => {}
+                }
+            }
+            (runs, taken)
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // One byte in `k` (never for 0).
+        let mut one_in = |k: u64| k != 0 && next() % k == 0;
+        let odds = [0, 1, 2, 7, 64];
+        for round in 0..20_000 {
+            let n = round % 80 + if round % 3 == 0 { 0 } else { 80 };
+            // How often the GPU writes a byte, the title already holds the
+            // GPU's byte, the title writes one of its own.
+            let (gpu, holds, writes) = (odds[round % 5], odds[round / 5 % 5], odds[round / 25 % 5]);
+            let old: Vec<u8> = (0..n).map(|i| (i * 31 + round) as u8).collect();
+            let host: Vec<u8> = old
+                .iter()
+                .map(|&o| {
+                    if one_in(gpu) {
+                        o ^ (1 + (round % 255) as u8)
+                    } else {
+                        o
+                    }
+                })
+                .collect();
+            let title: Vec<u8> = (0..n)
+                .map(|i| {
+                    if one_in(holds) {
+                        host[i]
+                    } else if one_in(writes) {
+                        old[i].wrapping_add(3)
+                    } else {
+                        old[i]
+                    }
+                })
+                .collect();
+            let (mut t1, mut h1) = (title.clone(), host.clone());
+            let (mut t2, mut h2) = (title, host);
+            let lanes = merge_words(&mut t1, &mut h1, &old);
+            let words = by_words(&mut t2, &mut h2, &old);
+            assert_eq!(lanes, words, "round {round}");
+            assert_eq!((t1, h1), (t2, h2), "round {round}");
+        }
+    }
 
     /// Whether the host GPU and the mirror are here (tests that need them
     /// pass without them, saying so).
