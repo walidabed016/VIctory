@@ -585,9 +585,11 @@ fn shader_names() -> &'static std::collections::HashMap<String, String> {
 }
 
 /// Logs the GPU time per frame by command kind and the pipelines that
-/// took most, over `frames` frames (diagnostics, timing on).
+/// took most, with where their views reach what shaders read and write,
+/// over `frames` frames (diagnostics, timing on).
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
+    let reached = crate::shadow::take_reached();
     let Some(t) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
@@ -632,8 +634,18 @@ fn log_gpu_times(frames: f64) {
     let mut labels: Vec<_> = t.by_label.iter().collect();
     labels.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     for (label, (ms, n, longest)) in labels.into_iter().take(40) {
+        let reach = label
+            .find('[')
+            .and_then(|s| reached.get(&label[s..]))
+            .map_or_else(String::new, |[reads, writes]| {
+                format!(
+                    "; reads {}; writes {}",
+                    reads.per_frame(frames),
+                    writes.per_frame(frames)
+                )
+            });
         tracing::info!(
-            "GPU time per frame: {:.2} ms in {:.1} commands (longest {longest:.2} ms): {}",
+            "GPU time per frame: {:.2} ms in {:.1} commands (longest {longest:.2} ms): {}{reach}",
             ms / frames,
             *n as f64 / frames,
             named(label),

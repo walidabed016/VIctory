@@ -469,27 +469,30 @@ impl Shadow {
         self.shaders_write.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         #[cfg(feature = "diagnostics")]
-        self.note_written(address, len);
+        self.note_reached(address, len, true, false);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
     /// Diagnostics: counts `[address, address + len)` as given to the
-    /// pipeline being bound to write, by where its shaders reach it
-    /// ([`WRITTEN`]).
+    /// pipeline being bound to read, or to `write`, by where its shaders
+    /// reach it ([`REACHED`]); a view that reads a copy of its `own`
+    /// reaches system memory.
     #[cfg(feature = "diagnostics")]
-    fn note_written(&self, address: u64, len: u64) {
-        let (mut vram, mut system) = (Vec::new(), Vec::new());
-        let mut w = Written {
+    pub(crate) fn note_reached(&self, address: u64, len: u64, write: bool, own: bool) {
+        let len = len.min(self.left(address));
+        let mut r = Reach {
             views: 1,
-            ..Written::default()
+            ..Reach::default()
         };
-        if self.in_place {
-            w.in_place = len;
+        if own {
+            r.system = len;
+        } else if self.in_place {
+            r.in_place = len;
         } else if !self.mirror() {
             if self.twin.is_some() {
-                w.vram = len;
+                r.vram = len;
             } else {
-                w.system = len;
+                r.system = len;
             }
         } else {
             let m = mirror_state();
@@ -497,23 +500,17 @@ impl Shadow {
             for n in address / WINDOW..end.div_ceil(WINDOW) {
                 let bytes = end.min((n + 1) * WINDOW) - address.max(n * WINDOW);
                 if self.twin.is_some() && m.twinned.contains_key(&n) {
-                    w.vram += bytes;
-                    vram.push(n);
+                    r.vram += bytes;
+                    r.vram_windows.insert(n);
                 } else if m.windows.contains_key(&n) {
-                    w.system += bytes;
-                    system.push(n);
+                    r.system += bytes;
+                    r.system_windows.insert(n);
                 }
             }
         }
         let pipeline = crate::descriptor::host::BINDING.get();
-        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        let e = written.entry(pipeline).or_default();
-        e.views += w.views;
-        e.vram += w.vram;
-        e.system += w.system;
-        e.in_place += w.in_place;
-        e.vram_windows.extend(vram);
-        e.system_windows.extend(system);
+        let mut reached = REACHED.lock().unwrap_or_else(|e| e.into_inner());
+        reached.entry(pipeline).or_default()[usize::from(write)].add(r);
     }
 
     /// The copy's offsets of the ranges `declared` (address, bytes),
@@ -2886,14 +2883,14 @@ fn first_warning(address: u64) -> bool {
     warned.len() < 4096 && warned.insert(address)
 }
 
-/// What shaders were given to write since the last frame-rate line, by
-/// title pipeline (diagnostics): views, bytes they reach in VRAM (twins)
-/// and in system memory (copies and mirror windows without a VRAM twin),
-/// bytes of title memory used in place (system memory, never twinned), and
-/// the mirror windows reached in VRAM and in system memory.
+/// What shaders were given to read or to write (diagnostics): views,
+/// bytes they reach in VRAM (twins) and in system memory (copies, views'
+/// own copies and mirror windows without a VRAM twin), bytes of title
+/// memory used in place (system memory, never twinned), and the mirror
+/// windows reached in VRAM and in system memory.
 #[cfg(feature = "diagnostics")]
 #[derive(Default)]
-struct Written {
+pub(crate) struct Reach {
     views: u64,
     vram: u64,
     system: u64,
@@ -2903,14 +2900,66 @@ struct Written {
 }
 
 #[cfg(feature = "diagnostics")]
-static WRITTEN: Mutex<BTreeMap<usize, Written>> = Mutex::new(BTreeMap::new());
+impl Reach {
+    fn add(&mut self, r: Reach) {
+        self.views += r.views;
+        self.vram += r.vram;
+        self.system += r.system;
+        self.in_place += r.in_place;
+        self.vram_windows.extend(r.vram_windows);
+        self.system_windows.extend(r.system_windows);
+    }
 
-/// Logs the mirror's twins against the windows submissions used, and the
-/// pipelines that write most outside VRAM with the windows they write
-/// there (diagnostics).
+    /// Per frame over `frames` frames, with the first mirror windows it
+    /// reaches in system memory.
+    pub(crate) fn per_frame(&self, frames: f64) -> String {
+        if self.views == 0 {
+            return "nothing".to_owned();
+        }
+        let windows: Vec<String> = self
+            .system_windows
+            .iter()
+            .take(8)
+            .map(|n| format!("{:#x}", n * WINDOW))
+            .collect();
+        format!(
+            "{:.1} views: {:.1} MB in VRAM, {:.1} MB in system memory, {:.1} MB in title memory used in \
+             place; {} windows in system memory: {}",
+            self.views as f64 / frames,
+            self.vram as f64 / frames / 1e6,
+            self.system as f64 / frames / 1e6,
+            self.in_place as f64 / frames / 1e6,
+            self.system_windows.len(),
+            windows.join(" "),
+        )
+    }
+}
+
+/// What shaders were given to read (first) and to write since the GPU time
+/// lines, by title pipeline (diagnostics).
 #[cfg(feature = "diagnostics")]
-fn log_written(frames: f64) {
-    let written = std::mem::take(&mut *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+static REACHED: Mutex<BTreeMap<usize, [Reach; 2]>> = Mutex::new(BTreeMap::new());
+
+/// Takes what shaders were given to read (first) and to write, by host
+/// pipeline name as the GPU time lines show it (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_reached() -> std::collections::HashMap<String, [Reach; 2]> {
+    let reached = std::mem::take(&mut *REACHED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut named: std::collections::HashMap<String, [Reach; 2]> = Default::default();
+    for (pipeline, [reads, writes]) in reached {
+        let name = crate::pipeline::host_pipeline(pipeline as crate::object::This)
+            .map_or_else(|| format!("{pipeline:#x}"), |p| p.name.clone());
+        let e = named.entry(name).or_default();
+        e[0].add(reads);
+        e[1].add(writes);
+    }
+    named
+}
+
+/// Logs the mirror's twins against the windows submissions used and the
+/// windows shaders were given to write (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn log_written() {
     let (placed, twinned, heaps, used, used_system) = {
         let mut m = mirror_state();
         let used = std::mem::take(&mut m.hot);
@@ -2927,10 +2976,10 @@ fn log_written(frames: f64) {
         )
     };
     let (mut vram_windows, mut system_windows) = (
-        std::collections::BTreeSet::<&u64>::new(),
-        std::collections::BTreeSet::<&u64>::new(),
+        std::collections::BTreeSet::<u64>::new(),
+        std::collections::BTreeSet::<u64>::new(),
     );
-    for w in written.values() {
+    for [_, w] in REACHED.lock().unwrap_or_else(|e| e.into_inner()).values() {
         vram_windows.extend(&w.vram_windows);
         system_windows.extend(&w.system_windows);
     }
@@ -2945,33 +2994,6 @@ fn log_written(frames: f64) {
         vram_windows.len(),
         system_windows.len(),
     );
-    let frames = frames.max(1.0);
-    let mut rows: Vec<_> = written.into_iter().collect();
-    rows.sort_by_key(|(_, w)| std::cmp::Reverse(w.system + w.in_place));
-    for (pipeline, w) in rows
-        .into_iter()
-        .take(16)
-        .filter(|(_, w)| w.system + w.in_place > 0)
-    {
-        let name = crate::pipeline::host_pipeline(pipeline as crate::object::This)
-            .map_or_else(|| format!("{pipeline:#x}"), |p| crate::host::named(&p.name));
-        let windows: Vec<String> = w
-            .system_windows
-            .iter()
-            .take(8)
-            .map(|n| format!("{:#x}", n * WINDOW))
-            .collect();
-        tracing::info!(
-            "shader writes per frame, {name}: {:.1} views; {:.1} MB in VRAM, {:.1} MB in system memory, {:.1} MB \
-             in title memory used in place; {} windows in system memory: {}",
-            w.views as f64 / frames,
-            w.vram as f64 / frames / 1e6,
-            w.system as f64 / frames / 1e6,
-            w.in_place as f64 / frames / 1e6,
-            w.system_windows.len(),
-            windows.join(" "),
-        );
-    }
 }
 
 /// Logs the root views per frame over `frames` frames, and the mirror's
@@ -2999,7 +3021,7 @@ pub(crate) fn log_roots(frames: f64) {
         r[Root::Split as usize],
     );
     #[cfg(feature = "diagnostics")]
-    log_written(frames);
+    log_written();
 }
 
 /// The host end of the copy holding host GPU address `va` (tests).
@@ -3169,13 +3191,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A buffer's copy keeps a snapshot per region shaders write, not one
-    /// over everything between them, and copies back what the GPU wrote in
-    /// overlapping declared ranges once (a range of 20 MiB on several
-    /// threads).
+    /// What a pipeline's views give its shaders to read and to write counts
+    /// by where they reach it.
     #[test]
     #[cfg(feature = "diagnostics")]
-    fn shader_writes_count_where_shaders_reach_them_by_pipeline() {
+    fn shader_reads_and_writes_count_where_shaders_reach_them_by_pipeline() {
         let _serial = crate::watch::serial();
         if !gpu() {
             return;
@@ -3190,21 +3210,40 @@ pub(crate) mod tests {
         assert!(!s.in_place && !s.mirror());
         let pipeline = 0x5eed_0009;
         crate::descriptor::host::BINDING.set(pipeline);
-        s.note_written(at as u64, 2 * MIB as u64);
-        s.note_written(at as u64 + MIB as u64, MIB as u64);
+        s.note_reached(at as u64, 2 * MIB as u64, true, false);
+        s.note_reached(at as u64 + MIB as u64, MIB as u64, true, false);
+        // A read past the buffer's end counts to its end; a view's own copy
+        // is system memory.
+        s.note_reached(at as u64 + 7 * MIB as u64, 2 * MIB as u64, false, false);
+        s.note_reached(at as u64, 256, false, true);
         crate::descriptor::host::BINDING.set(0);
-        let w = WRITTEN.lock().unwrap().remove(&pipeline).unwrap();
-        let (reached, other) = if s.twin.is_some() {
-            (w.vram, w.system)
+        let [reads, writes] = REACHED.lock().unwrap().remove(&pipeline).unwrap();
+        let twin = s.twin.is_some();
+        let (reached, other) = if twin {
+            (writes.vram, writes.system)
         } else {
-            (w.system, w.vram)
+            (writes.system, writes.vram)
         };
         assert_eq!(
-            (w.views, reached, other, w.in_place),
+            (writes.views, reached, other, writes.in_place),
             (2, 3 * MIB as u64, 0, 0)
+        );
+        let own = if twin { 0 } else { MIB as u64 };
+        assert_eq!(
+            (
+                reads.views,
+                reads.vram + reads.system,
+                reads.system,
+                reads.in_place
+            ),
+            (2, MIB as u64 + 256, own + 256, 0)
         );
     }
 
+    /// A buffer's copy keeps a snapshot per region shaders write, not one
+    /// over everything between them, and copies back what the GPU wrote in
+    /// overlapping declared ranges once (a range of 20 MiB on several
+    /// threads).
     #[test]
     fn a_buffer_copy_keeps_a_snapshot_per_region_shaders_write() {
         let _serial = crate::watch::serial();

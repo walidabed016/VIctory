@@ -194,6 +194,8 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     #[cfg(feature = "diagnostics")]
     crate::shadow::note_root(address, reach, &shadow, len);
     let gpu = shadow.gpu(address);
+    #[cfg(feature = "diagnostics")]
+    shadow.note_reached(address, len, false, !srv && gpu % 256 != 0);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
@@ -1345,9 +1347,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     {
         shadow.refresh(list, address, len);
         // A view the host cannot make on the copy reads its own.
-        if let Some((data, len)) =
-            crate::descriptor::host::own_copy_of(view, &shadow, (address, len))
-        {
+        let own = crate::descriptor::host::own_copy_of(view, &shadow, (address, len));
+        #[cfg(feature = "diagnostics")]
+        if kind != ResourceType::Uav {
+            shadow.note_reached(address, len, false, own.is_some());
+        }
+        if let Some((data, len)) = own {
             list.defer_fill(data, address as *const u8, len as usize);
         }
         if kind == ResourceType::Uav {
