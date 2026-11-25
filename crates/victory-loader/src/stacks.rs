@@ -1,6 +1,10 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
 //! [`dump_stacks_on_schedule`], to find what a title waits on.
+//! `VICTORY_HEARTBEAT=<rva>` (hex) names a title u64 that the title's main
+//! loop keeps storing a QueryPerformanceCounter value in for a watchdog of
+//! its own: [`dump_stacks_on_stall`] logs each long gap between those stores
+//! and prints the stacks once a gap passes [`STALLED`] seconds.
 
 use std::ffi::c_void;
 
@@ -14,6 +18,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
@@ -40,6 +45,97 @@ pub fn dump_stacks_on_schedule() {
             dump_stacks();
         }
     });
+}
+
+/// Heartbeat gaps at least this long (seconds) are logged when they end.
+const LATE: f64 = 5.0;
+
+/// A heartbeat gap this long (seconds) prints every thread's stack, once a
+/// gap. The game's watchdog (title+0x2215a60) ends it after 30 s without a
+/// heartbeat at title+0x71b6338.
+const STALLED: f64 = 20.0;
+
+/// Reads `VICTORY_HEARTBEAT` and, if it names an aligned u64 in the image
+/// at `base` of `size` bytes, starts a thread that looks at it every 100 ms.
+pub fn dump_stacks_on_stall(base: usize, size: usize) {
+    let Some(rva) = std::env::var("VICTORY_HEARTBEAT")
+        .ok()
+        .and_then(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva % 8 == 0 && rva + 8 <= size)
+    else {
+        return;
+    };
+    let mut frequency = 0;
+    // SAFETY: writes one i64.
+    unsafe { QueryPerformanceFrequency(&mut frequency) };
+    tracing::info!("VICTORY_HEARTBEAT: watching title+{rva:#x}");
+    let watching = victory_core::thread::spawn_host("victory heartbeat", move || {
+        let mut gap = Gap::default();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let mut now = 0;
+            // SAFETY: writes one i64; reads an aligned u64 inside the mapped
+            // image, checked above.
+            let beat = unsafe {
+                QueryPerformanceCounter(&mut now);
+                ((base + rva) as *const i64).read_volatile()
+            };
+            match gap.see(beat, now, frequency) {
+                Some(Heard::Late(seconds, longest)) => tracing::info!(
+                    "title heartbeat after {seconds:.1} s (longest gap {longest:.1} s)"
+                ),
+                Some(Heard::Stalled(seconds)) => {
+                    tracing::warn!("no title heartbeat for {seconds:.1} s; stacks follow");
+                    dump_stacks();
+                }
+                None => {}
+            }
+        }
+    });
+    if let Err(e) = watching {
+        tracing::warn!(error = %e, "VICTORY_HEARTBEAT: no thread");
+    }
+}
+
+/// What [`Gap::see`] found worth saying.
+#[derive(Debug, PartialEq)]
+enum Heard {
+    /// A gap of this many seconds ended; the longest so far.
+    Late(f64, f64),
+    /// No heartbeat for this many seconds, said once a gap.
+    Stalled(f64),
+}
+
+/// The heartbeat last seen (0 before the first), the longest gap since, and
+/// whether this gap was said to stall.
+#[derive(Default)]
+struct Gap {
+    beat: i64,
+    longest: f64,
+    stalled: bool,
+}
+
+impl Gap {
+    /// Sees heartbeat `beat` at counter `now`, which counts `frequency` a
+    /// second.
+    fn see(&mut self, beat: i64, now: i64, frequency: i64) -> Option<Heard> {
+        let seconds = |ticks: i64| ticks as f64 / frequency as f64;
+        if beat != self.beat {
+            let first = self.beat == 0;
+            let gap = seconds(beat - self.beat);
+            (self.beat, self.stalled) = (beat, false);
+            if first {
+                return None;
+            }
+            self.longest = self.longest.max(gap);
+            return (gap >= LATE).then_some(Heard::Late(gap, self.longest));
+        }
+        if beat == 0 || self.stalled || seconds(now - beat) < STALLED {
+            return None;
+        }
+        self.stalled = true;
+        Some(Heard::Stalled(seconds(now - beat)))
+    }
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -220,5 +316,26 @@ mod tests {
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
+    }
+
+    #[test]
+    fn heartbeat_gaps_are_said_once() {
+        let mut gap = Gap::default();
+        // Ten counts a second.
+        let mut see = |beat, now| gap.see(beat, now, 10);
+        assert_eq!(see(0, 5), None, "no heartbeat yet");
+        assert_eq!(see(10, 10), None, "the first");
+        assert_eq!(see(20, 20), None, "a second later");
+        assert_eq!(see(20, 219), None, "19.9 s");
+        assert_eq!(see(20, 220), Some(Heard::Stalled(20.0)));
+        assert_eq!(see(20, 300), None, "said once a gap");
+        assert_eq!(see(330, 330), Some(Heard::Late(31.0, 31.0)));
+        assert_eq!(see(340, 340), None, "a second");
+        assert_eq!(see(400, 400), Some(Heard::Late(6.0, 31.0)));
+        assert_eq!(
+            see(400, 600),
+            Some(Heard::Stalled(20.0)),
+            "a new gap says it again"
+        );
     }
 }
