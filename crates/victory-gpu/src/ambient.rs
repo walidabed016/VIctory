@@ -11,8 +11,10 @@
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Replaced, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` turns it on (0.6, say; 0 is no indirect diffuse
-//! light at all); off by default, the title's own output.
+//! `VICTORY_AMBIENT=<level>` sets it (0.6, say). It is 0 by default: no
+//! indirect diffuse light at all, so a room is lit by the sun alone, as
+//! DexNom 2e01ab4 draws the cell (runs 153 and 155). Anything that is not a
+//! level (`VICTORY_AMBIENT=title`) keeps the title's own output.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 //!
 //! The same program writes the probes' light for reflections too, as plain
@@ -21,8 +23,8 @@
 //! walls, bunks and ceilings (runs 116 to 118; most likely the sky, which
 //! every ray of the acceleration structure sees, the translation answering
 //! them as misses). `VICTORY_AMBIENT_REFLECTED=<level>` replaces that image
-//! by the constant as well (0: no light from the probes in reflections); off
-//! by default.
+//! by the constant as well; 0 by default (no light from the probes in
+//! reflections), and `VICTORY_AMBIENT_REFLECTED=title` keeps the title's.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -41,21 +43,25 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// The constant (0.6 looked balanced in run a2); `None` if off.
+/// The constant (0.6 looked balanced in run a2); `None` for the title's own
+/// output.
 pub(crate) fn level() -> Option<f32> {
     static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
     *LEVEL.get_or_init(|| setting("VICTORY_AMBIENT"))
 }
 
-/// The constant for the probes' light in reflections; `None` if off.
+/// The constant for the probes' light in reflections; `None` for the
+/// title's own output.
 pub(crate) fn reflected() -> Option<f32> {
     static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
     *LEVEL.get_or_init(|| setting("VICTORY_AMBIENT_REFLECTED"))
 }
 
 fn setting(name: &str) -> Option<f32> {
-    std::env::var(name)
-        .ok()?
+    let Ok(value) = std::env::var(name) else {
+        return Some(0.0);
+    };
+    value
         .trim()
         .parse()
         .ok()
