@@ -3415,6 +3415,18 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always (Belobug 03629f3; off with
+    /// `VICTORY_NO_BELOBUG=quad`). At a triangle's edge the quad's other
+    /// pixels are helpers (and so are discarded ones), which only quad reads
+    /// see: wave reads give 0 from them, so a derivative taken by hand
+    /// (`quad_perm`) was the whole value there, the texture read that used
+    /// it took its smallest level, and the triangles' edges showed as lines
+    /// on car paint, glass and skin.
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel && super::belobug("quad")
+    }
+
     /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
     /// a helper lane takes its own value instead (Belobug f520772, upstream
     /// 0601955; off with `VICTORY_NO_BELOBUG=readfirstlane`).
@@ -3574,7 +3586,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let mut r = if mesh_quad {
+            let mut r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6272,7 +6284,7 @@ impl<'a> Lower<'a> {
             }
             _ => (inside, zero),
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
