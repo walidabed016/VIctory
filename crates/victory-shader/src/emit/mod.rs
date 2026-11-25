@@ -418,6 +418,20 @@ pub fn mask_scc() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_SCC").is_some())
 }
 
+/// Whether a lane mask joined with numbers and read as data (a loop that
+/// starts from a mask and goes on with what it computes from it, as a
+/// scalar walk over a mask's lanes) takes the mask as the number it is,
+/// the ballot of its lanes where it is written, in compute code whose host
+/// lanes are the console's (wave32 code joining so now runs on them);
+/// refused otherwise (halves keep their ways). DexNom 570a941 (its numeric
+/// phis' lane-mask case). Off unless `VICTORY_MASK_JOINS` is set. The value
+/// is part of the translation, so the shader cache must key on it
+/// (`victory-gpu`'s does).
+pub fn mask_joins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_JOINS").is_some())
+}
+
 /// Whether buffer loads of a byte or short (`buffer_load_ubyte`,
 /// `buffer_load_ushort` and their signed forms) are translated, as the
 /// dword holding them shifted and extended; refused otherwise. On unless
