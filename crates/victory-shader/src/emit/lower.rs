@@ -5396,8 +5396,9 @@ impl<'a> Lower<'a> {
         let size_only = count == 8
             && super::size_only_textures()
             && used.is_none_or(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav));
-        let bases = &self.x.res.bvh_bases;
-        let bvh = inst.writes.iter().any(|w| bases.contains(&w.1));
+        // shortcut: in a program that intersects rays, a descriptor read
+        // only as data is an acceleration structure's (its address).
+        let bvh = self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().starts_with("image_bvh"));
         let ui = match found {
             Some((at, _)) => Some(&self.x.p.blocks[at.0].insts[at.1]),
             None if size_only && !bvh => None,
