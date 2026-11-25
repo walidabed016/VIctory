@@ -486,6 +486,29 @@ fn lane_merges() -> bool {
     })
 }
 
+/// Copy-back reads title memory into a piece buffer each of its threads
+/// keeps ([`KEPT_PIECE`]) rather than one allocated and zeroed for every
+/// range it writes back: run 155's copy-back spent a third of its work in
+/// those allocations, contended by its threads on the heap.
+/// `VICTORY_NO_KEPT_PIECE` allocates one for each range again.
+fn kept_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_KEPT_PIECE").is_none();
+        if !on {
+            tracing::info!(
+                "copy-back allocates a piece buffer for each range (VICTORY_NO_KEPT_PIECE)"
+            );
+        }
+        on
+    })
+}
+
+thread_local! {
+    /// This thread's piece buffer for copy-back ([`kept_pieces`]).
+    static KEPT_PIECE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 /// The 32 bits of `bits` from bit `at` (clear past its end).
 fn bits_at(bits: &[u32], at: usize) -> u32 {
     let (i, s) = (at / 32, at % 32);
@@ -1464,7 +1487,14 @@ impl Shadow {
             })
             .concat(),
         };
-        let mut title = vec![0u8; PIECE];
+        let mut title = if kept_pieces() {
+            KEPT_PIECE.take()
+        } else {
+            Vec::new()
+        };
+        if title.len() < PIECE {
+            title = vec![0u8; PIECE];
+        }
         let (mut written, mut synced) = (0, Vec::new());
         for i in changed {
             let (at, host, n) = pieces[i];
@@ -1579,6 +1609,9 @@ impl Shadow {
                     .unwrap_or_else(|e| e.into_inner())
                     .push((start + at + a, start + at + b));
             }
+        }
+        if kept_pieces() {
+            KEPT_PIECE.set(title);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::cost(
