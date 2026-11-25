@@ -4,7 +4,7 @@
 //! signals the title fences queues signalled after it. Meanwhile the title
 //! thread prepares the next one, and waits only where a step would touch
 //! memory a submission still in flight writes or reads, for one of its
-//! lists still in flight, or for room ([`DEPTH`]).
+//! lists still in flight, or for room ([`depth`]).
 //!
 //! Off unless `VICTORY_PIPELINED=1` and the host copies keep their
 //! copy-back state per submission ([`READY`]); never with
@@ -26,9 +26,24 @@ mod trace;
 /// submission back while the next is prepared would undo title writes.
 const READY: bool = true;
 
-/// Submissions queued and not yet completed, at most: one copying back,
-/// one on the GPU, one queued behind it.
-pub(crate) const DEPTH: usize = 3;
+/// The most [`depth`] can be: the submission slots host copies keep
+/// copy-back state for.
+pub(crate) const DEPTH: usize = 8;
+
+/// Submissions queued and not yet completed, at most: by default 3 (one
+/// copying back, one on the GPU, one queued behind it), else
+/// `VICTORY_PIPELINE_DEPTH`, 1 to [`DEPTH`]. Each level more holds one more
+/// submission's host lists, upload memory, twin copy lists, snapshots and
+/// twin compare buffers until it completes.
+pub(crate) fn depth() -> usize {
+    static DEPTH_SET: OnceLock<usize> = OnceLock::new();
+    *DEPTH_SET.get_or_init(|| depth_from(std::env::var("VICTORY_PIPELINE_DEPTH").ok().as_deref()))
+}
+
+fn depth_from(set: Option<&str>) -> usize {
+    set.and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(3, |d| d.clamp(1, DEPTH))
+}
 
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -45,7 +60,7 @@ pub(crate) fn on() -> bool {
             tracing::warn!("VICTORY_PIPELINED needs copy-back state per submission; off");
             return false;
         }
-        tracing::info!(depth = DEPTH, "pipelined submissions");
+        tracing::info!(depth = depth(), "pipelined submissions");
         true
     })
 }
@@ -449,8 +464,8 @@ impl Pipeline {
         if let Some(seq) = s.flying.iter().rev().find(|f| listed(f)).map(|f| f.seq) {
             s = self.wait(s, seq, Why::List);
         }
-        if s.flying.len() >= DEPTH {
-            let seq = s.flying[s.flying.len() - DEPTH].seq;
+        if s.flying.len() >= depth() {
+            let seq = s.flying[s.flying.len() - depth()].seq;
             s = self.wait(s, seq, Why::Depth);
         }
         #[cfg(feature = "diagnostics")]
@@ -605,13 +620,13 @@ fn signal_fence(fence: usize, value: u64) {
 }
 
 /// Before preparing a submission of `lists` (host list addresses): waits
-/// for room and for those lists. The submission's slot, below [`DEPTH`]:
+/// for room and for those lists. The submission's slot, below [`depth`]:
 /// its lists of its own (twin copies) are free again.
 pub(crate) fn room(lists: impl IntoIterator<Item = usize>) -> usize {
     if !on() {
         return 0;
     }
-    (PIPELINE.room(&lists.into_iter().collect::<Vec<_>>()) % DEPTH as u64) as usize
+    (PIPELINE.room(&lists.into_iter().collect::<Vec<_>>()) % depth() as u64) as usize
 }
 
 /// A submission is queued: `job` waits for it and completes it, after the
@@ -1246,17 +1261,26 @@ mod tests {
     }
 
     #[test]
+    fn depth_is_3_unless_set_and_stays_within_the_slots() {
+        assert_eq!(depth_from(None), 3);
+        assert_eq!(depth_from(Some("x")), 3);
+        assert_eq!(depth_from(Some(" 6 ")), 6);
+        assert_eq!(depth_from(Some("0")), 1);
+        assert_eq!(depth_from(Some("64")), DEPTH);
+    }
+
+    #[test]
     fn room_waits_for_depth_and_for_lists_in_flight() {
         let p = pipeline();
         let mut gos = Vec::new();
-        for list in 0..DEPTH {
+        for list in 0..depth() {
             let (go, job) = held();
             p.launch(Vec::new(), Vec::new(), vec![list], job);
             gos.push(go);
         }
         let mut gos = gos.into_iter();
         let (first, second) = (gos.next().unwrap(), gos.next().unwrap());
-        blocks_until(move || assert_eq!(p.room(&[99]), DEPTH as u64 + 1), first);
+        blocks_until(move || assert_eq!(p.room(&[99]), depth() as u64 + 1), first);
         blocks_until(
             move || {
                 p.room(&[1]);
