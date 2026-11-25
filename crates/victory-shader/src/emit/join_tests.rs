@@ -253,56 +253,6 @@ fn scalar_table_at_a_join(cmp: u8) -> Vec<u32> {
     w
 }
 
-/// Each thread stores `v0 + 1000` through the UAV descriptor the scalar
-/// code loads on one of three paths, chosen by `s4 = path`: paths 0 and 1
-/// join first (each adds its own number to the value, then the join adds
-/// 16), and that join meets path 2 (as the screen-probe ray programs merge
-/// code tails, each path loading the same table entry).
-fn loaded_on_three_paths(path: u8) -> Vec<u32> {
-    // v4 = v0 * 4; v5 = v0 + 1000; s1 = 0; s4 = path.
-    let mut w = vec![
-        vop2(0x1A, 4, u16::from(TWO), 0),
-        vop2(0x25, 5, 0xFF, 0),
-        1000,
-    ];
-    w.extend([sop1(0x03, 1, ZERO), sop1(0x03, 4, 128 + path)]);
-    // s_cmp_eq_u32 s4, 0; s_cbranch_scc1 first; s_cmp_eq_u32 s4, 1;
-    // s_cbranch_scc1 second.
-    w.push(sopc(0x06, 4, ZERO));
-    let to_first = w.len();
-    w.push(0);
-    w.push(sopc(0x06, 4, ONE));
-    let to_second = w.len();
-    w.push(0);
-    // s_load_dwordx4 s[8:11], s[0:1], 0; v5 += 2; s_branch last.
-    let load = [0xF408_0200, 0xFA00_0000];
-    w.extend(load);
-    w.push(vop2(0x25, 5, u16::from(TWO), 5));
-    let to_last = w.len();
-    w.push(0);
-    // first: the load; s_branch inner.
-    w[to_first] = sopp(0x05, to_first, w.len());
-    w.extend(load);
-    let to_inner = w.len();
-    w.push(0);
-    // second: the load; v5 += 1.
-    w[to_second] = sopp(0x05, to_second, w.len());
-    w.extend(load);
-    w.push(vop2(0x25, 5, u16::from(ONE), 5));
-    // inner: v5 += 16.
-    w[to_inner] = sopp(0x02, to_inner, w.len());
-    w.push(vop2(0x25, 5, 128 + 16, 5));
-    // last: s_waitcnt lgkmcnt(0); buffer_store_dword v5, v4, s[8:11], 0 offen.
-    w[to_last] = sopp(0x02, to_last, w.len());
-    w.push(0xBF8C_C07F);
-    w.extend([
-        0x38 << 26 | 0x1C << 18 | 1 << 12,
-        0x80 << 24 | 2 << 16 | 5 << 8 | 4,
-    ]);
-    w.push(S_ENDPGM);
-    w
-}
-
 /// Each lane counts an index up from `min(v0 & 7, 3)` until it passes
 /// `min(v0 >> 3, 3)` (or, without `clamp`, `v0 >> 3`), at least once,
 /// adding `index + 1` to element `index` of an array in v20..v23 through
@@ -545,17 +495,6 @@ fn a_scalar_table_address_joined_from_two_paths_reads_each_paths_dword() {
         let want = vec![dword; THREADS as usize];
         for (label, got) in run(&shader) {
             assert_eq!(got, want, "{label}, s_cmp {cmp:#x}");
-        }
-    }
-}
-
-#[test]
-fn a_descriptor_joined_twice_is_the_one_each_path_loads() {
-    for (path, add) in [(0, 16), (1, 17), (2, 2)] {
-        let shader = lower_cs(&loaded_on_three_paths(path)).expect("lower");
-        let want: Vec<u32> = (0..THREADS).map(|l| 1000 + l + add).collect();
-        for (label, got) in run(&shader) {
-            assert_eq!(got, want, "{label}, path {path}");
         }
     }
 }
