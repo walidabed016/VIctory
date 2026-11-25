@@ -781,11 +781,26 @@ pub(crate) fn arm(
     let mut armed = Vec::new();
     for (a, b) in g.clean.within(first, last.max(first)) {
         for (a, b) in g.protected.within(a, b) {
+            // The journal's pages of the run, walked beside its blocks: a
+            // lookup per block cost more than the rest of arming.
+            let mut pages = j
+                .written
+                .range(a * BLOCK / PAGE..b * BLOCK / PAGE)
+                .peekable();
             let mut run: Option<usize> = None;
             for block in a..=b {
+                let page = block * BLOCK / PAGE;
+                let mut written = 0;
+                while let Some(&(&p, &w)) = pages.peek()
+                    && p <= page
+                {
+                    if p == page {
+                        written = w;
+                    }
+                    pages.next();
+                }
                 let current = block < b && !g.saved.contains_key(&block) && {
-                    let taken = copied(block * BLOCK / PAGE);
-                    let written = j.written.get(&(block * BLOCK / PAGE)).copied().unwrap_or(0);
+                    let taken = copied(page);
                     taken != 0 && written <= taken
                 };
                 match (current, run) {
@@ -1388,6 +1403,122 @@ mod tests {
             VirtualFree(p as *mut _, 0, MEM_RELEASE);
             VirtualFree(h as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// Arming walks the journal's pages beside the blocks and arms what a
+    /// lookup of each block's page armed, over random guard states (at
+    /// addresses nothing maps, so no handler or other test reaches them).
+    #[test]
+    fn arming_walks_the_journal_as_lookups_did() {
+        fn runs(base: usize, next: &mut impl FnMut(usize) -> usize) -> Vec<(usize, usize)> {
+            (0..next(6))
+                .map(|_| {
+                    let a = base + next(48);
+                    (a, a + 1 + next(12))
+                })
+                .collect()
+        }
+        fn as_blocks(runs: &[(usize, usize)]) -> Blocks {
+            let mut blocks = Blocks(BTreeMap::new());
+            for &(a, b) in runs {
+                blocks.insert(a, b);
+            }
+            blocks
+        }
+        let _serial = serial();
+        let base = (1usize << 60) / BLOCK;
+        let span = (base - 2, base + 70);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut arming = 0;
+        for _ in 0..500 {
+            let protected = runs(base, &mut next);
+            let clean = runs(base, &mut next);
+            let saved: Vec<usize> = (0..next(4)).map(|_| base + next(64)).collect();
+            let written: BTreeMap<usize, u64> = (0..next(40))
+                .map(|_| {
+                    let block = span.0 + next(span.1 - span.0);
+                    (block * BLOCK / PAGE, 1 + next(8) as u64)
+                })
+                .collect();
+            let taken: Vec<u64> = (span.0..span.1).map(|_| next(8) as u64).collect();
+            let copied = |page: usize| taken[page - span.0 * BLOCK / PAGE];
+            let start = (base + next(20)) * BLOCK + next(2) * BLOCK / 2;
+            let end = start + next(50) * BLOCK + next(2) * BLOCK / 2;
+
+            // Arming as it was: a lookup of each block's page.
+            let (p, c) = (as_blocks(&protected), as_blocks(&clean));
+            let (first, last) = (start.div_ceil(BLOCK), end / BLOCK);
+            let mut armed = Vec::new();
+            for (a, b) in c.within(first, last.max(first)) {
+                for (a, b) in p.within(a, b) {
+                    let mut run: Option<usize> = None;
+                    for block in a..=b {
+                        let page = block * BLOCK / PAGE;
+                        let current = block < b && !saved.contains(&block) && {
+                            let taken = copied(page);
+                            let written = written.get(&page).copied().unwrap_or(0);
+                            taken != 0 && written <= taken
+                        };
+                        match (current, run) {
+                            (true, None) => run = Some(block),
+                            (false, Some(from)) => {
+                                armed.push((from, block));
+                                run = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let (mut loose, mut at) = (Vec::new(), start / BLOCK);
+            for &(a, b) in &armed {
+                if at < a {
+                    loose.push((at, a));
+                }
+                at = b;
+            }
+            if at < end.div_ceil(BLOCK) {
+                loose.push((at, end.div_ceil(BLOCK)));
+            }
+            arming += usize::from(!armed.is_empty());
+
+            {
+                let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+                j.written.extend(&written);
+                let mut g = guards();
+                for &(a, b) in &protected {
+                    g.protected.insert(a, b);
+                }
+                for &(a, b) in &clean {
+                    g.clean.insert(a, b);
+                }
+                for &block in &saved {
+                    g.saved.insert(block, Vec::new());
+                }
+            }
+            let asked = asking();
+            assert_eq!(arm(start, end, copied), (asked, loose));
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = guards();
+            let g = &mut *g;
+            assert_eq!(
+                g.armed.within(span.0, span.1),
+                as_blocks(&armed).within(span.0, span.1)
+            );
+            let pages = span.0 * BLOCK / PAGE..span.1 * BLOCK / PAGE;
+            j.written.retain(|page, _| !pages.contains(page));
+            g.saved.retain(|block, _| !(span.0..span.1).contains(block));
+            for blocks in [&mut g.protected, &mut g.clean, &mut g.armed] {
+                blocks.remove(span.0, span.1);
+            }
+        }
+        assert!(arming > 100, "{arming} states armed anything");
     }
 
     /// An armed block tells what it held when armed: itself while guarded,
