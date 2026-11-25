@@ -276,39 +276,66 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
-    // After the submissions queued before: they set the real states of
-    // what they draw (`host_transition`).
-    crate::pipelined::drained();
-    #[cfg(all(windows, feature = "diagnostics"))]
-    crate::capture::note_present(frame);
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
-    }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let plane = match planes {
+            0 => None,
+            // SAFETY: the title passes `planes` plane descriptions (null is
+            // tolerated), read now: they live only for the call.
+            _ => unsafe { plane_parameters.as_ref() },
+        };
+        let shown = Shown(
+            plane
+                .filter(|p| p.count > 0 && !p.resources.is_null())
+                // SAFETY: the plane lists `count` resources.
+                .map(|p| unsafe { *p.resources }),
+        );
+        // After the submissions queued before: they set the real states of
+        // what they draw (`host_transition`).
+        if !crate::pipelined::queue_present(Box::new(move || shown.show(frame))) {
+            crate::pipelined::drained();
+            shown.show(frame);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+
+/// The resource a present shows, if any. The title keeps it until a fence
+/// signalled after the present, which a queued present goes before.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct Shown(Option<This>);
+
+// SAFETY: our objects are shared between threads; see above for its life.
+#[cfg(windows)]
+unsafe impl Send for Shown {}
+
+#[cfg(windows)]
+impl Shown {
+    fn show(self, frame: u64) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_present(frame);
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(frame) {
+            crate::capture::dump_targets(frame);
+        }
+        if let Some(resource) = self.0
+            && let Some(texture) = crate::resource::host_resource(resource)
+            && let Some(host) = crate::host::host()
+        {
+            const COPY_SOURCE: u32 = 0x800;
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let shown = host.present(texture, state, frame);
+            crate::resource::host_transition(resource, state);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resource, state, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
+    }
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.

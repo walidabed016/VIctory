@@ -780,6 +780,22 @@ pub(crate) fn queue(lists: Vec<usize>, submit: Submit) -> bool {
     true
 }
 
+/// With the submit thread and `VICTORY_QUEUED_PRESENT=1`, off it: queues
+/// `present` for the submit thread, after the submissions queued before,
+/// so that the title does not wait for them; whether it did.
+pub(crate) fn queue_present(present: Submit) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on =
+            submit_thread() && std::env::var_os("VICTORY_QUEUED_PRESENT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("presents queued for the submit thread (VICTORY_QUEUED_PRESENT)");
+        }
+        on
+    });
+    on && queue(Vec::new(), present)
+}
+
 /// Off the submit thread: waits until the submissions queued for it have
 /// launched.
 pub(crate) fn drained() {
