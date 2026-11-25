@@ -174,16 +174,97 @@ fn fence_met(fence: usize, value: u64) -> bool {
         || crate::pipelined::will_signal(fence as This, value)
 }
 
-/// Whether a queue may pass `wait`: memory holds the value, or, pipelined,
-/// a submission queued or in flight stores it at the bottom of the pipe:
-/// what the queue runs next goes to the host behind that one, which is the
-/// order the wait asks for.
+/// Whether a part a queue held goes to the host as a submission of its own
+/// (`VICTORY_WAITS_APART=1`, as in 52383c8) instead of in the submission
+/// that releases it ([`Batch`]). Apart, run 162 made 19 submissions a
+/// frame instead of run 161's 18, and the GPU time per frame rose from
+/// 37-38 ms to 46-48 ms.
 #[cfg(windows)]
-fn value_met(wait: &crate::list::ValueWait) -> bool {
+fn apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WAITS_APART").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "parts queues held run as submissions of their own (VICTORY_WAITS_APART)"
+            );
+        }
+        on
+    })
+}
+
+/// Host lists (addresses) for one host submission, in order
+/// ([`release_behind`]): with the bottom-of-pipe values they store, and those of
+/// them queues held, taken off [`HELD_LISTS`] once given to the host (so
+/// that a title list reset meanwhile finds them held or in flight).
+#[cfg(windows)]
+#[derive(Default)]
+struct Batch {
+    lists: Vec<usize>,
+    writes: Vec<(usize, u64, usize)>,
+    held: Vec<usize>,
+}
+
+#[cfg(windows)]
+impl Batch {
+    fn add(&mut self, lists: Vec<usize>, held: bool) {
+        for &l in &lists {
+            // SAFETY: live host lists, as in [`Batch::flush`].
+            let list = unsafe { &*(l as *const crate::host::HostList) };
+            self.writes.extend(list.value_writes());
+        }
+        if held {
+            self.held.extend_from_slice(&lists);
+        }
+        self.lists.extend(lists);
+    }
+
+    /// The value the lists leave at `at` (at least `bytes` of it), if
+    /// they store one there.
+    fn stores(&self, at: usize, bytes: usize) -> Option<u64> {
+        let last = self.writes.iter().rev().find(|w| w.0 == at && w.2 >= bytes);
+        last.map(|w| w.1)
+    }
+
+    /// Gives the host the lists as one submission.
+    fn flush(&mut self, host: &crate::host::Host) {
+        if !self.lists.is_empty() {
+            // SAFETY: the title's lists, or lists a queue held: a title list
+            // leaves those to the queues when reset or let go of
+            // (`crate::list`).
+            let runs: Vec<&crate::host::HostList> = self
+                .lists
+                .iter()
+                .map(|&l| unsafe { &*(l as *const _) })
+                .collect();
+            host.submit(&runs);
+            promise(&runs);
+        }
+        self.lists.clear();
+        self.writes.clear();
+        let mut lists = lock(&HELD_LISTS);
+        for l in self.held.drain(..) {
+            if let Some(i) = lists.iter().position(|&h| h == l) {
+                lists.swap_remove(i);
+            }
+        }
+    }
+}
+
+/// Whether a queue may pass `wait`: memory holds the value, or the host
+/// is given a submission that stores it at the bottom of the pipe before
+/// what the queue runs next: `batch`, or, pipelined, one queued or in
+/// flight. The host runs them in order, which is the order the wait asks
+/// for.
+#[cfg(windows)]
+fn value_met(wait: &crate::list::ValueWait, batch: &Batch) -> bool {
     if wait.met() {
         return true;
     }
     let (at, bytes) = wait.place();
+    if let Some(value) = batch.stores(at, bytes) {
+        return wait.holds_for(value);
+    }
     let promised = lock(&PROMISED);
     promised
         .iter()
@@ -220,22 +301,6 @@ fn promise(runs: &[&crate::host::HostList]) {
     }
 }
 
-/// Gives the host host lists (addresses) as one submission, in order.
-#[cfg(windows)]
-fn run(host: &crate::host::Host, lists: &[usize]) {
-    if lists.is_empty() {
-        return;
-    }
-    // SAFETY: held lists are live: their title lists leave them to the
-    // queues when reset or let go of (`crate::list`).
-    let runs: Vec<&crate::host::HostList> = lists
-        .iter()
-        .map(|&l| unsafe { &*(l as *const _) })
-        .collect();
-    host.submit(&runs);
-    promise(&runs);
-}
-
 /// Runs what queues hold as far as their waits are met (`all`: all of it,
 /// waits met or not), each queue's in the order it was given. Called where
 /// a wait may have been met: when a queue is given a submission or a
@@ -249,6 +314,16 @@ pub(crate) fn release_held(all: bool) {
         return;
     };
     let _one = lock(&SUBMITTING);
+    release_behind(host, Batch::default(), all);
+}
+
+/// [`release_held`] behind `batch`, with [`SUBMITTING`] held: what is
+/// released joins the batch, and the host gets it all as one submission,
+/// unless a queue signals in between (the lists before the signal go
+/// first) or [`apart`].
+#[cfg(windows)]
+fn release_behind(host: &crate::host::Host, mut batch: Batch, all: bool) {
+    let mut emptied = Vec::new();
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -256,28 +331,16 @@ pub(crate) fn release_held(all: bool) {
             // SAFETY: a live queue: one let go of runs what it holds first.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
-            // Runs ready, made one submission (and taken off HELD_LISTS once
-            // given to the host, so that a reset finds them held or flying).
-            let mut ready: Vec<usize> = Vec::new();
-            let flush = |ready: &mut Vec<usize>| {
-                run(host, ready);
-                let mut lists = lock(&HELD_LISTS);
-                for l in ready.drain(..) {
-                    if let Some(i) = lists.iter().position(|&h| h == l) {
-                        lists.swap_remove(i);
-                    }
-                }
-            };
             loop {
                 let met = match held.front() {
                     None => break,
                     Some(Held::Fence(fence, value)) => fence_met(*fence, *value),
-                    Some(Held::Value(wait)) => value_met(wait),
+                    Some(Held::Value(wait)) => value_met(wait, &batch),
                     Some(Held::Run(..) | Held::Signal(..)) => true,
                 };
-                if !met && !ready.is_empty() {
+                if !met && apart() && !batch.lists.is_empty() {
                     // What is ready may be what the queue waits for.
-                    flush(&mut ready);
+                    batch.flush(host);
                     continue;
                 }
                 if !met && !all {
@@ -306,25 +369,31 @@ pub(crate) fn release_held(all: bool) {
                             HOLDS[1].fetch_add(us, Ordering::Relaxed);
                             HOLDS[2].fetch_max(us, Ordering::Relaxed);
                         }
-                        ready.extend(lists);
+                        batch.add(lists, true);
                     }
                     Some(Held::Signal(fence, value)) => {
-                        flush(&mut ready);
+                        batch.flush(host);
                         signal_now(fence as This, value);
                         crate::fence::release(fence as This);
                     }
                     Some(Held::Value(_)) | None => {}
                 }
             }
-            flush(&mut ready);
+            if apart() {
+                batch.flush(host);
+            }
             if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+                emptied.push(q);
             }
         }
         if !moved {
             break;
         }
     }
+    batch.flush(host);
+    // Only now that what they held is with the host: until then their
+    // signals and submissions go behind it.
+    lock(&WAITING).retain(|q| !emptied.contains(q));
     sweep();
 }
 
@@ -361,10 +430,11 @@ fn waiting(this: This) {
 }
 
 /// A submission to a queue that keeps the order of waits ([`waits`]): run
-/// now if the queue holds nothing and no list waits for a memory value;
-/// otherwise held, part by part, and run as far as the waits are met.
-/// (Only a queue that holds something is in [`WAITING`], and it leaves it
-/// once what it held was given to the host.)
+/// now if the queue holds nothing and no list waits for a memory value,
+/// with what other queues held for what it stores; otherwise held, part by
+/// part, and run as far as the waits are met. (Only a queue that holds
+/// something is in [`WAITING`], and it leaves it once what it held was
+/// given to the host.)
 #[cfg(windows)]
 fn submit(this: This, host: &crate::host::Host, lists: &[This]) {
     let holding = lock(&WAITING).contains(&(this as usize));
@@ -373,8 +443,19 @@ fn submit(this: This, host: &crate::host::Host, lists: &[This]) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.submit(&runs);
-        promise(&runs);
+        let none = lock(&WAITING).is_empty();
+        if none || apart() {
+            host.submit(&runs);
+            promise(&runs);
+            // What ran may be what another queue waits for.
+            release_held(false);
+        } else {
+            let _one = lock(&SUBMITTING);
+            let mut batch = Batch::default();
+            let lists = runs.iter().map(|&l| std::ptr::from_ref(l) as usize);
+            batch.add(lists.collect(), false);
+            release_behind(host, batch, false);
+        }
     } else {
         let _one = lock(&SUBMITTING);
         let pieces = crate::list::pieces(lists);
@@ -388,9 +469,8 @@ fn submit(this: This, host: &crate::host::Host, lists: &[This]) {
             }
         }
         waiting(this);
+        release_behind(host, Batch::default(), false);
     }
-    // What ran may be what another queue waits for.
-    release_held(false);
     left_holding(this);
 }
 
