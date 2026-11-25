@@ -468,7 +468,52 @@ impl Shadow {
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.shaders_write.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        self.note_written(address, len);
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Diagnostics: counts `[address, address + len)` as given to the
+    /// pipeline being bound to write, by where its shaders reach it
+    /// ([`WRITTEN`]).
+    #[cfg(feature = "diagnostics")]
+    fn note_written(&self, address: u64, len: u64) {
+        let (mut vram, mut system) = (Vec::new(), Vec::new());
+        let mut w = Written {
+            views: 1,
+            ..Written::default()
+        };
+        if self.in_place {
+            w.in_place = len;
+        } else if !self.mirror() {
+            if self.twin.is_some() {
+                w.vram = len;
+            } else {
+                w.system = len;
+            }
+        } else {
+            let m = mirror_state();
+            let end = address + len;
+            for n in address / WINDOW..end.div_ceil(WINDOW) {
+                let bytes = end.min((n + 1) * WINDOW) - address.max(n * WINDOW);
+                if self.twin.is_some() && m.twinned.contains_key(&n) {
+                    w.vram += bytes;
+                    vram.push(n);
+                } else if m.windows.contains_key(&n) {
+                    w.system += bytes;
+                    system.push(n);
+                }
+            }
+        }
+        let pipeline = crate::descriptor::host::BINDING.get();
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = written.entry(pipeline).or_default();
+        e.views += w.views;
+        e.vram += w.vram;
+        e.system += w.system;
+        e.in_place += w.in_place;
+        e.vram_windows.extend(vram);
+        e.system_windows.extend(system);
     }
 
     /// The copy's offsets of the ranges `declared` (address, bytes),
@@ -1568,6 +1613,10 @@ struct Mirror {
     retile: Vec<(u64, u64, Option<VramSlot>)>,
     /// Submissions prepared.
     now: u64,
+    /// Windows submissions used since the last frame-rate line
+    /// (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    hot: std::collections::BTreeSet<u64>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the pool memory is written only
@@ -1588,6 +1637,8 @@ static MIRROR: Mutex<Mirror> = Mutex::new(Mirror {
     fresh: Vec::new(),
     retile: Vec::new(),
     now: 0,
+    #[cfg(feature = "diagnostics")]
+    hot: std::collections::BTreeSet::new(),
 });
 
 fn mirror_state() -> std::sync::MutexGuard<'static, Mirror> {
@@ -1708,6 +1759,8 @@ impl Mirror {
         let now = self.now;
         let mut new = Vec::new();
         for w in std::mem::take(&mut self.wanted) {
+            #[cfg(feature = "diagnostics")]
+            self.hot.insert(w);
             match self.twinned.get_mut(&w) {
                 Some(t) => t.2 = now,
                 None if self.windows.contains_key(&w) => new.push(w),
@@ -2833,6 +2886,94 @@ fn first_warning(address: u64) -> bool {
     warned.len() < 4096 && warned.insert(address)
 }
 
+/// What shaders were given to write since the last frame-rate line, by
+/// title pipeline (diagnostics): views, bytes they reach in VRAM (twins)
+/// and in system memory (copies and mirror windows without a VRAM twin),
+/// bytes of title memory used in place (system memory, never twinned), and
+/// the mirror windows reached in VRAM and in system memory.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Written {
+    views: u64,
+    vram: u64,
+    system: u64,
+    in_place: u64,
+    vram_windows: std::collections::BTreeSet<u64>,
+    system_windows: std::collections::BTreeSet<u64>,
+}
+
+#[cfg(feature = "diagnostics")]
+static WRITTEN: Mutex<BTreeMap<usize, Written>> = Mutex::new(BTreeMap::new());
+
+/// Logs the mirror's twins against the windows submissions used, and the
+/// pipelines that write most outside VRAM with the windows they write
+/// there (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn log_written(frames: f64) {
+    let written = std::mem::take(&mut *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+    let (placed, twinned, heaps, used, used_system) = {
+        let mut m = mirror_state();
+        let used = std::mem::take(&mut m.hot);
+        let system = used
+            .iter()
+            .filter(|w| !m.twinned.contains_key(w) && m.windows.contains_key(w))
+            .count();
+        (
+            m.windows.len(),
+            m.twinned.len(),
+            m.vram.len(),
+            used.len(),
+            system,
+        )
+    };
+    let (mut vram_windows, mut system_windows) = (
+        std::collections::BTreeSet::<&u64>::new(),
+        std::collections::BTreeSet::<&u64>::new(),
+    );
+    for w in written.values() {
+        vram_windows.extend(&w.vram_windows);
+        system_windows.extend(&w.system_windows);
+    }
+    let mib = WINDOW >> 20;
+    tracing::info!(
+        "mirror twins: {placed} windows have host memory, {twinned} VRAM ({} MiB in {heaps} heaps; budget \
+         {} MiB); submissions used {used} windows ({} MiB) since the last line, {used_system} of them \
+         in system memory; shaders were given {} windows in VRAM and {} in system memory to write",
+        twinned as u64 * mib,
+        twin_budget() as u64 * mib,
+        used as u64 * mib,
+        vram_windows.len(),
+        system_windows.len(),
+    );
+    let frames = frames.max(1.0);
+    let mut rows: Vec<_> = written.into_iter().collect();
+    rows.sort_by_key(|(_, w)| std::cmp::Reverse(w.system + w.in_place));
+    for (pipeline, w) in rows
+        .into_iter()
+        .take(16)
+        .filter(|(_, w)| w.system + w.in_place > 0)
+    {
+        let name = crate::pipeline::host_pipeline(pipeline as crate::object::This)
+            .map_or_else(|| format!("{pipeline:#x}"), |p| crate::host::named(&p.name));
+        let windows: Vec<String> = w
+            .system_windows
+            .iter()
+            .take(8)
+            .map(|n| format!("{:#x}", n * WINDOW))
+            .collect();
+        tracing::info!(
+            "shader writes per frame, {name}: {:.1} views; {:.1} MB in VRAM, {:.1} MB in system memory, {:.1} MB \
+             in title memory used in place; {} windows in system memory: {}",
+            w.views as f64 / frames,
+            w.vram as f64 / frames / 1e6,
+            w.system as f64 / frames / 1e6,
+            w.in_place as f64 / frames / 1e6,
+            w.system_windows.len(),
+            windows.join(" "),
+        );
+    }
+}
+
 /// Logs the root views per frame over `frames` frames, and the mirror's
 /// size (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -2857,6 +2998,8 @@ pub(crate) fn log_roots(frames: f64) {
         windows as u64 * (WINDOW >> 20),
         r[Root::Split as usize],
     );
+    #[cfg(feature = "diagnostics")]
+    log_written(frames);
 }
 
 /// The host end of the copy holding host GPU address `va` (tests).
@@ -3030,6 +3173,38 @@ pub(crate) mod tests {
     /// over everything between them, and copies back what the GPU wrote in
     /// overlapping declared ranges once (a range of 20 MiB on several
     /// threads).
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn shader_writes_count_where_shaders_reach_them_by_pipeline() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        // Write-watched memory: the buffer is copied, with a VRAM twin if
+        // the host gave one.
+        let len = 8 * MIB;
+        let at = title_memory(510, 256 * MIB, len, 4 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 11, at as u64, len as u64);
+        let s = find(at as u64, len as u64).unwrap();
+        assert!(!s.in_place && !s.mirror());
+        let pipeline = 0x5eed_0009;
+        crate::descriptor::host::BINDING.set(pipeline);
+        s.note_written(at as u64, 2 * MIB as u64);
+        s.note_written(at as u64 + MIB as u64, MIB as u64);
+        crate::descriptor::host::BINDING.set(0);
+        let w = WRITTEN.lock().unwrap().remove(&pipeline).unwrap();
+        let (reached, other) = if s.twin.is_some() {
+            (w.vram, w.system)
+        } else {
+            (w.system, w.vram)
+        };
+        assert_eq!(
+            (w.views, reached, other, w.in_place),
+            (2, 3 * MIB as u64, 0, 0)
+        );
+    }
+
     #[test]
     fn a_buffer_copy_keeps_a_snapshot_per_region_shaders_write() {
         let _serial = crate::watch::serial();

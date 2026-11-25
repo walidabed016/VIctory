@@ -629,21 +629,29 @@ fn log_gpu_times(frames: f64) {
         .map(|(kind, (ms, n))| format!("{kind} {:.2} ms {:.1}x", ms / frames, *n as f64 / frames))
         .collect();
     tracing::info!("GPU time per frame by command: {}", kinds.join("; "));
-    let names = shader_names();
     let mut labels: Vec<_> = t.by_label.iter().collect();
     labels.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     for (label, (ms, n, longest)) in labels.into_iter().take(40) {
-        let named: Vec<&str> = label
-            .split(|c: char| !c.is_ascii_hexdigit())
-            .filter(|w| w.len() == 16)
-            .filter_map(|hash| names.get(hash).map(String::as_str))
-            .collect();
         tracing::info!(
-            "GPU time per frame: {:.2} ms in {:.1} commands (longest {longest:.2} ms): {label} {named:?}",
+            "GPU time per frame: {:.2} ms in {:.1} commands (longest {longest:.2} ms): {}",
             ms / frames,
             *n as f64 / frames,
+            named(label),
         );
     }
+}
+
+/// A label with the names of the shaders whose hashes it holds, from
+/// `VICTORY_SHADER_NAMES` (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn named(label: &str) -> String {
+    let names = shader_names();
+    let named: Vec<&str> = label
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .filter(|w| w.len() == 16)
+        .filter_map(|hash| names.get(hash).map(String::as_str))
+        .collect();
+    format!("{label} {named:?}")
 }
 
 /// Logs the host GPU's memory use against the budgets the OS gives the
