@@ -367,6 +367,10 @@ struct Guards {
     /// Blocks armed for the submission's copy-back ([`arm`]): the first
     /// write to one saves its bytes before it is opened.
     armed: Blocks,
+    /// Of those, the ones each submission slot armed, which its copy-back
+    /// disarms ([`disarm`]). Submissions in flight at once arm blocks
+    /// apart: one that writes a range waits for those in flight writing it.
+    slots: [Blocks; crate::pipelined::DEPTH],
     /// Those saved, by block.
     saved: BTreeMap<usize, Vec<u8>>,
     /// Write-watched title memory guarded instead ([`title_memory_watched`]).
@@ -385,6 +389,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: Blocks(BTreeMap::new()),
     clean: Blocks(BTreeMap::new()),
     armed: Blocks(BTreeMap::new()),
+    slots: [const { Blocks(BTreeMap::new()) }; crate::pipelined::DEPTH],
     saved: BTreeMap::new(),
     pools: Blocks(BTreeMap::new()),
     held: Blocks(BTreeMap::new()),
@@ -812,10 +817,11 @@ fn save(g: &mut Guards, from: usize, to: usize) {
 /// bytes lack, which a copy that took it would put back over the title's
 /// next write (runs 57, 60 and 64). Blocks the runtime is unmapping are
 /// not armed. Returns the asking now and the runs of blocks of the range
-/// not armed.
+/// not armed. For the submission in `slot` ([`crate::shadow::preparing`]).
 pub(crate) fn arm(
     start: usize,
     end: usize,
+    slot: usize,
     copied: impl Fn(usize) -> u64,
 ) -> (u64, Vec<(usize, usize)>) {
     #[cfg(feature = "diagnostics")]
@@ -871,6 +877,9 @@ pub(crate) fn arm(
     }
     for &(a, b) in &armed {
         g.armed.insert(a, b);
+    }
+    for &(a, b) in &armed {
+        g.slots[slot].insert(a, b);
     }
     let (mut loose, mut at) = (Vec::new(), start / BLOCK);
     for (a, b) in armed {
@@ -954,11 +963,19 @@ pub(crate) fn describe(block: usize, asked: u64) -> String {
     )
 }
 
-/// After a submission's copy-back: nothing is armed.
-pub(crate) fn disarm() {
+/// After the copy-back of the submission in `slot`: the blocks it armed
+/// are armed no more, and their saved bytes go. Those of submissions still
+/// in flight stay.
+pub(crate) fn disarm(slot: usize) {
     let mut g = guards();
-    g.armed = Blocks(BTreeMap::new());
-    g.saved.clear();
+    let runs = std::mem::take(&mut g.slots[slot].0);
+    for (a, b) in runs {
+        g.armed.remove(a, b);
+        let saved: Vec<usize> = g.saved.range(a..b).map(|(&block, _)| block).collect();
+        for block in saved {
+            g.saved.remove(&block);
+        }
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -1619,7 +1636,7 @@ mod tests {
                 }
             }
             let asked = asking();
-            assert_eq!(arm(start, end, copied), (asked, loose));
+            assert_eq!(arm(start, end, 0, copied), (asked, loose));
             let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
             let mut g = guards();
             let g = &mut *g;
@@ -1630,7 +1647,12 @@ mod tests {
             let pages = span.0 * BLOCK / PAGE..span.1 * BLOCK / PAGE;
             j.written.retain(|page, _| !pages.contains(page));
             g.saved.retain(|block, _| !(span.0..span.1).contains(block));
-            for blocks in [&mut g.protected, &mut g.clean, &mut g.armed] {
+            for blocks in [
+                &mut g.protected,
+                &mut g.clean,
+                &mut g.armed,
+                &mut g.slots[0],
+            ] {
                 blocks.remove(span.0, span.1);
             }
         }
@@ -1664,7 +1686,7 @@ mod tests {
         unsafe { std::slice::from_raw_parts_mut(v as *mut u8, 4 * BLOCK).fill(1) };
         forget_asked();
         let (now, _) = writes(v, v + 4 * BLOCK, true).expect("view memory");
-        let (asked, loose) = arm(v, v + 4 * BLOCK, |_| now);
+        let (asked, loose) = arm(v, v + 4 * BLOCK, 0, |_| now);
         assert!(loose.is_empty());
         let b = v / BLOCK;
         let ones = vec![1u8; BLOCK];
@@ -1676,7 +1698,7 @@ mod tests {
         assert_eq!(before(b + 2, asked), Some(ones.clone()));
         wrote(v + 3 * BLOCK, v + 4 * BLOCK);
         assert_eq!(before(b + 3, asked), None);
-        disarm();
+        disarm(0);
         assert_eq!(before(b, asked), None);
         title_memory_remapped(v, 4 * BLOCK);
         // The view stays: the journal keeps its pages, which another test
@@ -1718,7 +1740,7 @@ mod tests {
             unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
         });
         assert!(guards().protected.within(b, b + 2).is_empty());
-        let (_, loose) = arm(v, v + 2 * BLOCK, |_| now);
+        let (_, loose) = arm(v, v + 2 * BLOCK, 0, |_| now);
         assert_eq!(loose, vec![(b, b + 2)]);
         assert!(guards().armed.within(b, b + 2).is_empty());
         // The addresses stay taken: the journal keeps their pages, which
@@ -1755,7 +1777,7 @@ mod tests {
         unsafe { std::slice::from_raw_parts_mut(v as *mut u8, BLOCK).fill(3) };
         forget_asked();
         let (now, _) = writes(v, v + BLOCK, true).expect("view memory");
-        let (_, loose) = arm(v, v + BLOCK, |_| now);
+        let (_, loose) = arm(v, v + BLOCK, 0, |_| now);
         assert!(loose.is_empty());
         let b = v / BLOCK;
         let mut seen = None;
@@ -1768,7 +1790,7 @@ mod tests {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ })
         });
         assert_eq!(in_place(b, &mut seen, || unreachable!()), None::<u8>);
-        disarm();
+        disarm(0);
         // The address stays taken: the journal keeps its pages, which
         // another test given it would read as its own.
         // SAFETY: a reservation of the free range.
@@ -1807,7 +1829,7 @@ mod tests {
         let (now, _) = writes(v, v + 2 * BLOCK, true).expect("view memory");
         // The first block armed (and saved when the unmapping begins), the
         // second not.
-        let (_, loose) = arm(v, v + BLOCK, |_| now);
+        let (_, loose) = arm(v, v + BLOCK, 0, |_| now);
         assert!(loose.is_empty());
         let b = v / BLOCK;
         let mut seen = None;
@@ -1822,7 +1844,7 @@ mod tests {
                 // A copy asks again before the view goes: guarded again.
                 forget_asked();
                 let (now, _) = writes(v, v + 2 * BLOCK, true).expect("view memory");
-                let (_, loose) = arm(v, v + 2 * BLOCK, |_| now);
+                let (_, loose) = arm(v, v + 2 * BLOCK, 0, |_| now);
                 let ours = writing_in_place(v, 2 * BLOCK, |ours| ours);
                 let read = in_place::<u8>(b, &mut seen, || unreachable!());
                 tx.send((loose, ours, read)).unwrap();
@@ -2193,10 +2215,10 @@ mod tests {
         physical_pages_writing(PAGES + 1, 1);
         assert_eq!(written_blocks(x, 2), [1]);
         assert_eq!(written_blocks(x, 2), [1]);
-        let (_, loose) = arm(x, x + 2 * BLOCK, |_| u64::MAX - 1);
+        let (_, loose) = arm(x, x + 2 * BLOCK, 0, |_| u64::MAX - 1);
         let b = x / BLOCK;
         assert_eq!(loose, [(b + 1, b + 2)]);
-        disarm();
+        disarm(0);
         // SAFETY: the runtime's view, not guarded.
         unsafe { ((y + BLOCK + 8) as *mut u32).write(5) };
         physical_pages_written(PAGES + 1, 1);

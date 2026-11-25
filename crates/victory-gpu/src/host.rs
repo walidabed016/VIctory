@@ -815,6 +815,8 @@ struct Done {
     back: Vec<crate::shadow::Declared>,
     /// The twin compares that tell which blocks they left alone.
     compares: Option<Vec<crate::shadow::Compare>>,
+    /// Its slot ([`crate::pipelined::room`]): the copy-back state it uses.
+    slot: usize,
 }
 
 /// Pipelined (WAL-17): a submission the completion thread waits for and
@@ -1095,13 +1097,13 @@ impl Host {
     }
 
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        // One submission at a time from preparation to copy-back: snapshots
-        // and the ranges shaders write are per host copy, not per submission
-        // (pipelined, one prepared at a time: `crate::pipelined`).
+        // One submission prepared at a time; pipelined, copies keep what
+        // copy-back needs per submission slot (`crate::shadow::preparing`).
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // Pipelined (WAL-17): room for one more in flight and none of these
         // lists still in flight; the slot picks the twin copies' lists.
         let slot = crate::pipelined::room(runs.iter().map(|l| std::ptr::from_ref(*l) as usize));
+        crate::shadow::preparing(slot);
         let retired = std::mem::take(&mut *self.retired.lock().unwrap_or_else(|e| e.into_inner()));
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1169,7 +1171,7 @@ impl Host {
                 up
             }));
             let kept = self.twin_list(3 * slot + 1, |l| {
-                compares = crate::shadow::snapshot_twins(l, &back);
+                compares = crate::shadow::snapshot_twins(l, &back, slot);
                 compares.as_ref().map_or(0, |c| c.len() as u64)
             });
             if kept.is_none() {
@@ -1178,7 +1180,7 @@ impl Host {
             twins_before.extend(kept);
             twins_after = self.twin_list(3 * slot + 2, |l| match &compares {
                 Some(c) => {
-                    compared = crate::shadow::compare_twins(l, c);
+                    compared = crate::shadow::compare_twins(l, c, slot);
                     compared
                 }
                 None => {
@@ -1229,6 +1231,7 @@ impl Host {
             prepared,
             back,
             compares,
+            slot,
         };
         if crate::pipelined::on() {
             self.launch(runs, *submitted, done);
@@ -1320,6 +1323,7 @@ impl Host {
             retired,
             back,
             compares,
+            slot,
             ..
         } = done;
         // Retired before this submission: no submission still runs that
@@ -1350,15 +1354,15 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let _charged = crate::copystat::charge(crate::copystat::Caller::CopyBack);
         let unchanged = match &compares {
-            Some(compares) => crate::shadow::unchanged(compares, back.len()),
+            Some(compares) => crate::shadow::unchanged(compares, back.len(), slot),
             None => vec![std::collections::HashSet::new(); back.len()],
         };
         for ((shadow, declared), unchanged) in back.iter().zip(&unchanged) {
-            let written = shadow.copy_back(declared, unchanged);
+            let written = shadow.copy_back(declared, unchanged, slot);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             crate::shadow::touched(shadow);
         }
-        crate::watch::disarm();
+        crate::watch::disarm(slot);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
