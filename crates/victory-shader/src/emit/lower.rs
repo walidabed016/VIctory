@@ -365,9 +365,7 @@ enum MaskData {
     /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
     Host,
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
-    /// console's but no host wave size can be declared. Only whether a mask
-    /// has a lane set is read (`s_bcnt1_i32_b64`'s SCC, as in a test that
-    /// a value is uniform), not its count.
+    /// console's but no host wave size can be declared.
     None,
 }
 
@@ -1338,13 +1336,7 @@ impl<'a> Lower<'a> {
             }
             Shape::F16Sum(src, mask, ident, high) => return self.f16_sum(src, mask, ident, high),
         };
-        // Mesh programs run on the host's waves: a minimum, maximum, AND or
-        // OR over them is one the console's could give a subset of its
-        // lanes (as a waterfall over the distinct values of a lane value
-        // takes it), but a sum or prefix counts lanes per wave.
-        if self.mask_data == MaskData::None
-            && (prefix.is_some() || matches!(op, Op::AddU | Op::AddF | Op::Xor))
-        {
+        if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
         let c = self.cur;
@@ -4005,7 +3997,7 @@ impl<'a> Lower<'a> {
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
                     )
             }
-            MaskData::None => name == "s_bcnt1_i32_b64",
+            MaskData::None => false,
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
@@ -4284,13 +4276,7 @@ impl<'a> Lower<'a> {
                         .s
                         .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
                     let r = self.s.m.bin(c, Bin::Add, na, nb);
-                    // Mesh programs: whether any lane is set means the
-                    // same on any wave, the count does not.
-                    let count = match self.mask_data {
-                        MaskData::None => Val::Missing(LANE_MASK),
-                        _ => Val::I32(r),
-                    };
-                    self.set(lo, count);
+                    self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
                     self.set(scc, Val::Bit(s));
