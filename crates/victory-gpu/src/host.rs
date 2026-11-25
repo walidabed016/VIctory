@@ -922,6 +922,8 @@ impl Pending {
             .value
             .is_some_and(|value| unsafe { host.fence.GetCompletedValue() } >= value);
         if let Some(value) = self.value {
+            #[cfg(feature = "diagnostics")]
+            crate::progress::wait(&host.fence, value);
             // SAFETY: the fence is ours; without an event the call returns
             // once the fence reaches the value.
             let waited = unsafe { host.fence.SetEventOnCompletion(value, HANDLE::default()) };
@@ -1593,10 +1595,11 @@ impl Host {
         }
         // SAFETY: the fence and event are ours.
         unsafe {
-            let waited = self
-                .queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+            let waited = self.queue.Signal(&self.fence, *submitted).and_then(|()| {
+                #[cfg(feature = "diagnostics")]
+                crate::progress::wait(&self.fence, *submitted);
+                self.fence.SetEventOnCompletion(*submitted, self.event)
+            });
             match waited {
                 Ok(()) => {
                     WaitForSingleObject(self.event, INFINITE);

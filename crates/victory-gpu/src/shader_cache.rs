@@ -48,7 +48,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// through compares and loads that do not read them as data, whether
 /// coherent memory accesses stay coherent, whether selects on lane masks
 /// held as numbers translate, whether a lane's loops share a count of
-/// passes, whether byte and short buffer stores translate, whether vector
+/// passes and how many, whether byte and short buffer stores translate, whether vector
 /// addresses joined in two blocks do, and how mesh programs take wave
 /// operations).
 fn build() -> &'static [u8; 32] {
@@ -84,7 +84,19 @@ fn build() -> &'static [u8; 32] {
             );
         }
         let mesh = [mesh as u8];
-        *blake3::hash(&[translator, &limit.to_le_bytes(), off, &small, &mesh].concat()).as_bytes()
+        let budget = victory_shader::emit::loop_budget_passes().to_le_bytes();
+        *blake3::hash(
+            &[
+                translator,
+                &limit.to_le_bytes(),
+                off,
+                &small,
+                &mesh,
+                &budget,
+            ]
+            .concat(),
+        )
+        .as_bytes()
     })
 }
 

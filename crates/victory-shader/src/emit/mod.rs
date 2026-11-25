@@ -308,7 +308,7 @@ pub fn mask_numbers() -> bool {
 
 /// Whether a lane's loops share one count of passes besides each loop's
 /// own (per entry, [`loop_limit`]): a lane that has gone back
-/// [`DEFAULT_LOOP_BUDGET`] times in all, in a program with a loop that
+/// [`loop_budget_passes`] times in all, in a program with a loop that
 /// can wait on memory, or [`loop_limit`] times in any other, leaves the
 /// program as a loop stopped by its limit does. Per-entry limits multiply
 /// in nested loops: XboxBvhBuilder's FindTreelets nests two loops that can
@@ -319,6 +319,21 @@ pub fn mask_numbers() -> bool {
 pub fn loop_budget() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_BUDGET").is_some())
+}
+
+/// The passes [`loop_budget`] allows a lane in all in a program with a loop
+/// that can wait on memory: `VICTORY_LOOP_BUDGET`'s value when it is a
+/// number above 1, else [`DEFAULT_LOOP_BUDGET`]. Part of the translation,
+/// so the shader cache must key on it (`victory-gpu`'s does).
+pub fn loop_budget_passes() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| {
+        std::env::var("VICTORY_LOOP_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 1)
+            .unwrap_or(DEFAULT_LOOP_BUDGET)
+    })
 }
 
 /// Whether buffer stores of a byte or short (`buffer_store_byte`,

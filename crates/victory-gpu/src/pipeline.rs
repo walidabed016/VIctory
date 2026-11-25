@@ -490,6 +490,41 @@ pub(crate) fn is_builder(this: This) -> bool {
             .any(|shader| BVH_BUILDERS.contains(&shader.hash.as_str()))
 }
 
+/// `VICTORY_WAIT_BUILDER`: the BVH builders' host pipelines are started when
+/// the title creates them, and a dispatch whose pipeline is not made yet
+/// waits for it however long that takes instead of being dropped
+/// ([`make::ready`]). Off unless set.
+#[cfg(windows)]
+fn wait_builder() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_BUILDER").is_some())
+}
+
+/// Warns, once per pipeline, of a BVH builder dispatch dropped and why: the
+/// builder's passes after it then work on a broken tree.
+#[cfg(windows)]
+pub(crate) fn builder_dropped(this: This, why: &str) {
+    static TOLD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    if !is_builder(this) {
+        return;
+    }
+    let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if told.contains(&(this as usize)) {
+        return;
+    }
+    told.push(this as usize);
+    let why = match why {
+        "" => make::state(&pipeline(this).host),
+        why => why,
+    };
+    tracing::warn!(
+        frame = crate::frame::current(),
+        shaders = ?pipeline(this).shaders,
+        why,
+        "a BVH builder dispatch dropped"
+    );
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -636,7 +671,12 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let must = wait_builder()
+        && shaders
+            .iter()
+            .any(|shader| BVH_BUILDERS.contains(&shader.hash.as_str()));
+    #[cfg(windows)]
+    let host = Arc::new(make::Pending::new(shaders.clone(), graphics, must));
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {

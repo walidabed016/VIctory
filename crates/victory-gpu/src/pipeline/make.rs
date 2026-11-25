@@ -41,6 +41,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Made however long that takes, never dropped for want of time: a
+    /// BVH builder's with `VICTORY_WAIT_BUILDER` (see [`ready`]).
+    must: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -50,7 +53,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        must: bool,
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -66,6 +73,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            must,
         }
     }
 
@@ -106,6 +114,16 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Why `p` has no host pipeline, for a warning: still being made, or
+/// refused (a shader that does not translate, or the host's refusal).
+pub(crate) fn state(p: &Pending) -> &'static str {
+    match p.made.get() {
+        None => "no host pipeline: being made",
+        Some(None) => "no host pipeline: refused",
+        Some(Some(_)) => "its host pipeline did not bind",
+    }
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -130,11 +148,17 @@ pub(crate) fn take_waited() -> Duration {
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// queues it on first use. One that must be made is made by then, on this
+/// thread unless a worker has it already: a BVH builder pass dropped leaves
+/// the passes after it a broken tree, whose climbs ran past every frame
+/// (runs 146 and 148, PrefixSum64 queued behind 2,100 pipelines).
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, true);
-        wait(p, crate::frame::current());
+        match p.must {
+            true => make_here(p),
+            false => wait(p, crate::frame::current()),
+        }
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -159,9 +183,10 @@ fn start(p: &Arc<Pending>, first_use: bool) {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it or it must be made (during loading, so the world's
+/// first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && (p.must || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, false);
     }
@@ -191,6 +216,32 @@ fn wait(p: &Pending, frame: u64) {
     let waited = started.elapsed().as_micros() as u64;
     FRAME_US.fetch_add(waited, Ordering::Relaxed);
     WAITED_US.fetch_add(waited, Ordering::Relaxed);
+}
+
+/// Makes `p` on this thread unless a worker has taken it, else waits for
+/// that worker, however long either takes.
+fn make_here(p: &Pending) {
+    let started = Instant::now();
+    let here = !p.taken.swap(true, Ordering::Relaxed);
+    if here {
+        p.make();
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        held = done.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(held);
+    let waited = started.elapsed();
+    WAITED_US.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    tracing::info!(
+        ms = waited.as_millis() as u64,
+        here,
+        made = matches!(p.made.get(), Some(Some(_))),
+        shaders = ?p.shaders,
+        "a pipeline that must be made waited for at its first use"
+    );
 }
 
 /// Pipelines for the workers: first uses, then those started early.
@@ -286,7 +337,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(Vec::new(), None, false));
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
@@ -296,11 +347,20 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
+    /// A pipeline that must be made is made by the time its first use
+    /// returns (here: no host pipeline for no shaders).
+    #[test]
+    fn a_pipeline_that_must_be_made_is_made_at_first_use() {
+        let p = Arc::new(Pending::new(Vec::new(), None, true));
+        assert!(ready(&p).is_none());
+        assert!(matches!(p.made.get(), Some(None)));
+    }
+
     /// A frame waits for pipelines no longer than its budget, over all its
     /// waits.
     #[test]
     fn frames_wait_at_most_their_budget() {
-        let p = Pending::new(Vec::new(), None);
+        let p = Pending::new(Vec::new(), None, false);
         let started = Instant::now();
         for _ in 0..10 {
             wait(&p, u64::MAX - 1);

@@ -1875,7 +1875,7 @@ impl<'a> Lower<'a> {
         }
         if super::loop_budget() && !self.counters.is_empty() {
             let most = match waiting {
-                true => super::DEFAULT_LOOP_BUDGET.min(super::loop_limit()),
+                true => super::loop_budget_passes().min(super::loop_limit()),
                 false => super::loop_limit(),
             };
             let zero = self.s.m.i32(0);

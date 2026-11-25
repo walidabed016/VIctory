@@ -899,6 +899,7 @@ impl State {
         }
         if crate::pipeline::hangs(self.pipeline as This) {
             once!("a dispatch of a program that hangs the host GPU dropped (VICTORY_RUN_HANGING=1 runs it)");
+            crate::pipeline::builder_dropped(self.pipeline as This, "VICTORY_DROP_HANGING");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -907,6 +908,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            crate::pipeline::builder_dropped(self.pipeline as This, "");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -917,6 +919,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
+            crate::pipeline::builder_dropped(self.pipeline as This, "its bindings did not bind");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -924,8 +927,18 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // Its groups may write arguments later indirect executions read.
         crate::indirect::close(list);
+        #[cfg(feature = "diagnostics")]
+        let mark = crate::progress::before(&list.list, || {
+            format!(
+                "frame {} dispatch {x}x{y}x{z} {}",
+                crate::frame::current(),
+                p.name
+            )
+        });
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        crate::progress::after(&list.list, mark);
         self.twins_back(list);
         if self.ambient(list, p) {
             self.host_heaps = [0; 2];
@@ -1607,6 +1620,9 @@ impl State {
             _ => false,
         };
         if !ran {
+            if kind == DISPATCH {
+                crate::pipeline::builder_dropped(self.pipeline as This, "");
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1627,6 +1643,19 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let mark = (kind == DISPATCH)
+            .then(|| {
+                crate::progress::before(&list.list, || {
+                    let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                        .map_or(String::new(), |p| p.name.clone());
+                    format!(
+                        "frame {} indirect dispatch (at most {max}) {name}",
+                        crate::frame::current()
+                    )
+                })
+            })
+            .flatten();
         // SAFETY: an open list with everything set; the clamped records'
         // buffer is the list's own, the signature is cached.
         unsafe {
@@ -1639,6 +1668,8 @@ impl State {
                 count_at.unwrap_or(0),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::progress::after(&list.list, mark);
         self.twins_back(list);
         if kind == DISPATCH {
             // Its groups may write arguments later executions read.

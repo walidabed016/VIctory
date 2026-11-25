@@ -619,12 +619,12 @@ fn nested_loops_share_the_loop_budget() {
         S_ENDPGM,
     ];
     let shader = build(&w);
-    let budget = crate::emit::DEFAULT_LOOP_BUDGET.min(crate::emit::loop_limit());
+    let budget = crate::emit::loop_budget_passes().min(crate::emit::loop_limit());
     for (label, got) in run(&shader) {
         for x in 0..THREADS {
             let n = got[(x * SLOTS) as usize];
             if crate::emit::loop_budget() {
-                assert!(n < budget && n + 2 * 4096 > budget, "{label}: thread {x} counted {n}");
+                assert!(n <= budget && n + 2 * 4096 > budget, "{label}: thread {x} counted {n}");
             } else {
                 assert_eq!(n, 64 * 4096, "{label}: thread {x}");
             }

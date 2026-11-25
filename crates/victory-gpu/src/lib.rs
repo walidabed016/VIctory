@@ -52,6 +52,8 @@ mod pipelining;
 mod planes;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod progress;
 pub mod query;
 pub mod queue;
 pub mod resource;
