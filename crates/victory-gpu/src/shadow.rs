@@ -761,6 +761,8 @@ impl Shadow {
         unchanged: &std::collections::HashSet<usize>,
     ) -> usize {
         let merged = self.merged(declared);
+        #[cfg(feature = "diagnostics")]
+        lux_copy_back(self, &merged, "before");
         let start = self.start as usize;
         if self.in_place {
             // Shaders wrote title memory (with a twin, the compare stored
@@ -812,9 +814,13 @@ impl Shadow {
             unchanged,
         };
         let mut written = 0;
+        #[cfg(feature = "diagnostics")]
+        let lux_merged = merged.clone();
         for (from, to) in merged {
             written += self.write_back(from, to, &was);
         }
+        #[cfg(feature = "diagnostics")]
+        lux_copy_back(self, &lux_merged, "after");
         // The submission is done with its armed blocks (its copy-back
         // disarms them all).
         kept.clear();
@@ -2984,6 +2990,164 @@ fn first_warning(address: u64) -> bool {
     warned.len() < 4096 && warned.insert(address)
 }
 
+/// The programs that read or write the lux-compression buffers, `[L, 1/L,
+/// M, 1/M]` (diagnostics, WAL-10): TL_PS_PBR_MATERIAL_STANDARD and its
+/// NoDir twin, CS_SkyMain, ps_sun_scattering and CS_ApplyCombinedDeferred
+/// read them; SetLuxCompressionInfo and ComputeLuxCompressionInfo write.
+#[cfg(feature = "diagnostics")]
+const LUX_PROGRAMS: [&str; 7] = [
+    "1cd9bc634417a981",
+    "48e74d16cbfa45e3",
+    "348e1e8c414c7eca",
+    "758649b5598455c8",
+    "577248728544d74b",
+    "9502f5c0e56974af",
+    "441d01cd75dc5d5d",
+];
+
+/// Title addresses of the buffer views [`LUX_PROGRAMS`] bound on capture
+/// frames, and what was logged about them (diagnostics).
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Lux {
+    watched: std::collections::BTreeSet<u64>,
+    logged: std::collections::HashSet<(u64, String, u64, u64)>,
+    lines: u32,
+}
+
+#[cfg(feature = "diagnostics")]
+static LUX: Mutex<Option<Lux>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+static LUX_ON: AtomicBool = AtomicBool::new(false);
+
+/// Lines the lux probe writes at most.
+#[cfg(feature = "diagnostics")]
+const LUX_LINES: u32 = 3000;
+
+/// The watched addresses in `[from, to)`.
+#[cfg(feature = "diagnostics")]
+fn lux_in(watched: &std::collections::BTreeSet<u64>, from: u64, to: u64) -> Vec<u64> {
+    watched.range(from..to).copied().collect()
+}
+
+/// The four words at a title address as title memory holds them, as floats
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn title_words(shadow: &Shadow, address: u64) -> Option<[f32; 4]> {
+    // SAFETY: title memory inside the buffer the copy is of.
+    (shadow.left(address) >= 16).then(|| {
+        unsafe { std::ptr::read_unaligned(address as *const [u32; 4]) }.map(f32::from_bits)
+    })
+}
+
+/// The four words at a title address as the copy holds them (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn copy_words(shadow: &Shadow, address: u64) -> [Option<f32>; 4] {
+    [0, 4, 8, 12].map(|o| shadow.peek(address + o).map(f32::from_bits))
+}
+
+/// Diagnostics (WAL-10): on capture frames, logs each buffer view a lux
+/// program binds, with the first four words title memory and the copy hold
+/// there, and watches its address; on any frame, logs once each unordered
+/// view whose range covers a watched address, by program.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn probe_lux(write: bool, address: u64, len: u64, shadow: &Shadow, own: bool) {
+    let frame = crate::queue::presented() + 1;
+    let listed = crate::capture::listed(frame);
+    if !listed && !(write && LUX_ON.load(Ordering::Relaxed)) {
+        return;
+    }
+    let program = crate::pipeline::host_pipeline(
+        crate::descriptor::host::BINDING.get() as crate::object::This
+    )
+    .map_or("none", |p| p.name.as_str());
+    let capture = listed && LUX_PROGRAMS.iter().any(|h| program.contains(h));
+    if !capture && !write {
+        return;
+    }
+    let mut lux = LUX.lock().unwrap_or_else(|e| e.into_inner());
+    let lux = lux.get_or_insert_with(Lux::default);
+    if capture {
+        lux.watched.insert(address);
+        LUX_ON.store(true, Ordering::Relaxed);
+        if lux.lines < LUX_LINES && lux.logged.insert((frame, program.to_owned(), address, len)) {
+            lux.lines += 1;
+            tracing::info!(
+                frame,
+                program,
+                write,
+                address = format_args!("{address:#x}"),
+                len,
+                copy = format_args!("{:#x}+{:#x}", shadow.start, shadow.len),
+                in_place = shadow.in_place,
+                twin = shadow.twin.is_some(),
+                mirror = shadow.mirror(),
+                loose = shadow.loose,
+                own,
+                title = ?title_words(shadow, address),
+                copied = ?copy_words(shadow, address),
+                "lux probe: a view"
+            );
+        }
+    }
+    if write {
+        for at in lux_in(&lux.watched, address, address + len) {
+            if lux.lines < LUX_LINES && lux.logged.insert((0, program.to_owned(), address, len)) {
+                lux.lines += 1;
+                tracing::info!(
+                    frame,
+                    program,
+                    range = format_args!("{address:#x}+{len:#x}"),
+                    watched = format_args!("{at:#x}"),
+                    "lux probe: shaders are given a range that covers a lux view to write"
+                );
+            }
+        }
+    }
+}
+
+/// Diagnostics (WAL-10): logs the watched lux addresses a copy-back's
+/// declared ranges cover on capture frames, with the words title memory
+/// holds there `when` (before or after it), and before it the copy's (after
+/// it, the copy's locks are held, so the copy is not read).
+#[cfg(feature = "diagnostics")]
+fn lux_copy_back(shadow: &Shadow, merged: &[(usize, usize)], when: &str) {
+    if !LUX_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let frame = crate::queue::presented();
+    if !crate::capture::listed(frame) && !crate::capture::listed(frame + 1) {
+        return;
+    }
+    let mut lux = LUX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(lux) = lux.as_mut() else {
+        return;
+    };
+    let start = shadow.start;
+    for &(from, to) in merged {
+        let (a, b) = (start + from as u64, start + to as u64);
+        for at in lux_in(&lux.watched, a, b) {
+            if lux.lines >= LUX_LINES {
+                return;
+            }
+            lux.lines += 1;
+            tracing::info!(
+                frame,
+                when,
+                watched = format_args!("{at:#x}"),
+                declared = format_args!("{a:#x}+{:#x}", b - a),
+                copy = format_args!("{start:#x}+{:#x}", shadow.len),
+                in_place = shadow.in_place,
+                twin = shadow.twin.is_some(),
+                title = ?title_words(shadow, at),
+                copied = ?(when == "before").then(|| copy_words(shadow, at)),
+                "lux probe: a copy-back covers a lux view"
+            );
+        }
+    }
+}
+
 /// What shaders were given to read or to write (diagnostics): views,
 /// bytes they reach in VRAM (twins) and in system memory (copies, views'
 /// own copies and mirror windows without a VRAM twin), bytes of title
@@ -3666,6 +3830,17 @@ pub(crate) mod tests {
     /// Big splits run on the split threads, started once, not on threads
     /// of their own each time (a thread's start and end run the title
     /// images' thread notices, ~110 ms in the game).
+    /// The lux probe watches a view's address and names the ranges that
+    /// cover it: the start, not the end (diagnostics, WAL-10).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn lux_watch_names_the_addresses_a_range_covers() {
+        let watched: std::collections::BTreeSet<u64> = [0x1000, 0x1010, 0x2000].into();
+        assert_eq!(lux_in(&watched, 0x1000, 0x1010), [0x1000]);
+        assert_eq!(lux_in(&watched, 0x0f00, 0x2001), [0x1000, 0x1010, 0x2000]);
+        assert!(lux_in(&watched, 0x1011, 0x2000).is_empty());
+    }
+
     #[test]
     fn big_splits_run_on_threads_started_once() {
         let mut ran = std::collections::HashSet::new();

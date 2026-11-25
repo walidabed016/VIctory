@@ -1349,6 +1349,16 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         // A view the host cannot make on the copy reads its own.
         let own = crate::descriptor::host::own_copy_of(view, &shadow, (address, len));
         #[cfg(feature = "diagnostics")]
+        if !matches!(*view, View::Constant(..)) {
+            crate::shadow::probe_lux(
+                kind == ResourceType::Uav,
+                address,
+                len,
+                &shadow,
+                own.is_some(),
+            );
+        }
+        #[cfg(feature = "diagnostics")]
         if kind != ResourceType::Uav {
             shadow.note_reached(address, len, false, own.is_some());
         }
