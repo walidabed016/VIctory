@@ -1408,6 +1408,13 @@ impl<'a> Tracer<'a> {
             }
         }
         joins.pop();
+        let mut present = args.iter().flatten();
+        if crate::emit::joined_constants()
+            && let Some(first @ Source::Constant(_)) = present.next()
+            && present.all(|a| a == first)
+        {
+            return Ok(Some(first.clone()));
+        }
         Ok(Some(Source::Phi { block, args }))
     }
 
@@ -2509,6 +2516,43 @@ pub(crate) mod tests {
         assert!(
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
+        );
+    }
+
+    #[test]
+    fn an_immediate_sampler_set_in_the_arm_every_lane_runs_is_that_constant() {
+        // The sampler is set only where the lanes active at the start are
+        // (all of them), as the compiler sinks it into an arm that skips
+        // only waves without such lanes (`crate::emit::joined_constants`).
+        let r = track_words(
+            &[
+                0xBEA8_037E, // s_mov_b32 s40, exec_lo
+                0xBE84_0309, // s_mov_b32 s4, s9
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0202,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+                0xBE94_3C28, // s_and_saveexec_b32 s20, s40
+                0xBF88_0005, // s_cbranch_execz -> s_mov_b32 exec_lo, s20
+                0xB000_0092, // s_movk_i32 s0, 0x92
+                0xBE81_03FF,
+                0x00C0_0000, // s_mov_b32 s1, 0xc00000
+                0xBE82_0BA8, // s_brev_b32 s2, 40
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBEFE_0314, // s_mov_b32 exec_lo, s20
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF080_0F08,
+                0x0002_0000, // image_sample v[0:3], v[0:1], s[8:15], s[0:3] dmask:0xf dim:2D
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
+        assert_eq!(
+            sampler.map(|d| &d.source),
+            Some(&Source::Constant(vec![0x92, 0x00C0_0000, 0x1400_0000, 0])),
+            "{:?}",
+            r.descriptors
         );
     }
 

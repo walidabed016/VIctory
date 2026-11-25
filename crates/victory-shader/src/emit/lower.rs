@@ -4977,27 +4977,39 @@ impl<'a> Lower<'a> {
                 Fields::Smem { .. }
             )
         };
-        let Some(&(at, first)) = uses.iter().find(|u| !scalar(u.0)).or(uses.first()) else {
-            const DATA: Why = "a descriptor read only as data";
-            let bases = &self.x.res.bvh_bases;
-            if !inst.writes.iter().any(|w| bases.contains(&w.1)) {
-                return Err(DATA);
-            }
-            // An acceleration structure's descriptor: its base is 0.
-            let zero = self.s.m.i32(0);
-            for &(r, v) in &inst.writes {
-                if bases.contains(&v) {
-                    self.write(inst, r, zero, None);
-                } else {
-                    self.vals.insert(v, Val::Missing(DATA));
-                }
-            }
-            return Ok(());
-        };
+        let found = uses.iter().find(|u| !scalar(u.0)).or(uses.first()).copied();
+        let first = found.map_or(0, |u| u.1);
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
+        // shortcut: eight dwords no access uses, of no constant buffer or
+        // sampler, are a 2D texture's (code that only reads its size, as
+        // `GetDimensions` does, to scale coordinates in another).
+        let size_only = count == 8
+            && super::size_only_textures()
+            && used.is_none_or(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav));
+        let bases = &self.x.res.bvh_bases;
+        let bvh = inst.writes.iter().any(|w| bases.contains(&w.1));
+        let ui = match found {
+            Some((at, _)) => Some(&self.x.p.blocks[at.0].insts[at.1]),
+            None if size_only && !bvh => None,
+            None => {
+                const DATA: Why = "a descriptor read only as data";
+                if !bvh {
+                    return Err(DATA);
+                }
+                // An acceleration structure's descriptor: its base is 0.
+                let zero = self.s.m.i32(0);
+                for &(r, v) in &inst.writes {
+                    if bases.contains(&v) {
+                        self.write(inst, r, zero, None);
+                    } else {
+                        self.vals.insert(v, Val::Missing(DATA));
+                    }
+                }
+                return Ok(());
+            }
+        };
+        let un = ui.map_or("", Inst::name);
         let uav = un.contains("store")
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
@@ -5005,8 +5017,9 @@ impl<'a> Lower<'a> {
         // Indexed raw accesses count records, of the used-resource entry's
         // stride or the view's own, past the host raw view's lead.
         let mut records = None;
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
+        let (props, image) = match ui.map(|i| &i.fields) {
+            None => ((2 | u, 0x409), Some(2)),
+            Some(Fields::Image { dim, .. }) => {
                 let kind = match dim {
                     0 => 1,
                     1 => 2,
@@ -5017,7 +5030,7 @@ impl<'a> Lower<'a> {
                 };
                 ((kind | u, 0x409), Some(kind))
             }
-            Fields::Buffer { idxen, format, .. } => {
+            Some(Fields::Buffer { idxen, format, .. }) => {
                 let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
@@ -5037,7 +5050,7 @@ impl<'a> Lower<'a> {
             // Scalar buffer loads read the raw view the host makes of a
             // buffer view: its descriptor counts the records of a structured
             // view (the used-resource entry's stride), the bytes of a raw one.
-            Fields::Smem { .. } => {
+            Some(Fields::Smem { .. }) => {
                 let stride = match used {
                     Some(u) if u.kind != ResourceType::Cbv => u.stride,
                     Some(_) => return Err("a constant buffer's descriptor read as data"),

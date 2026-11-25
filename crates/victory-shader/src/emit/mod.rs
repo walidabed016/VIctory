@@ -237,6 +237,26 @@ pub fn own_pass_scalars() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_OWN_PASS").is_none())
 }
 
+/// Whether an image descriptor (eight dwords) the code reads only as data,
+/// with no access using it, is taken as a 2D texture's, whose size the
+/// code reads; refused otherwise. On unless `VICTORY_NO_SIZE_ONLY` is set.
+/// The value is part of the translation, so the shader cache must key on it
+/// (`victory-gpu`'s does).
+pub fn size_only_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_SIZE_ONLY").is_none())
+}
+
+/// Whether a descriptor control flow joins from one constant (an immediate
+/// sampler) on every edge that lanes using it take, and nothing on the
+/// others, is that constant; refused otherwise. On unless
+/// `VICTORY_NO_JOINED_CONSTANTS` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn joined_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_JOINED_CONSTANTS").is_none())
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
