@@ -94,6 +94,8 @@ extern "system" fn completed(this: This) -> u64 {
     fence.value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    #[cfg(windows)]
+    crate::queue::before_cpu_wait(this, value);
     let fence = fence(this);
     #[cfg(feature = "diagnostics")]
     crate::pipelining::fence_wait(Some(fence.queued_at.load(Ordering::Relaxed)).filter(|&at| {
@@ -148,6 +150,19 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     S_OK
 }
 
+/// The title's own signal: a queue may wait for the fence.
+extern "system" fn cpu_signal(this: This, value: u64) -> HRESULT {
+    let signalled = signal(this, value);
+    #[cfg(windows)]
+    crate::queue::release_held(false);
+    signalled
+}
+
+/// The fence's value now.
+pub(crate) fn value(this: This) -> u64 {
+    fence(this).value.load(Ordering::Acquire)
+}
+
 extern "system" fn creation_flags(this: This) -> u32 {
     fence(this).flags
 }
@@ -165,7 +180,7 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     f[8] = completed as *const (); // 0x40
     f[9] = set_event_on_completion as *const (); // 0x48
-    f[10] = signal as *const (); // 0x50
+    f[10] = cpu_signal as *const (); // 0x50
     f[11] = creation_flags as *const (); // 0x58
     f[12] = gpu_address as *const (); // 0x60
     Table(f)
