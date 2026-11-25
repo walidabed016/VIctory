@@ -380,6 +380,10 @@ pub struct Structured {
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
     pub restored: HashMap<Value, Value>,
+    /// SCC values a mask operation sets when some lane's bit of its result
+    /// is set, with that lane bit: as data such an SCC is "some lane of the
+    /// wave has it" (DexNom 570a941).
+    pub scc_some: HashMap<Value, Bool>,
 }
 
 impl Structured {
@@ -432,6 +436,8 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// See [`Structured::scc_some`].
+    scc_some: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -501,6 +507,7 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            scc_some: Map::default(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
@@ -568,6 +575,7 @@ impl<'a> Lanes<'a> {
         self.masks.clear();
         self.other.clear();
         self.scc_lane.clear();
+        self.scc_some.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
@@ -782,6 +790,7 @@ impl<'a> Lanes<'a> {
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
+            scc_some: self.scc_some.into_iter().collect(),
             bools: self.b,
             exits,
             guards,
@@ -1172,6 +1181,7 @@ impl<'a> Lanes<'a> {
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
                         self.scc_lane.insert(scc, m);
+                        self.scc_some.insert(scc, m);
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.

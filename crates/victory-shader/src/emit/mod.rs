@@ -402,6 +402,22 @@ pub fn split_joins() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_JOINS").is_some())
 }
 
+/// Whether the SCC a lane-mask operation sets (`s_and_saveexec_b32`,
+/// `s_andn2_wrexec_b32`: the result has a lane) read as data by an
+/// instruction (`s_cselect`, not at a join) is "some lane of the console
+/// wave has its bit there", in wave32 compute code whose host lanes are the
+/// console's; refused otherwise (wave64 code keeps its halves' ways, and a
+/// join needs the wave to have branched together, which DexNom's wave-wide
+/// branches make sure of and this does not). DexNom 570a941
+/// (`Lower::scc_some`); bvh_skinning:CSComputeSkinningPed reads it so.
+/// Off unless `VICTORY_MASK_SCC` is set. The value is part of
+/// the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn mask_scc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_SCC").is_some())
+}
+
 /// Whether buffer loads of a byte or short (`buffer_load_ubyte`,
 /// `buffer_load_ushort` and their signed forms) are translated, as the
 /// dword holding them shifted and extended; refused otherwise. On unless
