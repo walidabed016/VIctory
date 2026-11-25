@@ -756,11 +756,12 @@ impl<'a> Lanes<'a> {
             return (m, false);
         }
         let p = self.p;
-        // A mask restored from the VGPR lanes it was spilled to is the
-        // spilled mask, bit for bit.
+        // A mask restored from the VGPR lanes it was spilled to, or copied
+        // through a VGPR, is the mask it came from, bit for bit.
         let known = self
             .join(k)
-            .or_else(|| self.restored(k).map(|s| self.mask(s)));
+            .or_else(|| self.restored(k).map(|s| self.mask(s)))
+            .or_else(|| self.moved(k).map(|s| self.mask(s)));
         let (m, derived) = match known {
             Some(known) => known,
             None => {
@@ -810,6 +811,64 @@ impl<'a> Lanes<'a> {
             Moved::Const(_) => None,
         };
         Some((from(k.0)?, from(k.1)?))
+    }
+
+    /// The pair a mask copied through VGPRs comes from: `v_mov_b32` of a
+    /// scalar, or `v_readfirstlane_b32` of VGPRs holding such a copy in
+    /// every lane of the EXEC it runs under ([`Self::copied`]).
+    fn moved(&self, k: Key) -> Option<Key> {
+        let p = self.p;
+        let source = |v: Value| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &p.blocks[b].insts[i];
+            let Fields::Valu(f) = &inst.fields else {
+                return None;
+            };
+            if let Some(code) = scalar_copy(inst) {
+                return inst.read(Reg::S(code));
+            }
+            match (inst.name(), &f.src[..]) {
+                ("v_readfirstlane_b32", &[Operand::Vector { reg, .. }]) => {
+                    let w = inst.read(Reg::V(reg))?;
+                    let exec = self.key(|r| inst.read(r), EXEC)?;
+                    self.copied(w, exec, &mut Vec::new()).then_some(w)
+                }
+                _ => None,
+            }
+        };
+        let lo = source(k.0)?;
+        let hi = if k.1 == k.0 { lo } else { source(k.1)? };
+        Some((lo, hi))
+    }
+
+    /// Whether VGPR value `w` holds, in every lane of EXEC `exec`, the
+    /// scalar a `v_mov_b32` wrote there under that same EXEC, on every
+    /// path (through joins, with EXEC taken along each edge).
+    fn copied(&self, w: Value, exec: Key, seen: &mut Vec<(Value, Key)>) -> bool {
+        let p = self.p;
+        if let Some(&(b, i)) = self.phis.get(&w) {
+            if seen.contains(&(w, exec)) {
+                return true;
+            }
+            seen.push((w, exec));
+            let block = &p.blocks[b];
+            let along = |v: Value, n: usize| {
+                block
+                    .phis
+                    .iter()
+                    .find(|phi| phi.value == v)
+                    .map_or(v, |phi| phi.args[n])
+            };
+            return (0..block.preds.len()).all(|n| {
+                let e = (along(exec.0, n), along(exec.1, n));
+                self.copied(block.phis[i].args[n], e, seen)
+            });
+        }
+        let Some(&(b, i)) = self.defs.get(&w) else {
+            return false;
+        };
+        let inst = &p.blocks[b].insts[i];
+        scalar_copy(inst).is_some() && self.key(|r| inst.read(r), EXEC) == Some(exec)
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1025,7 +1084,8 @@ impl<'a> Lanes<'a> {
                     {
                         let lazy = self.phis.contains_key(&k.0)
                             || self.phis.contains_key(&k.1)
-                            || self.restored(k).is_some();
+                            || self.restored(k).is_some()
+                            || self.moved(k).is_some();
                         takes_mask |= self.masks.contains_key(&k) || lazy && self.mask(k).1;
                     }
                 }
@@ -1083,6 +1143,14 @@ impl<'a> Lanes<'a> {
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
+                {
+                    self.mask(k);
+                }
+                // A mask copied back from a VGPR, as a loop may carry it.
+                if name == "v_readfirstlane_b32"
+                    && let Some(Operand::Scalar { code, .. }) = v.dst
+                    && let Some(k) = self.key(|r| inst.write(r), code)
+                    && self.moved(k).is_some()
                 {
                     self.mask(k);
                 }
@@ -1190,6 +1258,20 @@ const TOO_LARGE: ShaderError = ShaderError::Isa {
 
 /// `ir::build` splits irreducible loops; checked again because everything
 /// here assumes a reducible graph.
+/// The SGPR a plain `v_mov_b32` copies into its lanes.
+fn scalar_copy(inst: &Inst) -> Option<u8> {
+    let Fields::Valu(f) = &inst.fields else {
+        return None;
+    };
+    let plain = f.neg == 0 && f.abs == 0 && f.sdwa.is_none() && f.dpp.is_none();
+    match f.src[..] {
+        [Operand::Scalar { code, .. }] if plain && code != NULL && inst.name() == "v_mov_b32" => {
+            Some(code)
+        }
+        _ => None,
+    }
+}
+
 fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), ShaderError> {
     match crate::ir::irreducible_edge(&p.blocks, order, index) {
         Some((from, _)) => Err(ShaderError::Unsupported {

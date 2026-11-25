@@ -439,3 +439,62 @@ fn a_lane_mask_a_loop_carries_reads_as_the_lanes_it_still_holds() {
         }
     }
 }
+
+/// A loop over the lanes whose x & 5 is not 0, kept in s2: each turn the
+/// lanes left (`s_and_saveexec_b32` of s2) count themselves in v8 and the
+/// first one left (`s_ff1`) drops out. The lane of rank k counts k + 1;
+/// the others 0. `carry` gives the words that set s2 to s7, the lanes left
+/// for the next turn.
+fn lanes_left_loop(carry: &[u32]) -> Vec<u32> {
+    let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+    w.push(vop2(0x1A, 9, inline((SLOTS * 4).trailing_zeros() as u16), 0));
+    w.push(vop1(0x001, 8, ZERO));
+    w.push(vop2(0x1B, 12, inline(5), 0));
+    w.push(vopc(0xC5, ZERO, 12));
+    // s_and_b32 s2, vcc_lo, exec_lo
+    w.push(0x8000_0000 | 14 << 23 | 2 << 16 | (EXEC_LO as u32) << 8 | VCC_LO as u32);
+    let head = w.len();
+    w.push(sop1(0x13, 4, 2));
+    w.push(sop1(0x3C, 6, 2));
+    w.push(vop2(0x25, 8, inline(1), 8));
+    w.push(sop1(0x03, EXEC_LO, 6));
+    // s_lshl_b32 s5, 1, s4; s_andn2_b32 s7, s2, s5
+    w.push(0x8000_0000 | 30 << 23 | 5 << 16 | 4 << 8 | inline(1) as u32);
+    w.push(0x8000_0000 | 20 << 23 | 7 << 16 | 5 << 8 | 2);
+    w.extend(carry);
+    // s_cmp_lg_u32 s2, 0
+    w.push(0xBF07_8002);
+    w.push(sopp(0x05, head as i16 - w.len() as i16 - 1));
+    w.extend(store(8, 9, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+fn check_lanes_left(shader: &HostShader) {
+    let on = |x: u32| x & 5 != 0;
+    for (label, got) in run(shader) {
+        for x in 0..THREADS {
+            let rank = (x & !31..x).filter(|&g| on(g)).count() as u32;
+            let want = if on(x) { rank + 1 } else { 0 };
+            assert_eq!(got[(x * SLOTS) as usize], want, "{label}: thread {x}");
+        }
+    }
+}
+
+#[test]
+fn a_lane_mask_a_loop_carries_through_a_vgpr_keeps_its_lanes() {
+    // The lanes left go round as the console compiler may carry them: into
+    // v10 by `v_mov_b32` on two uniform paths (s7 itself, or a copy in s13)
+    // and back by `v_readfirstlane_b32`.
+    let carry = [
+        // s_bitcmp0_b32 s4, 0; s_cbranch_scc1 +3
+        0xBF0C_8004,
+        sopp(0x05, 3),
+        sop1(0x03, 13, 7),
+        vop1(0x001, 10, 13),
+        sopp(0x02, 1),
+        vop1(0x001, 10, 7),
+        vop1(0x002, 2, v(10)),
+    ];
+    check_lanes_left(&build(&lanes_left_loop(&carry)));
+}
