@@ -22,7 +22,11 @@
 //! lighting: 8-pixel tiles and rectangles of orange light along the edges of
 //! walls, bunks and ceilings (runs 116 to 118; most likely the sky, which
 //! every ray of the acceleration structure sees, the translation answering
-//! them as misses). `VICTORY_AMBIENT_REFLECTED=<level>` replaces that image
+//! them as misses). It writes the same light packed as the indirect diffuse
+//! light is, to an image the lighting reads as it is: that one carried the
+//! final gather's 16-pixel tiles and sky-blue misses into the lit scene (the
+//! band of blocks under the cell window and the blue tile by the bunk, run
+//! 157 frame 4096). `VICTORY_AMBIENT_REFLECTED=<level>` replaces both images
 //! by the constant as well; 0 by default (no light from the probes in
 //! reflections), and `VICTORY_AMBIENT_REFLECTED=title` keeps the title's.
 
@@ -40,8 +44,13 @@ use crate::object::This;
 /// The programs it follows, by the start of their name.
 pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// Where they write the indirect diffuse light (R9G9B9E5 as 32-bit
-/// integers): root parameter and place in its table.
-pub(crate) const LIGHT: (u8, u32) = (1, 176);
+/// integers), by shader register: u36 (u32 is a second view of it). The
+/// register, not the place in the table: the `_CB` variants hold their
+/// views 8 dwords further on.
+pub(crate) const LIGHT: u32 = 36;
+/// Where they write the probes' light for reflections packed the same way:
+/// u33 (u39 is a second view of it; u41 holds it as plain colors).
+pub(crate) const REFLECTED: u32 = 33;
 
 /// The constant (0.6 looked balanced in run a2); `None` for the title's own
 /// output.
@@ -218,6 +227,20 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
 /// plain-color images (R11G11B10) are replaced.
 pub(crate) fn reflect(list: &HostList, image: This, format: Option<u32>) -> bool {
     reflected().is_some_and(|level| replace(list, image, level, Some(format)))
+}
+
+/// As [`reflect`], for the packed copy of the reflections' light
+/// ([`REFLECTED`]).
+pub(crate) fn reflect_packed(list: &HostList, image: This) -> bool {
+    let Some(level) = reflected() else {
+        return false;
+    };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let recorded = replace(list, image, level, None);
+    if recorded {
+        ONCE.call_once(|| tracing::info!(level, "ambient light in reflections, packed"));
+    }
+    recorded
 }
 
 /// What both do. `plain` is `None` for the packed light, else the format of

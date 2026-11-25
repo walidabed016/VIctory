@@ -714,33 +714,39 @@ impl State {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
-        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            let u = stage.translated().used.iter().find(|u| {
-                u.kind == kind
-                    && u.root == RootType::Table
-                    && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })?;
+        let uavs = || {
+            stage
+                .translated()
+                .used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+        };
+        let view = |u: &UsedResource| {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
                 return None;
             };
             crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
-        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
-            Some(View::Unordered(r, ..)) => r,
-            _ => 0,
+        let image = |register: u32| {
+            let u = uavs().find(|u| u.lower_bound == register)?;
+            match view(u)? {
+                View::Unordered(r, ..) if r != 0 => Some(r as This),
+                _ => None,
+            }
         };
-        let mut recorded = if light == 0 {
-            once!("no ambient light: other tables");
-            false
-        } else {
-            crate::ambient::raise(list, light as This)
+        let mut recorded = match image(crate::ambient::LIGHT) {
+            Some(light) => crate::ambient::raise(list, light),
+            None => {
+                once!("no ambient light: other tables");
+                false
+            }
         };
         if crate::ambient::reflected().is_some() {
-            for u in &stage.translated().used {
-                let at = (u.slot, u.table_offset_dwords);
-                if u.kind == ResourceType::Uav
-                    && at != crate::ambient::LIGHT
-                    && let Some(View::Unordered(r, _, desc)) = view(u.kind, at)
+            if let Some(packed) = image(crate::ambient::REFLECTED) {
+                recorded |= crate::ambient::reflect_packed(list, packed);
+            }
+            for u in uavs().filter(|u| u.lower_bound != crate::ambient::LIGHT) {
+                if let Some(View::Unordered(r, _, desc)) = view(u)
                     && r != 0
                 {
                     recorded |= crate::ambient::reflect(list, r as This, desc.map(|d| d[0]));
