@@ -4226,6 +4226,7 @@ pub(crate) mod tests {
         let list = host.new_list().unwrap();
         list.close();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // The GPU writes a word of the second block.
         let list = host.new_list().unwrap();
         s.refresh(&list, at as u64, 32 << 20);
@@ -4312,6 +4313,7 @@ pub(crate) mod tests {
             list.close();
             let started = std::time::Instant::now();
             host.execute(&[&list]);
+            crate::pipelined::wait_all();
             started.elapsed()
         };
         let copy = |to: &ID3D12Resource| {
@@ -4360,6 +4362,7 @@ pub(crate) mod tests {
                         let gpu = notes(&list.list, LEN / PAGE, 0).unwrap();
                         list.close();
                         host.execute(&[&list]);
+                        crate::pipelined::wait_all();
                         (gpu, 0)
                     }),
                 };

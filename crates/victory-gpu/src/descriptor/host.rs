@@ -2102,6 +2102,7 @@ mod tests {
         // SAFETY: an open list.
         unsafe { list.list.Close() }.unwrap();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         assert_eq!(refs(&copy), held - 1, "held after a submission ran");
     }
 

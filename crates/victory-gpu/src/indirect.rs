@@ -737,6 +737,7 @@ void main() { uint was; counted.InterlockedAdd(0, 1, was); }
         run(base + 192, 1, None);
         list.close();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         assert_eq!(first, Some(2), "the first two executions share a segment");
         // SAFETY: the mapped buffers, which the finished list wrote.
         let (ran, kept) = unsafe { (total.cast::<u32>().read_volatile(), words.add(3).read()) };
@@ -824,6 +825,7 @@ void main() { uint was; counted.InterlockedAdd(0, 1, was); }
         run(base + 64, 2, Some(base + 128));
         list.close();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // SAFETY: the mapped buffers, which the finished list wrote.
         let (ran, kept) = unsafe { (total.cast::<u32>().read_volatile(), words.add(3).read()) };
         assert_eq!(ran, 5 + 3, "groups run");

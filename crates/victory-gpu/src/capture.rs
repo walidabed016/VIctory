@@ -922,6 +922,7 @@ mod tests {
                 read = super::read_back(&host.device, &list.list, &texture);
                 list.close();
                 host.execute(&[&list]);
+                crate::pipelined::wait_all();
             });
             assert_eq!(errors.unwrap_or_default(), Vec::<String>::new());
             let (buffer, footprint) = read.unwrap();

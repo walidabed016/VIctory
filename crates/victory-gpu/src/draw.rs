@@ -1625,6 +1625,7 @@ void main() {
             l.Close().unwrap();
         }
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // SAFETY: the mapped words the dispatch wrote, waited for.
         std::array::from_fn(|i| unsafe { data.cast::<u32>().add(i).read_volatile() })
     }
@@ -1804,6 +1805,7 @@ void main() {
             l.Close().unwrap();
         }
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // SAFETY: the mapped words the dispatch wrote, waited for.
         let got: [u32; 4] =
             std::array::from_fn(|i| unsafe { data.cast::<u32>().add(i).read_volatile() });
@@ -1844,6 +1846,7 @@ void main() {
         // SAFETY: an open list.
         unsafe { list.list.Close() }.unwrap();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         let view = View::Constant(address, 0x80);
         let (data, len) = crate::descriptor::host::own_copy_of(&view, &shadow, (address, 0x80))
             .expect("its own copy");
@@ -1868,6 +1871,7 @@ void main() {
         // SAFETY: an open list.
         unsafe { list.list.Close() }.unwrap();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         let range = crate::descriptor::host::buffer_range(&view).expect("its range");
         assert_eq!(range, (base + 4, 48));
         let (data, len) =
@@ -1957,6 +1961,7 @@ void main() {
             list.list.Close().unwrap();
         }
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // SAFETY: the mapped bytes the list wrote, waited for.
         let row = unsafe { std::slice::from_raw_parts(back, 0x4000) };
         assert!(
@@ -1992,6 +1997,7 @@ void main() {
         // SAFETY: an open list.
         unsafe { list.list.Close() }.unwrap();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
@@ -2052,6 +2058,7 @@ void main() {
             l.Close().unwrap();
         }
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         // SAFETY: the mapped words the dispatch wrote, waited for.
         let got: [u32; 10] =
             std::array::from_fn(|i| unsafe { data.cast::<u32>().add(i).read_volatile() });

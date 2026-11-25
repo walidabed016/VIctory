@@ -1945,6 +1945,7 @@ mod tests {
         }
         back.close();
         host.execute(&[&back]);
+        crate::pipelined::wait_all();
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {
@@ -2081,6 +2082,7 @@ mod tests {
             };
             list.close();
             host.execute(&[&list]);
+            crate::pipelined::wait_all();
             let mut data = std::ptr::null_mut();
             // SAFETY: the finished copy's read-back buffer.
             unsafe {
@@ -2108,6 +2110,7 @@ mod tests {
         };
         list.close();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         assert_eq!(read(), 0x22, "unchanged contents are not uploaded again");
         fill(0x33);
         assert_eq!(read(), 0x33, "changed contents are");

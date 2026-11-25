@@ -1557,6 +1557,7 @@ mod tests {
         // SAFETY: an open list.
         unsafe { list.list.Close() }.unwrap();
         host.execute(&[&list]);
+        crate::pipelined::wait_all();
         assert!(buffer[0x200..0x4200].iter().all(|&b| b == 0x5a), "the copy");
         let around = [&buffer[..0x200], &buffer[0x4200..]].concat();
         assert!(around.iter().all(|&b| b == 0), "around it");
