@@ -9709,10 +9709,15 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
-            // shortcut: typed stores are taken to write all four channels
-            // of a float format.
-            if typed && (count != 4 || *offen || *offset != 0) {
-                return Err("a typed buffer store of some channels or at an offset");
+            // shortcut: typed stores are taken to write channels of a float
+            // format. A store of some channels (Belobug 94a8607) keeps the
+            // others as the element holds them (`buffer_store`); refused again
+            // with `VICTORY_NO_BELOBUG=partial-stores`.
+            if typed && (*offen || *offset != 0) {
+                return Err("a typed buffer store at an offset");
+            }
+            if typed && count != 4 && !super::belobug("partial-stores") {
+                return Err("a typed buffer store of some channels");
             }
             let at = index.unwrap_or(self.s.m.i32(0));
             let known = match slot {
@@ -9881,7 +9886,26 @@ impl<'a> Lower<'a> {
             if vals.len() < 4 {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
                 let rt = self.s.t.res_ret;
-                let old =  match k {
+                let old = self.s.op(
+                    self.cur,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    rt,
+                    68,
+                    &[h, index, iu],
+                );
+                for k in vals.len()..4 {
+                    args.push(self.s.m.extract(self.cur, old, k as u32));
+                }
+            }
+            args.push(self.s.m.i8(0xF));
+            self.s
+                .op(self.cur, "bufferStore.f32", Attr::NoUnwind, void, 69, &args);
+            return;
+        }
+        let (one, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        for (k, &x) in vals.iter().enumerate() {
+            let at = match k {
                 0 => off,
                 _ => {
                     let step = self.s.m.i32(4 * k as u32);
@@ -11405,6 +11429,68 @@ mod tests {
                 // image_store v[2..], v[0..1], s[4:11]
                 mimg_w0,
                 0x0001_0200,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&structure::structure(&p).unwrap())).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+        }
+    }
+    #[test]
+    fn partial_channel_typed_buffer_store_lowers() {
+        use crate::native::{RootParam, RootType};
+
+        // MUBUF buffer_store_format_{x,xy,xyz,d16_xyz} (ops 0x04, 0x05, 0x06, 0x86)
+        // with idxen=1, vaddr=v0, vdata=v1, srsrc=s[4:7].
+        for op in [0x04u32, 0x05, 0x06, 0x86] {
+            let mubuf_w0 = 0xE000_2000 | (op << 18);
+            let words = [
+                // s_mov_b32 s1, 0
+                0xBE81_0380u32,
+                // s_load_dwordx4 s[4:7], s[0:1], null
+                0xF408_0100,
+                0xFA00_0000,
+                // v_mov_b32 v0..v3, 0
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                // buffer_store_format_* v[1..], v0, s[4:7], 0 idxen
+                mubuf_w0,
+                0x8001_0100,
                 S_ENDPGM,
             ];
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
