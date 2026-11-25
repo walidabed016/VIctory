@@ -590,26 +590,104 @@ fn texel_decoder(format: u32) -> Option<TexelDecoder> {
     })
 }
 
-/// Of `w` x `h` texels `pitch` bytes a row apart in `format`: how many,
-/// and how many have every channel zero, a NaN channel, an infinite one.
+/// A tile's texels, those with every channel zero, and the sum of each
+/// finite texel's largest channel.
 #[cfg(feature = "diagnostics")]
-fn value_counts(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<[u64; 4]> {
+type TileStats = (u64, u64, f64);
+
+/// Of `w` x `h` texels `pitch` bytes a row apart in `format`: how many,
+/// and how many have every channel zero, a NaN channel, an infinite one;
+/// with `tile` above 0, also [`TileStats`] per `tile` x `tile` square (rows
+/// of `w` / `tile` rounded up, row-major).
+#[cfg(feature = "diagnostics")]
+fn texel_stats(
+    format: u32,
+    w: usize,
+    h: usize,
+    pitch: usize,
+    rows: &[u8],
+    tile: usize,
+) -> Option<([u64; 4], Vec<TileStats>)> {
     let (n, channels, decode) = texel_decoder(format)?;
+    let side = std::num::NonZeroUsize::new(tile);
+    let across = side.map_or(0, |s| w.div_ceil(s.get()));
+    let mut tiles = vec![(0, 0, 0.0); across * side.map_or(0, |s| h.div_ceil(s.get()))];
     let mut counts = [0u64; 4];
     for y in 0..h {
         let Some(row) = rows.get(y * pitch..y * pitch + w * n) else {
             break;
         };
-        for texel in row.chunks_exact(n) {
+        for (x, texel) in row.chunks_exact(n).enumerate() {
             let v = decode(texel);
             let v = &v[..channels];
+            let zero = v.iter().all(|&c| c == 0.0);
             counts[0] += 1;
-            counts[1] += u64::from(v.iter().all(|&c| c == 0.0));
+            counts[1] += u64::from(zero);
             counts[2] += u64::from(v.iter().any(|c| c.is_nan()));
             counts[3] += u64::from(v.iter().any(|c| c.is_infinite()));
+            if let Some(side) = side {
+                let t = &mut tiles[y / side * across + x / side];
+                t.0 += 1;
+                t.1 += u64::from(zero);
+                let top = v
+                    .iter()
+                    .copied()
+                    .filter(|c| c.is_finite())
+                    .fold(0.0f32, f32::max);
+                t.2 += f64::from(top);
+            }
         }
     }
-    Some(counts)
+    Some((counts, tiles))
+}
+
+/// The tile side [`dump_slots`] grids a texture by: a twentieth of its
+/// width (128 for 2560x1440, the tiled lighting's tile) for screen-shaped
+/// textures, else none.
+#[cfg(feature = "diagnostics")]
+fn screen_tile(w: usize, h: usize) -> usize {
+    if w >= 320 && w.is_multiple_of(20) && (w * 9).abs_diff(h * 16) <= w / 8 {
+        w / 20
+    } else {
+        0
+    }
+}
+
+/// Per-tile stats as two grids, rows split by " / ": the percent of zero
+/// texels, and the mean of the largest channel.
+#[cfg(feature = "diagnostics")]
+fn tile_grids(tiles: &[TileStats], across: usize) -> (String, String) {
+    let rows = |cell: &dyn Fn(&TileStats) -> String| {
+        tiles
+            .chunks(across.max(1))
+            .map(|row| row.iter().map(cell).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
+    let zero = rows(&|t| format!("{}", (100 * t.1).checked_div(t.0).unwrap_or(0)));
+    let mean = rows(&|t| format!("{:.1e}", if t.0 > 0 { t.2 / t.0 as f64 } else { 0.0 }));
+    (zero, mean)
+}
+
+/// Each texel's bytes in hex (rows split by " / "), for textures of at most
+/// 256 texels.
+#[cfg(feature = "diagnostics")]
+fn texel_hex(w: usize, h: usize, pitch: usize, n: usize, rows: &[u8]) -> Option<String> {
+    if w * h > 256 || n == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for y in 0..h {
+        let row = rows.get(y * pitch..y * pitch + w * n)?;
+        let texels = row.chunks_exact(n).map(|t| {
+            t.iter()
+                .rev()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        });
+        out.push(texels.collect::<Vec<_>>().join(" "));
+    }
+    Some(out.join(" / "))
 }
 
 /// At the present of a listed frame: logs every texture slot TL_PS and
@@ -705,6 +783,7 @@ fn dump_slots(
         crate::pipelined::wait_all();
     }
     let mut values = std::collections::HashMap::new();
+    let mut details = std::collections::HashMap::new();
     for (r, buffer, footprint, view_format) in reads {
         if started.elapsed() > DEADLINE {
             skipped.insert(r, "past the 750 ms deadline");
@@ -727,15 +806,23 @@ fn dump_slots(
                 continue;
             }
             let rows = std::slice::from_raw_parts(data.cast::<u8>(), rows_bytes(&f) as usize);
-            let counts = value_counts(
-                format,
+            let (w, h, pitch) = (
                 f.Width as usize,
                 (f.Height * f.Depth) as usize,
                 f.RowPitch as usize,
-                rows,
             );
+            let tile = if f.Depth == 1 { screen_tile(w, h) } else { 0 };
+            let stats = texel_stats(format, w, h, pitch, rows, tile);
+            let grids = stats
+                .as_ref()
+                .filter(|_| tile > 0)
+                .map(|s| (tile, tile_grids(&s.1, w.div_ceil(tile))));
+            let hex = bytes(host_format).and_then(|n| texel_hex(w, h, pitch, n as usize, rows));
             buffer.Unmap(0, None);
-            values.insert(r, (format, counts));
+            values.insert(r, (format, stats.map(|s| s.0)));
+            if grids.is_some() || hex.is_some() {
+                details.insert(r, (grids, hex));
+            }
         }
     }
     let gpu = GPU_WROTE
@@ -797,6 +884,27 @@ fn dump_slots(
             values = shares,
             "lighting program texture slot"
         );
+        match details.get(resource) {
+            Some((Some((tile, (zero, mean))), _)) => tracing::info!(
+                frame,
+                family,
+                register = format_args!("t{register}"),
+                resource = ?r,
+                tile,
+                zero_percent = zero.as_str(),
+                mean_top = mean.as_str(),
+                "lighting program texture slot tiles"
+            ),
+            Some((None, Some(hex))) => tracing::info!(
+                frame,
+                family,
+                register = format_args!("t{register}"),
+                resource = ?r,
+                texels = hex.as_str(),
+                "lighting program texture slot texels"
+            ),
+            _ => {}
+        }
     }
     tracing::info!(
         frame,
@@ -1301,7 +1409,7 @@ mod tests {
             .flat_map(|h| h.to_le_bytes())
             .collect();
         assert_eq!(
-            super::value_counts(10, 4, 1, 32, &halves),
+            super::texel_stats(10, 4, 1, 32, &halves, 0).map(|s| s.0),
             Some([4, 1, 1, 1])
         );
         let nan_11 = (31u32 << 6) | 1;
@@ -1310,7 +1418,7 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         assert_eq!(
-            super::value_counts(26, 4, 1, 16, &small),
+            super::texel_stats(26, 4, 1, 16, &small, 0).map(|s| s.0),
             Some([4, 1, 1, 1])
         );
         let values: Vec<u8> = [0x3c00u16, 0xc000, 1, 0x7bff]
@@ -1327,8 +1435,38 @@ mod tests {
         assert_eq!(decode(&half.to_le_bytes())[0], 0.5);
         let shared: Vec<u8> = [0u32, half].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert_eq!(
-            super::value_counts(67, 1, 2, 4, &shared),
+            super::texel_stats(67, 1, 2, 4, &shared, 0).map(|s| s.0),
             Some([2, 1, 0, 0])
+        );
+    }
+
+    /// A 4x2 R32_FLOAT texture in 2x2 tiles: the left tile all zero, the
+    /// right one 1 and 3 over 4 texels; small textures print each texel.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn tiles_count_their_zero_texels_and_average_the_largest_channel() {
+        let texels: Vec<u8> = [0.0f32, 0.0, 1.0, 3.0, 0.0, 0.0, 0.0, 0.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let (counts, tiles) = super::texel_stats(41, 4, 2, 16, &texels, 2).unwrap();
+        assert_eq!(counts, [8, 6, 0, 0]);
+        assert_eq!(tiles, [(4, 4, 0.0), (4, 2, 4.0)]);
+        let (zero, mean) = super::tile_grids(&tiles, 2);
+        assert_eq!((zero.as_str(), mean.as_str()), ("100 50", "0.0e0 1.0e0"));
+        assert_eq!(super::screen_tile(2560, 1440), 128);
+        assert_eq!(super::screen_tile(1280, 720), 64);
+        assert_eq!(super::screen_tile(64, 64), 0);
+        let hex = super::texel_hex(
+            2,
+            2,
+            8,
+            4,
+            &[1, 0, 0, 0, 0xcb, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0],
+        );
+        assert_eq!(
+            hex.as_deref(),
+            Some("00000001 000000cb / 00000000 0000ffff")
         );
     }
 
