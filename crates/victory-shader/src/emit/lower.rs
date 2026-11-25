@@ -700,7 +700,8 @@ fn half_inputs(io: &StageIo, elements: &[SigElement]) -> HashMap<u8, HalfSources
 }
 
 /// A scalar a waterfall loop reads from a descriptor and code after the loop
-/// reads, where it cannot be the loop's last pass's ([`Lower::last_pass_exact`]).
+/// reads, where it cannot be the loop's last pass's ([`Lower::last_pass_exact`])
+/// and [`super::own_pass_scalars`] is off.
 const LAST_PASS: Why = "a scalar a waterfall loop reads from a descriptor, used after the loop";
 /// [`LAST_PASS`] where only the host's lanes stand in the way: [`lower_as`]
 /// lowers the program again on the console's.
@@ -4957,12 +4958,17 @@ impl<'a> Lower<'a> {
             uses = uses_of(&|load| self.same_address(load, site));
             if !uses.is_empty() && !self.loop_scalars(site.0).is_empty() {
                 if !self.last_pass_exact(site.0) {
-                    return Err(LAST_PASS);
-                }
-                if !self.console_lanes {
+                    // shortcut: each lane keeps its own pass's scalars, the
+                    // last pass's wherever the console's wave reads one
+                    // descriptor (its size, as `GetDimensions` does).
+                    if !super::own_pass_scalars() {
+                        return Err(LAST_PASS);
+                    }
+                } else if !self.console_lanes {
                     return Err(HOST_LANES);
+                } else {
+                    self.last_pass_loops.insert(site.0);
                 }
-                self.last_pass_loops.insert(site.0);
             }
         }
         let scalar = |at: Site| {

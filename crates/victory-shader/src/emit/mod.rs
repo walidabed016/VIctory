@@ -226,6 +226,17 @@ pub fn subdword_buffer_loads() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_SUBDWORD_LOADS").is_none())
 }
 
+/// Whether a scalar a waterfall loop reads from a descriptor, which code
+/// after the loop reads, is each lane's own pass's where it cannot be the
+/// last pass's as on the console (a pixel program, a loop on halves or one
+/// code skips around); refused otherwise. On unless `VICTORY_NO_OWN_PASS`
+/// is set. The value is part of the translation, so the shader cache must
+/// key on it (`victory-gpu`'s does).
+pub fn own_pass_scalars() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_OWN_PASS").is_none())
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

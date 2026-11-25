@@ -616,6 +616,45 @@ fn lanes_read_the_last_passs_height_after_a_waterfall_loop() {
     }
 }
 
+/// [`height_after_the_loop`] with a branch around the height's loop when no
+/// lane is left, which never runs: the block after the loop follows another
+/// too, so the last pass is not found, and each lane reads its own entry's
+/// height (`super::own_pass_scalars`): 4 in lanes 8 to 15, 2 in the others.
+#[test]
+fn lanes_read_their_own_height_after_a_waterfall_loop_code_skips() {
+    let mut words = height_after_the_loop(false);
+    let at = words
+        .iter()
+        .position(|&w| w == 0xBE96_037E)
+        .expect("s_mov_b32 s22")
+        + 1;
+    words.splice(
+        at..at,
+        [
+            0xBEA0_0381, // s_mov_b32 s32, 1
+            0xBF88_000E, // s_cbranch_execz -> s_mov_b32 exec_lo, s23
+        ],
+    );
+    let first = [[1.0f32, 0.0, 0.0, 1.0]; 2];
+    let second = [[2.0f32, 0.0, 0.0, 1.0]; 4];
+    let views = [
+        View::Texture(1, 2, &first),
+        View::Texture(1, 4, &second),
+        View::RawUav(64),
+    ];
+    let (shader, _, _) = lower_cs(&words, false);
+    let results = run_on(&shader, &views, true);
+    assert!(!results.is_empty());
+    let own = |l: u32| (8..16).contains(&l);
+    for (label, words) in results {
+        let red: Vec<f32> = words[..32].iter().map(|&w| f32::from_bits(w)).collect();
+        let want: Vec<f32> = (0..32).map(|l| if own(l) { 2.0 } else { 1.0 }).collect();
+        assert_eq!(red, want, "{label}");
+        let want: Vec<u32> = (0..32).map(|l| if own(l) { 4 } else { 2 }).collect();
+        assert_eq!(words[32..], want, "{label}");
+    }
+}
+
 #[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
