@@ -71,7 +71,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then by name offset.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -89,7 +89,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -396,5 +396,46 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// Elements sharing a register (TEXCOORD16.w before TANGENT0.xyz, as in
+    /// the ped pixel programs) are written in name-offset order, as
+    /// validator 1.6 sorts its rows (stream, register, name offset): in
+    /// column order it rejected the part as not matching the module.
+    #[test]
+    fn signature_rows_sharing_a_register_follow_their_name_offsets() {
+        let el = |name: &str, index, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let part = signature(
+            &[
+                el("TEXCOORD", 16, 10, 3, 1),
+                el("TANGENT", 0, 10, 0, 3),
+                el("TEXCOORD", 0, 1, 0, 4),
+            ],
+            true,
+        );
+        let word = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        let name = |at: usize| {
+            let end = part[at..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&part[at..at + end]).unwrap()
+        };
+        let rows: Vec<(u32, &str, u32)> = (0..3)
+            .map(|i| 8 + 32 * i)
+            .map(|r| (word(r + 20), name(word(r + 4) as usize), word(r + 8)))
+            .collect();
+        assert_eq!(
+            rows,
+            [(1, "TEXCOORD", 0), (10, "TEXCOORD", 16), (10, "TANGENT", 0)]
+        );
     }
 }
