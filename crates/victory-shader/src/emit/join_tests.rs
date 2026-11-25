@@ -303,6 +303,118 @@ fn loaded_on_three_paths(path: u8) -> Vec<u32> {
     w
 }
 
+/// Lanes 0-15 (`v_cmp_gt_u32`, `s_and_saveexec_b64`) run an arm that sets
+/// s1 to 0 and loads the UAV descriptor to s[8:11]; after it each stores
+/// `v0 + 1000` through that descriptor and `v0 + 2000` at dword 16 on,
+/// through the one it then loads from s[0:1]. The arm's mask is EXEC and
+/// the mask on entry, as the light-probe schedule program keeps its lanes
+/// apart from the quads it samples in, so every lane that stores ran the
+/// arm. With `inner`, the mask is EXEC and `v0 < inner` instead, and
+/// lanes that skipped the arm store too.
+fn loaded_in_an_arm(inner: Option<u8>) -> Vec<u32> {
+    // v4 = v0 * 4; v6 = v4 + 64; v5 = v0 + 1000; v7 = v0 + 2000;
+    // s[12:13] = exec.
+    let mut w = vec![vop2(0x1A, 4, u16::from(TWO), 0), vop2(0x25, 6, 128 + 64, 4)];
+    w.extend([vop2(0x25, 5, 0xFF, 0), 1000, vop2(0x25, 7, 0xFF, 0), 2000]);
+    w.push(sop1(0x04, 12, EXEC_LO));
+    // v_cmp_gt_u32 vcc, 16, v0; s_and_saveexec_b64 s[6:7], vcc;
+    // s_cbranch_execz end.
+    w.extend([vopc(0xC4, 128 + 16, 0), sop1(0x24, 6, VCC_LO)]);
+    let to_end = w.len();
+    w.push(0);
+    // s_and_saveexec_b64 s[14:15], s[12:13] (or vcc = v0 < inner);
+    // s_cbranch_execz join.
+    match inner {
+        None => w.push(sop1(0x24, 14, 12)),
+        Some(n) => w.extend([vopc(0xC4, 128 + u16::from(n), 0), sop1(0x24, 14, VCC_LO)]),
+    }
+    let to_join = w.len();
+    w.push(0);
+    // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0.
+    w.extend([sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000]);
+    // join: exec = s[14:15]; s_load_dwordx4 s[16:19], s[0:1], 0;
+    // s_waitcnt lgkmcnt(0); buffer_store_dword v5, v4, s[8:11], 0 offen;
+    // buffer_store_dword v7, v6, s[16:19], 0 offen.
+    w[to_join] = sopp(0x08, to_join, w.len());
+    w.extend([
+        sop1(0x04, EXEC_LO, 14),
+        0xF408_0400,
+        0xFA00_0000,
+        0xBF8C_C07F,
+    ]);
+    w.extend([
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4,
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 4 << 16 | 7 << 8 | 6,
+    ]);
+    // end.
+    w[to_end] = sopp(0x08, to_end, w.len());
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Lanes 0-15 run an arm under EXEC and the mask on entry (or `v0 < inner`),
+/// as in [`loaded_in_an_arm`], whose scalar code points s[2:3] into a table
+/// after the code, read through `s_getpc_b64`: at dword 1 on the path
+/// `s_cmp_<cmp>_u32 s0, 0` (s0 is 0) falls through on, at dword 9 on the
+/// one it branches on. After the arm each lane loads the dword at s[2:3]
+/// with `s_load_dword` and stores it at dword `v0`; on the edge that skips
+/// the arm s[2:3] hold what they held on entry. The table's dwords are 1000
+/// and on.
+fn table_pointed_at_in_an_arm(cmp: u8, inner: Option<u8>) -> Vec<u32> {
+    // s1 = 0; s_load_dwordx4 s[8:11], s[0:1], 0; v4 = v0 * 4; s[12:13] = exec.
+    let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
+    w.extend([vop2(0x1A, 4, u16::from(TWO), 0), sop1(0x04, 12, EXEC_LO)]);
+    // s_getpc_b64 s[16:17] (the next instruction's byte); s16 += the table's
+    // distance from it; s_addc_u32 s17, s17, 0.
+    let pc = 4 * (w.len() + 1);
+    w.extend([sop1(0x1F, 16, 0), sop2(0x00, 16, 16, LITERAL), 0]);
+    let distance = w.len() - 1;
+    w.push(sop2(0x04, 17, 17, ZERO));
+    // v_cmp_gt_u32 vcc, 16, v0; s_and_saveexec_b64 s[6:7], vcc;
+    // s_cbranch_execz end.
+    w.extend([vopc(0xC4, 128 + 16, 0), sop1(0x24, 6, VCC_LO)]);
+    let to_end = w.len();
+    w.push(0);
+    // s_and_saveexec_b64 s[14:15], s[12:13] (or vcc = v0 < inner);
+    // s_cbranch_execz join.
+    match inner {
+        None => w.push(sop1(0x24, 14, 12)),
+        Some(n) => w.extend([vopc(0xC4, 128 + u16::from(n), 0), sop1(0x24, 14, VCC_LO)]),
+    }
+    let to_join = w.len();
+    w.push(0);
+    // s_cmp_<cmp>_u32 s0, 0; s_cbranch_scc0 far; s_add_u32 s2, s16, 4;
+    // s_addc_u32 s3, s17, 0; s_branch join; far: s_add_u32 s2, s16, 36;
+    // s_addc_u32 s3, s17, 0.
+    w.push(sopc(cmp, 0, ZERO));
+    let to_far = w.len();
+    w.push(0);
+    w.extend([sop2(0x00, 2, 16, 128 + 4), sop2(0x04, 3, 17, ZERO)]);
+    let near = w.len();
+    w.push(0);
+    w[to_far] = sopp(0x04, to_far, w.len());
+    w.extend([sop2(0x00, 2, 16, 128 + 36), sop2(0x04, 3, 17, ZERO)]);
+    // join: exec = s[14:15]; s_load_dword s4, s[2:3], null;
+    // s_waitcnt lgkmcnt(0); v7 = s4; buffer_store_dword v7, v4, s[8:11], 0
+    // offen.
+    w[to_join] = sopp(0x08, to_join, w.len());
+    w[near] = sopp(0x02, near, w.len());
+    w.extend([sop1(0x04, EXEC_LO, 14), 0xF400_0101, 0xFA00_0000]);
+    w.extend([0xBF8C_C07F, vop1(0x01, 7, 4)]);
+    w.extend([
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 7 << 8 | 4,
+    ]);
+    // end.
+    w[to_end] = sopp(0x08, to_end, w.len());
+    w.push(S_ENDPGM);
+    w[distance] = (4 * w.len() - pc) as u32;
+    w.extend(1000..1016);
+    w
+}
+
 /// Each lane counts an index up from `min(v0 & 7, 3)` until it passes
 /// `min(v0 >> 3, 3)` (or, without `clamp`, `v0 >> 3`), at least once,
 /// adding `index + 1` to element `index` of an array in v20..v23 through
@@ -411,7 +523,7 @@ fn lower_cs(words: &[u32]) -> Result<HostShader, ShaderError> {
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
@@ -556,6 +668,59 @@ fn a_descriptor_joined_twice_is_the_one_each_path_loads() {
         let want: Vec<u32> = (0..THREADS).map(|l| 1000 + l + add).collect();
         for (label, got) in run(&shader) {
             assert_eq!(got, want, "{label}, path {path}");
+        }
+    }
+}
+
+#[test]
+fn scalars_set_in_an_arm_every_storing_lane_runs_are_the_arms() {
+    let shader = lower_cs(&loaded_in_an_arm(None)).expect("lower");
+    let want: Vec<u32> = (0..THREADS)
+        .map(|d| match d {
+            0..16 => 1000 + d,
+            16..32 => 2000 + d - 16,
+            _ => 0,
+        })
+        .collect();
+    for (label, got) in run(&shader) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn scalars_set_in_an_arm_are_refused_where_a_lane_that_skipped_it_reads_them() {
+    match lower_cs(&loaded_in_an_arm(Some(8))) {
+        Err(ShaderError::Unsupported { what, .. }) => {
+            assert_eq!(what, "an address with an untracked high half");
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn a_table_address_an_arm_sets_is_read_on_each_path_its_lanes_take() {
+    for (cmp, dword) in [(0x06, 1001), (0x07, 1009)] {
+        let shader = lower_cs(&table_pointed_at_in_an_arm(cmp, None)).expect("lower");
+        let want: Vec<u32> = (0..THREADS)
+            .map(|l| if l < 16 { dword } else { 0 })
+            .collect();
+        for (label, got) in run(&shader) {
+            assert_eq!(got, want, "{label}, s_cmp {cmp:#x}");
+        }
+    }
+}
+
+#[test]
+fn a_table_address_an_arm_sets_is_refused_where_a_lane_that_skipped_it_reads_it() {
+    for cmp in [0x06, 0x07] {
+        match lower_cs(&table_pointed_at_in_an_arm(cmp, Some(8))) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(
+                    what, "an address in an SGPR that is no root parameter",
+                    "s_cmp {cmp:#x}"
+                );
+            }
+            other => panic!("s_cmp {cmp:#x}: {:?}", other.map(|_| ())),
         }
     }
 }
