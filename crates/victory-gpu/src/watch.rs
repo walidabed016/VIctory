@@ -205,13 +205,16 @@ fn asked_writes<T>(
     for (from, to, pool) in pieces {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let asked = if pool {
+        // Guarded and not written since: the guards would find nothing, and
+        // the kernel cannot be asked (views) or need not be (pools).
+        let unwritten = guarded && skip_unwritten() && unwritten(from * PAGE, to * PAGE);
+        let asked = if pool || unwritten {
             None
         } else {
             ask(&mut j.found, from, to)
         };
         let (failed, count) = (asked.is_none(), asked.unwrap_or(0));
-        let guarded = if failed {
+        let guarded = if failed && !unwritten {
             if !guarded {
                 return None;
             }
@@ -466,6 +469,15 @@ impl Blocks {
             .is_some_and(|(_, &end)| block < end)
     }
 
+    /// Whether it holds every block of `[from, to)` (in one run, as runs
+    /// that meet are joined).
+    fn holds(&self, from: usize, to: usize) -> bool {
+        self.0
+            .range(..=from)
+            .next_back()
+            .is_some_and(|(_, &end)| to <= end)
+    }
+
     /// The runs that hold blocks of `[from, to)`, whole.
     fn touching(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let first = self
@@ -560,6 +572,8 @@ fn ask(found: &mut Vec<usize>, from: usize, to: usize) -> Option<usize> {
     let mut count = (to - from) * PAGE / KERNEL_PAGE;
     found.resize(count.max(found.len()), 0);
     let mut granularity = 0;
+    #[cfg(test)]
+    tests::ASKS.set(tests::ASKS.get() + 1);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
@@ -1151,12 +1165,29 @@ pub fn physical_pages_written(first: u64, n: usize) {
 }
 
 /// Whether every block of `[start, end)` is guarded and clean: not
-/// written since a guarded asking took it (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// written since a guarded asking took it.
 pub(crate) fn unwritten(start: usize, end: usize) -> bool {
     let g = guards();
     let (from, to) = (start / BLOCK, end.div_ceil(BLOCK));
-    g.clean.gaps(from, to).is_empty() && g.protected.gaps(from, to).is_empty()
+    from >= to || g.clean.holds(from, to) && g.protected.holds(from, to)
+}
+
+/// Whether askings for guarded memory of blocks guarded and not written
+/// since ([`unwritten`]) are answered without asking: run 99 asked ~3,100
+/// times a frame (~20 ms) about ~14 GB, all but 0.5% unchanged, each a
+/// failed write-watch call and a guarded asking for views.
+/// `VICTORY_ASK_UNWRITTEN` asks about them again.
+fn skip_unwritten() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASK_UNWRITTEN").is_none();
+        if !on {
+            tracing::info!(
+                "guarded blocks not written since are asked about again (VICTORY_ASK_UNWRITTEN)"
+            );
+        }
+        on
+    })
 }
 
 /// The runtime reserved (`watched`) or released write-watched title memory
@@ -1293,6 +1324,11 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    thread_local! {
+        /// Write-watch askings made on this thread ([`ask`]).
+        pub(super) static ASKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -1477,6 +1513,67 @@ mod tests {
         );
         title_memory_remapped(view, N * BLOCK);
         assert!(guards().protected.within(first, first + N).is_empty());
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
+    }
+
+    /// Guarded askings of blocks guarded and not written since ask nothing
+    /// and find nothing; a block the title writes is asked about again and
+    /// found written, alone.
+    #[test]
+    fn unwritten_guarded_blocks_are_not_asked_about() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        let _serial = serial();
+        const N: usize = 8;
+        // SAFETY: a pagefile section of N blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (N * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, N * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let (start, end) = (view, view + N * BLOCK);
+        forget_asked();
+        let (first, all) = writes(start, end, true).expect("guarded");
+        assert_eq!(
+            all,
+            (0..N).map(|b| (view / PAGE + b, first)).collect::<Vec<_>>()
+        );
+        forget_asked();
+        let asks = ASKS.get();
+        let (later, again) = writes(start, end, true).expect("guarded");
+        assert_eq!(ASKS.get(), asks, "unwritten blocks were asked about");
+        assert_eq!(again, all);
+        // SAFETY: our view; our handler opens the guarded block.
+        unsafe { ((view + 3 * BLOCK + 8) as *mut u32).write(7) };
+        forget_asked();
+        let (now, after) = writes(start, end, true).expect("guarded");
+        assert!(now > later);
+        let mut expected = all.clone();
+        expected[3].1 = now;
+        assert_eq!(after, expected);
+        // Its pages' writes would be found by an allocation reusing them.
+        let pages = view / PAGE..view / PAGE + N;
+        JOURNAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .written
+            .retain(|page, _| !pages.contains(page));
+        title_memory_remapped(view, N * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
