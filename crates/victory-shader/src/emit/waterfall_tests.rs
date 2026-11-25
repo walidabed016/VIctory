@@ -107,6 +107,12 @@ fn lower_cs(words: &[u32], buffers: bool) -> (HostShader, u32, bool) {
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_on(shader, views, false)
+}
+
+/// [`run`], skipping WARP where it refuses the pipeline when
+/// `wave32` (the shader takes `WaveSize(32)`, which WARP may not).
+fn run_on(shader: &HostShader, views: &[View], wave32: bool) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -130,6 +136,10 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         };
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
+            Err(e) if warp && wave32 => {
+                eprintln!("WARP refused the pipeline ({e}); skipped");
+                continue;
+            }
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
         // Both tables start at heap index 0.
@@ -500,6 +510,103 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
+    }
+}
+
+/// [`crate::resource::tests::WATERFALL_INDEXED_WAVE32`]'s loop, and ahead
+/// of it another over the same entries that only reads the height from the
+/// descriptor into an SGPR (`s_bfe_u32`), copied to v17 after the loop;
+/// with `join`, through a uniform branch around a write of 7 to it, which
+/// never runs. Lanes 8 to 15 hold entry 1's offset, the others entry 0's.
+/// The sample goes to dword `lane` of the buffer, the height to dword
+/// 32 + `lane`.
+fn height_after_the_loop(join: bool) -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x2C0E_0083, // v_lshrrev_b32 v7, 3, v0
+        0x7D84_0E81, // v_cmp_eq_u32 vcc_lo, 1, v7
+        0x7E10_02A0, // v_mov_b32 v8, 32
+        0x020E_1080, // v_cndmask_b32 v7, 0, v8, vcc_lo
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE96_037E, // s_mov_b32 s22, exec_lo
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0602,
+        0x2800_0000, // s_load_dwordx8 s[24:31], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x93A0_FF1A,
+        0x0010_000E, // s_bfe_u32 s32, s26, 0x10000e (height - 1)
+        0xBE96_4716, // s_andn2_wrexec_b32 s22, s22
+        0xBF89_FFF7, // s_cbranch_execnz -> v_readfirstlane_b32
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+    ];
+    if join {
+        w.extend([
+            0xBF07_8005, // s_cmp_lg_u32 s5, 0
+            0xBF84_0001, // s_cbranch_scc0 -> v_mov_b32
+            0xBEA0_0387, // s_mov_b32 s32, 7
+        ]);
+    }
+    w.extend([
+        0x7E22_0220, // v_mov_b32 v17, s32
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> v_readfirstlane_b32
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xE070_1080,
+        0x800A_1110, // buffer_store_dword v17, v16, s[40:43], 0 offen offset:128
+        0xBF81_0000, // s_endpgm
+    ]);
+    w
+}
+
+/// The console runs a waterfall loop's scalar code while any lane is left
+/// in it, so after it every lane holds the last pass's SGPRs: entry 1's
+/// height (the pass of lane 8, the first lane left after lane 0's pass),
+/// not each lane's own entry's, the first pass's, nor the last lane's.
+#[test]
+fn lanes_read_the_last_passs_height_after_a_waterfall_loop() {
+    let first = [[1.0f32, 0.0, 0.0, 1.0]; 2];
+    let second = [[2.0f32, 0.0, 0.0, 1.0]; 4];
+    let views = [
+        View::Texture(1, 2, &first),
+        View::Texture(1, 4, &second),
+        View::RawUav(64),
+    ];
+    for join in [false, true] {
+        let (shader, _, wave_ops) = lower_cs(&height_after_the_loop(join), false);
+        assert!(wave_ops);
+        let results = run_on(&shader, &views, true);
+        assert!(!results.is_empty());
+        for (label, words) in results {
+            let red: Vec<f32> = words[..32].iter().map(|&w| f32::from_bits(w)).collect();
+            let want: Vec<f32> = (0..32)
+                .map(|l| if (8..16).contains(&l) { 2.0 } else { 1.0 })
+                .collect();
+            assert_eq!(red, want, "{label}, join {join}");
+            assert_eq!(words[32..], [3; 32], "{label}, join {join}");
+        }
     }
 }
 
