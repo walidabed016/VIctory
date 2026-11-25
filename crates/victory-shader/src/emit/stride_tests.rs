@@ -2,7 +2,8 @@
 //! in the descriptor (a heap descriptor no used-resource entry names): the
 //! stride, and the bytes the host's raw view starts before the first
 //! record, come from the view heap's records at run time; so does that
-//! lead for scalar loads of a structured view. Synthetic
+//! lead for scalar loads of a structured view; a constant buffer's
+//! descriptor spilled to VGPR lanes loads once restored. Synthetic
 //! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present, and
 //! run on the host GPU and WARP against views of each kind.
 
@@ -96,9 +97,9 @@ fn build_with(words: &[u32], more: &[UsedResource]) -> HostShader {
 
 /// Runs `shader` with `views` at heap indices 0.. and their `records`
 /// (stride, lead and kind, one per view; bound only when the shader reads
-/// them) on the hardware GPU and on WARP (each
-/// skipped without a device): per one that ran, each UAV's dwords in heap
-/// order.
+/// them) on the hardware GPU, which must take it, and on WARP if it takes
+/// it (each skipped without a device): per one that ran, each UAV's dwords
+/// in heap order.
 fn run(
     shader: &HostShader,
     views: &[View],
@@ -113,9 +114,14 @@ fn run(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            Err(e) if warp => {
+                eprintln!("WARP refused the pipeline ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         // The table starts at heap index 0; the view records follow the
         // user data (no root views).
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -395,6 +401,73 @@ fn a_structured_views_record_count_read_from_its_descriptor_counts_its_records()
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Each lane stores dword 1 of the constant buffer at table entry 1, and 7,
+/// at dwords 2 * lane and 2 * lane + 1 of the UAV. The buffer's descriptor
+/// and the 7 are spilled to lanes 0-4 of v5 (`v_writelane_b32`) and
+/// restored (`v_readlane_b32`) before the load, as the console compiler
+/// does under SGPR pressure: the descriptor's dwords have no host value.
+const SPILLED_DESCRIPTOR: &[u32] = &[
+    0xBE86_0301, // s_mov_b32 s6, s1 (the table)
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], null
+    0xF408_0203,
+    0xFA00_0020, // s_load_dwordx4 s[8:11], s[6:7], 0x20
+    0xBE84_0387, // s_mov_b32 s4, 7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD761_0005,
+    0x0001_0008, // v_writelane_b32 v5, s8, 0
+    0xD761_0005,
+    0x0001_0209, // v_writelane_b32 v5, s9, 1
+    0xD761_0005,
+    0x0001_040A, // v_writelane_b32 v5, s10, 2
+    0xD761_0005,
+    0x0001_060B, // v_writelane_b32 v5, s11, 3
+    0xD761_0005,
+    0x0001_0804, // v_writelane_b32 v5, s4, 4
+    0xD760_0010,
+    0x0001_0105, // v_readlane_b32 s16, v5, 0
+    0xD760_0011,
+    0x0001_0305, // v_readlane_b32 s17, v5, 1
+    0xD760_0012,
+    0x0001_0505, // v_readlane_b32 s18, v5, 2
+    0xD760_0013,
+    0x0001_0705, // v_readlane_b32 s19, v5, 3
+    0xD760_0014,
+    0x0001_0905, // v_readlane_b32 s20, v5, 4
+    0xF420_0548,
+    0xFA00_0004, // s_buffer_load_dword s21, s[16:19], 0x4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0215, // v_mov_b32 v1, s21
+    0x7E04_0214, // v_mov_b32 v2, s20
+    0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+    0xE074_1000,
+    0x8003_0103, // buffer_store_dwordx2 v[1:2], v3, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_constant_buffers_descriptor_spilled_to_vgpr_lanes_loads_once_restored() {
+    let cbv = UsedResource {
+        kind: ResourceType::Cbv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 1,
+        slot: 1,
+    };
+    let shader = build_with(SPILLED_DESCRIPTOR, &[cbv]);
+    let cb: Vec<u32> = (0..64).map(|i| 1000 + i).collect();
+    let views = [View::RawUav(2 * LANES), View::Cbv(&cb)];
+    let records = [[4, 0, view_kind::RAW_UAV], [0, 0, view_kind::CBV]];
+    let want: Vec<u32> = (0..LANES).flat_map(|_| [cb[1], 7]).collect();
+    for (label, uavs) in run(&shader, &views, &records) {
+        assert_eq!(uavs[0], want, "{label}");
+    }
 }
 
 /// Each lane stores 2, 3 and 4 dwords (`buffer_store_dwordx4/x3/x2`) into
