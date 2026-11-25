@@ -702,7 +702,12 @@ fn ask(found: &mut Vec<usize>, from: usize, to: usize) -> Option<usize> {
         use crate::copystat::{Op, cost};
         cost(Op::Ask, started, from * PAGE, ((to - from) * PAGE) as u64);
         if failed {
-            cost(Op::Refused, started, from * PAGE, ((to - from) * PAGE) as u64);
+            cost(
+                Op::Refused,
+                started,
+                from * PAGE,
+                ((to - from) * PAGE) as u64,
+            );
         }
         if !failed && count > 0 {
             cost(
