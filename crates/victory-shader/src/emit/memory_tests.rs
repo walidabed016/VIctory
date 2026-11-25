@@ -4,8 +4,10 @@
 //! takes a 64-bit pointer from root constants, reads through it with a
 //! global and a scalar load, follows a pointer it loaded with another
 //! scalar load, stores through a pointer it computes (64-bit multiply-add)
-//! and does float min/max atomics, and reads through the address it takes
-//! from a buffer view's descriptor (the host's view addresses).
+//! and does float min/max atomics, reads through the address it takes
+//! from a buffer view's descriptor (the host's view addresses), reads
+//! pointers into memory no copy holds (zeros, marked missed) and stores and
+//! loads through a root UAV (title memory in such a program).
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -79,11 +81,29 @@ fn program() -> HostShader {
     w.push(S_WAITCNT_ALL);
     w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
     w.push(S_WAITCNT_ALL);
+    // Pointers into a page no copy holds and into a 256 MiB region with no
+    // block, read through: zeros, and both marked missed.
+    w.extend(s_load(1, 22, 0, 0x10)); // s[22:23]
+    w.extend(s_load(1, 24, 0, 0x18)); // s[24:25]
+    w.push(S_WAITCNT_ALL);
+    w.extend(s_load(0, 26, 22, 0));
+    w.extend(s_load(0, 27, 24, 0));
+    w.push(S_WAITCNT_ALL);
     w.push(v_mov_b32(5, 14));
     w.push(v_mov_b32(7, 18));
     w.extend(buffer_store_dword(2, 8, 0));
     w.extend(buffer_store_dword(5, 8, 4));
     w.extend(buffer_store_dword(7, 8, 8));
+    w.push(v_mov_b32(5, 26));
+    w.push(v_mov_b32(7, 27));
+    w.extend(buffer_store_dword(5, 8, 12));
+    w.extend(buffer_store_dword(7, 8, 16));
+    // A root UAV (s[6:7]), title memory in such a program: a store and a
+    // load at its address.
+    w.extend(global(28, 0, 1, 4, 6, 0x20)); // global_store_dword v1, v4, s[6:7]
+    w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
+    w.push(S_WAITCNT_ALL);
+    w.extend(buffer_store_dword(9, 8, 20));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -106,19 +126,39 @@ fn program() -> HostShader {
                 user_data: 4,
                 slot: 1,
             },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
         ],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        }],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
+            rsrc2: 8 << 1,
             threads: [1, 1, 1],
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -127,7 +167,7 @@ fn program() -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 7, "every access through the pointer is title memory");
+    assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -142,6 +182,7 @@ fn program() -> HostShader {
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
+    assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -189,7 +230,13 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let pointer = TITLE + 0x100;
     memory[2] = pointer as u32;
     memory[3] = (pointer >> 32) as u32;
+    // The next page (no copy) and another 256 MiB region (no block).
+    let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
+    memory[4..8].copy_from_slice(&[next as u32, (next >> 32) as u32, far as u32, (far >> 32) as u32]);
     memory[0x40] = 0x2222_2222;
+    // The root UAV's address, and what it loads there.
+    let root_uav = TITLE + 0x200;
+    memory[(0x200 + 0x24) / 4] = 0x3333_3333;
     memory[0x80 / 4] = 1.0f32.to_bits();
     memory[0x84 / 4] = (-1.0f32).to_bits();
     let value = 0xCAFE_F00D;
@@ -211,6 +258,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 let constants = [TITLE as u32, (TITLE >> 32) as u32, value, operand.to_bits()];
                 ud[u.index as usize] = match u.root {
                     RootType::Constants => constants[u.dword as usize],
+                    RootType::Descriptor => (root_uav >> (32 * u.dword)) as u32,
                     _ => 0,
                 };
             }
@@ -226,7 +274,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(3),
+                            View::RawUav(6),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -237,17 +285,23 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert_eq!(out[0], [0x1111_1111, 0x2222_2222, 0x2222_2222], "{label}: reads");
+            assert_eq!(
+                out[0],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333],
+                "{label}: reads"
+            );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
+            assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");
             let floats = [f32::from_bits(out[1][0x20]), f32::from_bits(out[1][0x21])];
             let want = [operand.min(1.0), operand.max(-1.0)];
             assert_eq!(floats, want, "{label}: float min and max");
-            // The page written is marked, nothing else.
+            // The far region by its level-1 index, the page written, the
+            // page missed after it; nothing else.
             let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
             let marked: Vec<usize> = (0..out[2].len() * 32)
                 .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
                 .collect();
-            assert_eq!(marked, [entry], "{label}: written pages");
+            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
         }
         ran += 1;
     }

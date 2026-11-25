@@ -2,9 +2,9 @@
 //! box and triangle tests with their edge cases, and synthetic GFX10
 //! programs running `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`
 //! over random nodes and rays on the host GPU and WARP, compared with the
-//! reference word for word. The nodes come from an ordinary buffer (a root
-//! SRV whose address the program shifts into the descriptor), or from title
-//! memory at a pointer in root constants (`Lower::memory`).
+//! reference word for word. The nodes come from a root SRV whose address
+//! the program shifts into the descriptor, or from a pointer in root
+//! constants; both are title memory (`Lower::memory`) in such a program.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -712,7 +712,9 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
 
 fn run_cases(wide: bool, batches: usize, memory: bool) {
     let shader = build(wide, memory);
-    assert_eq!(shader.memory, memory);
+    // A program with the BVH instruction reads its root SRV as title
+    // memory too.
+    assert!(shader.memory);
     let mut rng = Rng(if wide { 77 } else { 7 });
     let batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
         .map(|_| (0..LANES).map(|_| case(&mut rng)).collect())
@@ -734,6 +736,7 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Table, 1) => 0,
                 (RootType::Constants, 0) if memory => (TITLE >> (32 * u.dword)) as u32,
+                (RootType::Descriptor, 0) if !memory => (TITLE >> (32 * u.dword)) as u32,
                 _ => panic!("{u:?}"),
             };
         }
@@ -755,29 +758,18 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                 let at = LANES * 16 + 32 * n;
                 data[at..at + 28].copy_from_slice(w);
             }
-            let (roots, views) = if memory {
-                (
-                    vec![
-                        (0, Root::Constants(ud.clone())),
-                        (1, Root::View { srv: true, data: page_table(1, 3) }),
-                    ],
-                    vec![
-                        View::RawUav((LANES * 4) as u32),
-                        View::Memory(&data),
-                        View::Pair,
-                        View::NullPair,
-                        View::Pair,
-                    ],
-                )
-            } else {
-                (
-                    vec![
-                        (0, Root::Constants(ud.clone())),
-                        (1, Root::View { srv: true, data: data.clone() }),
-                    ],
-                    vec![View::RawUav((LANES * 4) as u32)],
-                )
-            };
+            let roots = vec![
+                (0, Root::Constants(ud.clone())),
+                (1, Root::View { srv: true, data: page_table(1, 3) }),
+                (2, Root::Uav(2 * 4096 / 32)),
+            ];
+            let views = [
+                View::RawUav((LANES * 4) as u32),
+                View::Memory(&data),
+                View::Pair,
+                View::NullPair,
+                View::Pair,
+            ];
             let out = host
                 .dispatch(
                     &root,

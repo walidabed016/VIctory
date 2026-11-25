@@ -80,9 +80,9 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-    /// The title-memory page table made for this list (`crate::memory`):
-    /// view heap, table and written-pages bitmap host addresses.
-    memory: Option<(usize, u64, u64)>,
+    /// The title-memory page table made for this list (`crate::memory`)
+    /// and its view heap.
+    memory: Option<(usize, crate::memory::Map)>,
 }
 
 impl Drop for State {
@@ -408,9 +408,11 @@ impl State {
     }
 
     /// The user-data value of a root argument, as translated shaders read
-    /// it: a table's byte offset in its heap, a constant's value.
+    /// it: a table's byte offset in its heap, a constant's value, a root
+    /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
+            (Some(Root::View(address)), RootType::Descriptor) => (address >> (32 * dword)) as u32,
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
                 None => {
@@ -435,17 +437,19 @@ impl State {
         }
     }
 
-    /// The host addresses of the list's title-memory page table and
-    /// written-pages bitmap for the bound view heap, made on first use.
-    fn memory_map(&mut self, list: &HostList) -> Option<(u64, u64)> {
+    /// The host addresses of the list's title-memory page table and page
+    /// bitmap for the bound view heap, made on first use and again when
+    /// one of `roots` (root view addresses) is in no copy it names.
+    fn memory_map(&mut self, list: &HostList, roots: &[u64]) -> Option<(u64, u64)> {
         let heap = match self.heaps[0] {
             0 => MEMORY_HEAP,
             h => h,
         };
-        if let Some((h, table, dirty)) = self.memory
-            && h == heap
+        if let Some((h, map)) = &self.memory
+            && *h == heap
+            && roots.iter().all(|&a| map.holds(a))
         {
-            return Some((table, dirty));
+            return Some((map.table, map.dirty));
         }
         let host = if heap == MEMORY_HEAP {
             crate::memory::heap()?
@@ -453,13 +457,15 @@ impl State {
             crate::descriptor::heap(heap as This).host()?
         };
         let mut slots = Vec::new();
-        let map = crate::memory::build(list, host, &mut slots);
+        let before = self.memory.as_ref().map(|m| &m.1);
+        let map = crate::memory::build(list, host, &mut slots, before);
         if let [first, n] = slots[..] {
             self.dynamic.push((heap, first, n));
         }
         let map = map?;
-        self.memory = Some((heap, map.table, map.dirty));
-        Some((map.table, map.dirty))
+        let out = (map.table, map.dirty);
+        self.memory = Some((heap, map));
+        Some(out)
     }
 
     /// The bound heap holding `handle`.
@@ -628,6 +634,24 @@ impl State {
                     None => self.user_value(compute, u.slot, u.root, u.dword),
                 };
             }
+            // Root views a shader reads as title memory: the copies holding
+            // their addresses go into the page table.
+            let mut roots = Vec::new();
+            for u in &t.host.user_data {
+                if u.root == RootType::Descriptor
+                    && u.dword == 0
+                    && let Some(Root::View(address)) =
+                        self.roots_ref(compute).get(usize::from(u.slot))
+                    && let Some(shadow) = crate::shadow::find(*address, 1)
+                {
+                    let uav = t.used.iter().any(|r| {
+                        r.slot == u.slot
+                            && r.root == RootType::Descriptor
+                            && r.kind == ResourceType::Uav
+                    });
+                    roots.push((*address, uav.then_some(shadow)));
+                }
+            }
             if let Some((param, dwords)) = stage.user_data {
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -702,10 +726,22 @@ impl State {
                 }
             }
             if let Some(param) = stage.memory {
-                let Some((table, dirty)) = self.memory_map(list) else {
+                let addresses: Vec<u64> = roots.iter().map(|r| r.0).collect();
+                let Some((table, dirty)) = self.memory_map(list, &addresses) else {
                     once!("a shader reading title memory dropped: no view heap or dynamic slots");
                     return false;
                 };
+                crate::memory::note_use(&p.name);
+                // What shaders write through a root UAV goes back by its
+                // bytes, as through root views ([`root_view`]).
+                for (address, shadow) in &roots {
+                    if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
+                        let len = shadow.left(*address).min(1 << 20);
+                        shadow.refresh(list, *address, len);
+                        shadow.gpu_writes(list, *address, len);
+                        map.precise(*address, len);
+                    }
+                }
                 // SAFETY: an open list; list memory alive until it is reset.
                 unsafe {
                     if compute {

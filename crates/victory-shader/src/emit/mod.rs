@@ -113,11 +113,19 @@
 //!   two dwords each: the resource-heap index of a raw SRV of the host
 //!   memory holding the page, whose raw UAV is the next index, and the low
 //!   dword of the title address that memory starts at (byte offset =
-//!   address low dword - it). Block 0 names null views; addresses at or
-//!   above 2^40 use it. A shader that writes there
-//!   ([`HostShader::memory_writes`]) sets bit `block × 4096 + page` of the
-//!   root UAV `u0` in [`MEMORY_SPACE`] for each page it writes (pages of an
-//!   access's first and last byte): what the host copies back.
+//!   address low dword - it). Block 0 names null views (its entry 0 is
+//!   how the shader tells a miss); addresses at or above 2^40 use it. The
+//!   root UAV `u0` in [`MEMORY_SPACE`] ([`HostShader::memory_writes`]) takes
+//!   bit `block × 4096 + page` for each page a shader writes (pages of an
+//!   access's first and last byte: what the host copies back) and for each
+//!   page with no copy an access reached, or for an address whose 256 MiB
+//!   region has no block, bit `level-1 index` (block 0's bits). Reads there
+//!   give 0, writes are dropped. In such a program (and one with root
+//!   parameters past its user SGPRs) root SRVs and UAVs are title memory
+//!   too: no root views; the shader reads their addresses as user data
+//!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
+//!   dword 0 the address's low dword, 1 the high), and the host must have
+//!   a copy holding each such address.
 //! * **View addresses** ([`HostShader::view_addresses`]): a buffer
 //!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
 //!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
@@ -395,8 +403,8 @@ pub struct HostShader {
     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
     /// "Title memory").
     pub memory: bool,
-    /// Whether it also writes there: the host binds the written-pages
-    /// bitmap `u0` in [`MEMORY_SPACE`].
+    /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
+    /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
     /// Whether it reads buffer views' title addresses from their
     /// descriptors: the host binds the view addresses `t1` in
@@ -457,7 +465,8 @@ pub struct UserData {
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
-    /// `Constants` or `Table` (see the module notes for the value).
+    /// `Constants`, `Table` or, in a program using title memory,
+    /// `Descriptor` (see the module notes for the value).
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,

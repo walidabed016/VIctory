@@ -415,7 +415,7 @@ mod tests {
         let address = |r: &Recording| std::ptr::from_ref(r.get().unwrap()) as usize;
         let errors = errors_of(|| {
             let recording = Recording::new(Some(host.new_list().unwrap()));
-            let uploads = Mutex::new(vec![vec![1u8; 16]]);
+            let uploads = Mutex::new(vec![crate::list::Upload::new(16).unwrap()]);
             let first = address(&recording);
             recording.get().unwrap().close();
             recording.before_reset_as(&uploads, true, |_| false);
@@ -988,7 +988,7 @@ impl Held {
 /// Host lists title lists left to submissions in flight, with the upload
 /// memory the title wrote for them, until those complete; then free.
 struct Recycler {
-    held: Vec<(Held, Vec<Vec<u8>>)>,
+    held: Vec<(Held, Vec<crate::list::Upload>)>,
     free: Vec<Held>,
 }
 
@@ -1062,13 +1062,13 @@ impl Recording {
     /// that run its host list, or, recycling, leaves the list to them with
     /// the upload memory the title wrote for it (`uploads`) and records
     /// into a free one.
-    pub(crate) fn before_reset(&self, uploads: &Mutex<Vec<Vec<u8>>>) {
+    pub(crate) fn before_reset(&self, uploads: &Mutex<Vec<crate::list::Upload>>) {
         self.before_reset_as(uploads, recycling(), crate::pipelined::flying);
     }
 
     fn before_reset_as(
         &self,
-        uploads: &Mutex<Vec<Vec<u8>>>,
+        uploads: &Mutex<Vec<crate::list::Upload>>,
         recycle: bool,
         flying: impl Fn(usize) -> bool,
     ) {
@@ -3381,6 +3381,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         self.logged_frames += 1;
+        crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;

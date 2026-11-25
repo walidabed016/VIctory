@@ -301,6 +301,10 @@ struct Lower<'a> {
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
+    /// The program uses title memory (addresses it computes, the BVH
+    /// instruction, root parameters through the user-data pointer): its root
+    /// SRVs and UAVs are read there too ([`Lower::raw_view`]).
+    root_memory: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -369,6 +373,19 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
 /// reach that block, so the ballot misses none.
+/// A page table lookup ([`Lower::memory`]).
+struct MemoryEntry {
+    handle: V,
+    offset: V,
+    /// Block × 4096 + page in the block.
+    entry: V,
+    block: V,
+    /// The level-1 index: address bits 28-39.
+    l1: V,
+    /// No host copy holds the page.
+    miss: V,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskData {
     /// Compute: host lane n is console lane n (the program declares the
@@ -879,6 +896,8 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+            || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let mut halves = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1041,6 +1060,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
+            root_memory,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1213,10 +1233,10 @@ impl<'a> Lower<'a> {
             return Err("a global load result");
         };
         let c = self.cur;
+        let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
         let (h, off) = if a.param == MEMORY {
             let (lo, hi) = self.global_address(inst)?;
-            let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
-            let (h, off) = self.memory(lo, hi, bytes, false);
+            let (h, off) = self.memory(lo, hi, bytes, false, guard);
             (Some(h), off)
         } else {
             let mut off = self.s.m.i32(a.offset);
@@ -1228,18 +1248,19 @@ impl<'a> Lower<'a> {
                 let d = self.i32_of(d)?;
                 off = self.s.m.bin(c, Bin::Add, off, d);
             }
-            let h = if a.param == CODE {
-                None
+            if a.param == CODE {
+                (None, off)
             } else {
                 let src = Source::Built {
                     address: a,
                     bits: 0,
                     words: [0, 0],
                 };
-                Some(self.handle((b, i), &src, false, (11, 0))?)
-            };
-            (h, off)
+                let (h, off) = self.raw_view((b, i), &src, off, bytes, (11, 0), false, guard)?;
+                (Some(h), off)
+            }
         };
+        let c = self.cur;
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
@@ -1384,15 +1405,25 @@ impl<'a> Lower<'a> {
                 bits: 0,
                 words: [0, 0],
             };
-            let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
-            (None, Some((h, off)))
+            match self.root_address(&src) {
+                Some((lo, hi)) => {
+                    // As `raw_view`, looked up inside the guard below.
+                    let (lo, hi) = self.add64(lo, hi, off, false);
+                    let mask = self.s.m.i32(0xFFFF);
+                    (Some((lo, self.s.m.bin(self.cur, Bin::And, hi, mask))), None)
+                }
+                None => {
+                    let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+                    (None, Some((h, off)))
+                }
+            }
         };
         let (iu, void, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.void, self.s.t.i32);
         // Title memory is looked up (and its pages marked written) only in
         // the lanes that write.
         let at = self.begin_guarded(guard);
         let (h, off) = match (memory, root) {
-            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true),
+            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
@@ -2236,10 +2267,18 @@ impl<'a> Lower<'a> {
     fn user(&mut self, param: usize, dword: u32) -> Val {
         let rp = self.x.native.layout[param];
         match rp.root {
-            RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
-            RootType::Constants | RootType::Table => {}
-            _ => return Val::Missing("a root descriptor"),
+            RootType::ResourceHeap | RootType::SamplerHeap => Val::I32(self.s.m.i32(0)),
+            RootType::Constants | RootType::Table => Val::I32(self.user_dword(param, dword)),
+            // Its address, where root views are title memory.
+            RootType::Descriptor if self.root_memory => Val::I32(self.user_dword(param, dword)),
+            _ => Val::Missing("a root descriptor"),
         }
+    }
+
+    /// User-data dword `dword` of root parameter `param` as the host passes
+    /// it (for a root descriptor: its GPU address, low dword first).
+    fn user_dword(&mut self, param: usize, dword: u32) -> V {
+        let rp = self.x.native.layout[param];
         let index = u32::from(rp.user_data) + dword;
         self.user_reads.insert(
             index,
@@ -2269,7 +2308,52 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
+    }
+
+    /// In a program that uses title memory, the address of the root SRV or
+    /// UAV a descriptor `src` is built around: `(lo, hi)`, `hi` cut to bits
+    /// 32-47. None for other descriptors and programs.
+    fn root_address(&mut self, src: &Source) -> Option<(V, V)> {
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        let rp = self.x.native.layout.get(address.param)?;
+        let cbv = self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv);
+        if !self.root_memory || rp.root != RootType::Descriptor || cbv {
+            return None;
+        }
+        let lo = self.user_dword(address.param, 0);
+        let hi = self.user_dword(address.param, 1);
+        let mask = self.s.m.i32(0xFFFF);
+        Some((lo, self.s.m.bin(self.s.entry, Bin::And, hi, mask)))
+    }
+
+    /// A raw view `src` at byte offset `off` (`props` as [`Self::handle`]
+    /// takes them): its handle and the offset in it. A root view of a
+    /// program that uses title memory is title memory at the root address
+    /// plus the offset ([`Self::memory`]: `bytes` accessed, `write`, the
+    /// `active` lanes), so the access is bounds-checked (host root views
+    /// have no bounds) and sees the copies the program's other accesses see.
+    #[allow(clippy::too_many_arguments)]
+    fn raw_view(
+        &mut self,
+        site: Site,
+        src: &Source,
+        off: V,
+        bytes: u32,
+        props: (u32, u32),
+        write: bool,
+        active: Option<V>,
+    ) -> Result<(V, V), Why> {
+        let Some((lo, hi)) = self.root_address(src) else {
+            return Ok((self.handle(site, src, false, props)?, off));
+        };
+        // The hardware adds the 32-bit offset to the 48-bit base.
+        let (lo, hi) = self.add64(lo, hi, off, false);
+        let mask = self.s.m.i32(0xFFFF);
+        let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
+        Ok(self.memory(lo, hi, bytes, write, active))
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -5076,6 +5160,11 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        // A root UAV is read as title memory in a program that uses it.
+        let root_uav = self.root_memory
+            && matches!(kind, Some(u) if u.kind == ResourceType::Uav)
+            && matches!(src, Source::Built { address, .. }
+                if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         let xs = if self.by_slot_kind(src) {
             // A raw view's bytes start at its lead (structured views made
             // raw start before their first record).
@@ -5095,14 +5184,14 @@ impl<'a> Lower<'a> {
                 let at = l.s.m.bin(l.cur, Bin::Add, addr, lead);
                 Ok(l.raw_dwords(h, at, count))
             })?
-        } else if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        } else if matches!(kind, Some(u) if u.kind == ResourceType::Srv) || root_uav {
             // A structured view's raw view starts its lead before the first
             // record (a raw one's has none).
             if kind.is_some_and(|u| u.stride != 0) && !matches!(src, Source::Built { .. }) {
                 let (_, lead) = self.view_record(src)?;
                 addr = self.s.m.bin(c, Bin::Add, addr, lead);
             }
+            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
             self.raw_dwords(h, addr, count)
         } else {
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
@@ -5940,7 +6029,7 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
-        let (h, off) = self.memory(lo, hi, 4 * count, false);
+        let (h, off) = self.memory(lo, hi, 4 * count, false, None);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
@@ -5986,52 +6075,81 @@ impl<'a> Lower<'a> {
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
     /// item). Every access to an address the program computes goes through
     /// here: scalar and global loads, stores and atomics, the BVH node
-    /// fetch. `(hi:lo)` is the 64-bit address of the access's first byte
-    /// (`hi` holds bits 32-47), `bytes` its size, `write` whether it stores
-    /// or does atomics. Returns a raw buffer handle (read-write with
-    /// `write`) and the address's byte offset in it; the access's dwords
-    /// follow at `+ 4k`. Contract (`emit` "Title memory"): a page table in
-    /// the root SRV `t0` of [`super::shader::MEMORY_SPACE`]; a write marks
-    /// the pages it touches in the root UAV `u0` there.
+    /// fetch, and in a program that uses title memory its root SRVs and UAVs
+    /// ([`Self::raw_view`]). `(hi:lo)` is the 64-bit address of the access's
+    /// first byte (`hi` holds bits 32-47), `bytes` its size, `write` whether
+    /// it stores or does atomics, `active` the lanes that access (`None`:
+    /// all; the others look up but mark nothing). Returns a raw buffer handle
+    /// (read-write with `write`) and the address's byte offset in it; the
+    /// access's dwords follow at `+ 4k`. Memory no host copy holds is the
+    /// null view: reads give 0, writes are dropped. Contract (`emit` "Title
+    /// memory"): a page table in the root SRV `t0` of
+    /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
+    /// per page written and per page or 256 MiB region missed. May end in a
+    /// new block: callers take [`Lower::cur`] afresh.
     // shortcut: one lookup per access, so its bytes are taken to lie in one
     // host copy of title memory (any access within a 64 KiB page does).
-    pub(crate) fn memory(&mut self, lo: V, hi: V, bytes: u32, write: bool) -> (V, V) {
-        let (h, off, entry) = self.memory_entry(lo, hi, write);
+    pub(crate) fn memory(
+        &mut self,
+        lo: V,
+        hi: V,
+        bytes: u32,
+        write: bool,
+        active: Option<V>,
+    ) -> (V, V) {
+        let e = self.memory_entry(lo, hi, write);
+        let c = self.cur;
+        // Writes always mark (written or missed pages), reads only misses.
+        let marks = match (write, active) {
+            (true, Some(a)) => Some(a),
+            (true, None) => None,
+            (false, Some(a)) => Some(self.s.m.bin(c, Bin::And, e.miss, a)),
+            (false, None) => Some(e.miss),
+        };
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        // A miss marks its page's entry, or with no block its region's
+        // level-1 index (bits 0-4095, block 0's entries, which no copy has).
+        let zero = k(self, 0);
+        let empty = self.s.m.cmp(c, pred::EQ, e.block, zero);
+        let missed = self.s.m.select(c, empty, e.l1, e.entry);
+        let first = self.s.m.select(c, e.miss, missed, e.entry);
+        let mut bits = vec![first];
         if write {
-            // The pages of the first and the last byte (one 256 MiB block).
-            let c = self.cur;
-            let dirty = self.s.memory_dirty_handle();
-            let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-            let (last, k16, k5, k31, one) =
-                (k(self, bytes - 1), k(self, 16), k(self, 5), k(self, 31), k(self, 1));
-            // Byte offset of the bitmap dword; operation 2 is OR.
-            let (k2, or) = (k(self, 2), k(self, 2));
+            // A write marks the pages of its first and last byte (one block).
+            let (last, k16) = (k(self, bytes - 1), k(self, 16));
             let end = self.s.m.bin(c, Bin::Add, lo, last);
             let a = self.s.m.bin(c, Bin::LShr, lo, k16);
             let b = self.s.m.bin(c, Bin::LShr, end, k16);
             let pages = self.s.m.bin(c, Bin::Sub, b, a);
-            let iu = self.s.m.undef(self.s.t.i32);
-            for e in [entry, self.s.m.bin(c, Bin::Add, entry, pages)] {
-                let word = self.s.m.bin(c, Bin::LShr, e, k5);
-                let word = self.s.m.bin(c, Bin::Shl, word, k2);
-                let bit = self.s.m.bin(c, Bin::And, e, k31);
-                let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-                self.s.op(
-                    c,
-                    "atomicBinOp.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    78,
-                    &[dirty, or, word, iu, iu, bit],
-                );
-            }
+            let next = self.s.m.bin(c, Bin::Add, e.entry, pages);
+            bits.push(self.s.m.select(c, e.miss, first, next));
         }
-        (h, off)
+        let bitmap = self.s.memory_dirty_handle();
+        let at = self.begin_guarded(marks);
+        let c = self.cur;
+        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
+        let iu = self.s.m.undef(self.s.t.i32);
+        for n in bits {
+            // Byte offset of the bitmap dword; operation 2 is OR.
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            self.s.op(
+                c,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                78,
+                &[bitmap, k2, word, iu, iu, bit],
+            );
+        }
+        self.end_guarded(at, &[]);
+        (e.handle, e.offset)
     }
 
-    /// [`Self::memory`]'s lookup: the handle, the byte offset, and the page
-    /// table entry's number (block × 4096 + page in the block).
-    fn memory_entry(&mut self, lo: V, hi: V, write: bool) -> (V, V, V) {
+    /// [`Self::memory`]'s lookup in the page table.
+    fn memory_entry(&mut self, lo: V, hi: V, write: bool) -> MemoryEntry {
         let c = self.cur;
         let map = self.s.memory_handle();
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
@@ -6060,6 +6178,9 @@ impl<'a> Lower<'a> {
         let four = k(self, 4);
         let at = self.s.m.bin(c, Bin::Add, at, four);
         let start = self.raw_dword(map, at);
+        // Block 0's first entry names the null pair: no copy holds the page.
+        let null = self.raw_dword(map, first);
+        let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
         let (view, props) = if write {
             let one = k(self, 1);
@@ -6067,9 +6188,14 @@ impl<'a> Lower<'a> {
         } else {
             (view, (11, 0))
         };
-        let h = self.s.heap_handle(c, view, false, true, props);
-        let off = self.s.m.bin(c, Bin::Sub, lo, start);
-        (h, off, entry)
+        MemoryEntry {
+            handle: self.s.heap_handle(c, view, false, true, props),
+            offset: self.s.m.bin(c, Bin::Sub, lo, start),
+            entry,
+            block,
+            l1,
+            miss,
+        }
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
@@ -10403,9 +10529,12 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let known = match slot {
-                None => Some(self.handle(site, src, false, (11 | u, 0))?),
-                Some(_) => None,
+            let (known, off) = match slot {
+                None => {
+                    let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
+                    (Some(h), off)
+                }
+                Some(_) => (None, off),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -10466,10 +10595,14 @@ impl<'a> Lower<'a> {
                 return Err("a typed buffer store of some channels");
             }
             let at = index.unwrap_or(self.s.m.i32(0));
-            let known = match slot {
-                None if typed => Some(self.handle(site, src, false, (10 | u, 0x409))?),
-                None => Some(self.handle(site, src, false, (11 | u, 0))?),
-                Some(_) => None,
+            let (known, off) = match slot {
+                None if typed => (Some(self.handle(site, src, false, (10 | u, 0x409))?), off),
+                None => {
+                    let (h, off) =
+                        self.raw_view(site, src, off, 4 * count, (11 | u, 0), true, guard)?;
+                    (Some(h), off)
+                }
+                Some(_) => (None, off),
             };
             let guarded = self.begin_guarded(guard);
             match (known, slot) {
@@ -10500,7 +10633,8 @@ impl<'a> Lower<'a> {
             }
             let xs = match slot {
                 None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (h, off) =
+                        self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
                     self.format_load(h, off, f, count)?
                 }
                 Some((index, per_lane, .., kind)) => {
@@ -10543,7 +10677,8 @@ impl<'a> Lower<'a> {
         } else {
             match slot {
                 None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (h, off) =
+                        self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
                     self.raw_view_load(h, off, count)
                 }
                 Some((index, per_lane, .., kind)) => {

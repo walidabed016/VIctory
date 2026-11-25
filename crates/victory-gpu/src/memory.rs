@@ -9,23 +9,27 @@
 //! within a submission too.
 //!
 //! Per list, at its first dispatch or draw with such a shader in a view
-//! heap: every host copy made so far gets its pair of views in dynamic
+//! heap (and again when a root view's address is in no copy the table
+//! names): every host copy made so far gets its pair of views in dynamic
 //! slots of that heap (held until the list is reset), the page table goes
 //! into the list's upload memory, and every copy is brought up to date at
-//! each submission (page by page, as every refresh). Shaders that write
-//! mark the pages they write in the list's bitmap; after the submission
-//! each marked page goes back into title memory
+//! each submission (page by page, as every refresh). Shaders mark the
+//! pages they write in the table's bitmap; after the submission each
+//! marked page goes back into title memory
 //! ([`crate::shadow::Shadow::copy_back_page`]) and the bitmap is cleared.
+//! Such shaders read their root views there too, so the host makes a copy
+//! for each root view's address before the table.
 //!
 //! Cost per submission with such a shader: one write-watch check of every
 //! host copy (the refresh), copies of the pages the title wrote, and a
 //! compare of each 64 KiB page shaders wrote; per list, two views per copy
 //! and a 16 KiB + 32 KiB-per-256-MiB-block table.
 //!
-//! shortcut: memory no copy holds when the table is made (or that is only
-//! made later in the list's recording) reads 0 and takes no writes; a page
-//! two copies share without either holding all of it is the larger one's.
-//! Upgrade when a world run shows raw addresses outside every copy.
+//! Memory no copy holds when the table is made reads 0 and takes no
+//! writes (null views, bounds-checked); shaders mark such pages (or 256
+//! MiB regions with no block) in the bitmap and [`log_frame`] counts them.
+//! shortcut: a page two copies share without either holding all of it is
+//! the larger one's.
 
 use std::sync::Arc;
 
@@ -41,8 +45,84 @@ const LEVEL1: usize = 4096;
 pub(crate) struct Map {
     /// The page table's host GPU address (the root SRV).
     pub(crate) table: u64,
-    /// The written-pages bitmap's host GPU address (the root UAV).
+    /// The page bitmap's host GPU address (the root UAV).
     pub(crate) dirty: u64,
+    /// The title ranges of the copies it names.
+    ranges: Vec<(u64, u64)>,
+    /// Ranges that go back byte for byte instead (root UAVs, see
+    /// [`Map::precise`]).
+    precise: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+impl Map {
+    /// Whether `address` is in a copy the table names, or can never be
+    /// (at or above 2^40).
+    pub(crate) fn holds(&self, address: u64) -> bool {
+        address >= 1 << 40 || self.ranges.iter().any(|&(s, l)| address >= s && address - s < l)
+    }
+
+    /// Shaders write `[address, address + len)` through a root UAV, which
+    /// goes back by its bytes before and after the run
+    /// ([`Shadow::gpu_writes`]): the marked pages it touches are left to
+    /// that. A whole page from the copy would put back what it held at
+    /// the submission over what the title (or DirectStorage, through
+    /// physical pages no watch sees) wrote there since.
+    /// shortcut: a marked page partly in such a range loses what shaders
+    /// wrote in its other part.
+    pub(crate) fn precise(&self, address: u64, len: u64) {
+        self.precise
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((address, len));
+    }
+}
+
+/// Since the last frame line: draws and dispatches with shaders using title
+/// memory (by pipeline), page tables made, pages copied back, pages and 256
+/// MiB regions missed (no copy), and the first missed addresses.
+#[derive(Default)]
+struct Stats {
+    uses: std::collections::BTreeMap<String, u64>,
+    tables: u64,
+    written: u64,
+    missed_pages: u64,
+    missed_regions: u64,
+    first_missed: Vec<u64>,
+}
+
+static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
+
+fn stats<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
+    f(STATS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
+/// A draw or dispatch of `pipeline` uses title memory.
+pub(crate) fn note_use(pipeline: &str) {
+    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+}
+
+/// Logs what title memory did since the last call, if anything: a line per
+/// presented frame while shaders use it.
+pub(crate) fn log_frame() {
+    let s = stats(std::mem::take);
+    if s.uses.is_empty() && s.written + s.missed_pages + s.missed_regions == 0 {
+        return;
+    }
+    let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
+    uses.sort_by(|a, b| b.1.cmp(a.1));
+    let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
+    let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
+    tracing::info!(
+        "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
+         copied back, missed {} pages and {} 256 MiB regions with no copy (first: {})",
+        s.uses.values().sum::<u64>(),
+        uses.join(", "),
+        s.tables,
+        s.written,
+        s.missed_pages,
+        s.missed_regions,
+        missed.join(" ")
+    );
 }
 
 /// Our view heap for lists that bind none of the title's (dynamic slots
@@ -98,11 +178,13 @@ fn table(copies: &[(u64, u64)], first: u32) -> (Vec<u32>, Vec<usize>, Vec<Option
 }
 
 /// The page table of `list` in view heap `heap` (a host heap): views of
-/// every host copy in dynamic slots, which `slots` gets to give back.
+/// every host copy in dynamic slots, which `slots` gets to give back;
+/// `before` the list's earlier table, whose byte-for-byte ranges it keeps.
 pub(crate) fn build(
     list: &HostList,
     heap: &crate::descriptor::host::HostHeap,
     slots: &mut Vec<u32>,
+    before: Option<&Map>,
 ) -> Option<Map> {
     let copies: Vec<Arc<Shadow>> = crate::shadow::all();
     // A raw view holds at most 2^27 dwords: a longer copy (a slab of the
@@ -148,24 +230,60 @@ pub(crate) fn build(
     }
     let data = data as usize;
     tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+    stats(|s| s.tables += 1);
+    let precise = before.map(|m| m.precise.clone()).unwrap_or_default();
+    let byte_for_byte = precise.clone();
     list.defer_after(move || {
+        let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        let (mut written, mut pages, mut regions, mut missed) = (0, 0, 0, Vec::new());
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let (block, page) = (entry / BLOCK, entry % BLOCK);
-                if let (Some(&l1), Some(Some(k))) = (blocks.get(block), owner.get(entry))
-                    && block != 0
-                {
-                    copies[pieces[*k].0].copy_back_page(l1 << 28 | page << 16);
+                // Block 0's bits are 256 MiB regions with no block.
+                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                    regions += 1;
+                    missed.push((entry as u64) << 28);
+                    continue;
+                };
+                let at = (l1 << 28 | page << 16) as u64;
+                match owner.get(entry) {
+                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    Some(Some(k)) => {
+                        let n = copies[pieces[*k].0].copy_back_page(at as usize);
+                        tracing::debug!(
+                            page = format_args!("{at:#x}"),
+                            copy = format_args!("{:#x?}", copies[pieces[*k].0].range()),
+                            bytes = n,
+                            "title memory page written back"
+                        );
+                        written += 1;
+                    }
+                    _ => {
+                        pages += 1;
+                        missed.push(at);
+                    }
                 }
             }
         }
+        stats(|s| {
+            s.written += written;
+            s.missed_pages += pages;
+            s.missed_regions += regions;
+            let room = 4usize.saturating_sub(s.first_missed.len());
+            s.first_missed.extend(missed.into_iter().take(room));
+        });
     });
-    Some(Map { table, dirty })
+    Some(Map {
+        table,
+        dirty,
+        ranges,
+        precise,
+    })
 }
 
 #[cfg(test)]

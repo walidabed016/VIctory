@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: crate::host::Recording,
     #[cfg(windows)]
@@ -1010,16 +1010,95 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let Some(block) = Upload::new(len) else {
+        return std::ptr::null_mut();
+    };
+    let start = block.start();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
 }
+
+/// Memory [`allocate_upload`] hands out, zeroed, freed when the list is
+/// reset. On Windows it lies in [4 GiB, 2^40), where translated shaders
+/// find title memory by address (`crate::memory`; the console's GPU
+/// addresses have 40 bits), and is a buffer of its own to the host copies
+/// (`crate::shadow`), so its copy is exactly it.
+pub(crate) struct Upload {
+    #[cfg(windows)]
+    at: usize,
+    #[cfg(not(windows))]
+    block: Vec<u8>,
+}
+
+impl Upload {
+    #[cfg(windows)]
+    pub(crate) fn new(len: usize) -> Option<Upload> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
+            MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 32) as *mut _,
+            HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // Watched like the title's pools: copies take only written pages.
+        // SAFETY: a fresh allocation; the parameter points at `requirements`,
+        // which outlives the call.
+        let at = unsafe {
+            VirtualAlloc2(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+                &mut parameter,
+                1,
+            )
+        } as usize;
+        if at == 0 {
+            return None;
+        }
+        crate::shadow::register(at, at as u64, len as u64);
+        Some(Upload { at })
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn new(len: usize) -> Option<Upload> {
+        Some(Upload {
+            block: vec![0; len],
+        })
+    }
+
+    fn start(&self) -> *mut u8 {
+        #[cfg(windows)]
+        return self.at as *mut u8;
+        #[cfg(not(windows))]
+        return self.block.as_ptr().cast_mut();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Upload {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        crate::shadow::unregister(self.at, self.at as u64);
+        // SAFETY: our allocation; lists that still use its copy hold that.
+        unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+// SAFETY: plain memory, handed out once.
+#[cfg(windows)]
+unsafe impl Send for Upload {}
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
@@ -1652,9 +1731,12 @@ mod tests {
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
-        // List-owned upload memory: aligned, writable, gone at reset.
+        // List-owned upload memory: aligned, writable, below 2^40 (where
+        // shaders find title memory), gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
+        #[cfg(windows)]
+        assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");

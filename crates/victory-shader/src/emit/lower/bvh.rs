@@ -126,7 +126,6 @@ impl Lower<'_> {
             Some(src) if matches!(src, Source::Built { .. }) => {
                 // shortcut: the root address is taken to be 256-byte aligned
                 // (the descriptor drops its low byte, not known here).
-                let h = self.handle((b, i), src, false, (11, 0))?;
                 let (k, dynamic) = self.built_offset(src)?;
                 let three = self.s.m.i32(3);
                 let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
@@ -135,7 +134,17 @@ impl Lower<'_> {
                 if let Some(d) = dynamic {
                     at = self.s.m.bin(c, Bin::Add, at, d);
                 }
-                Nodes::Buffer(h, at)
+                // A root view is title memory there (bounds-checked).
+                match self.root_address(src) {
+                    Some((root_lo, root_hi)) => {
+                        self.s.flags |= super::flags::INT64;
+                        let base = wide64(self, root_lo, root_hi);
+                        let zero = self.s.m.i32(0);
+                        let at = wide64(self, at, zero);
+                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
+                    }
+                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
+                }
             }
             Some(_) => return Err("a BVH descriptor"),
             None => {
@@ -260,7 +269,8 @@ impl Lower<'_> {
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
         // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
-        let (h, at) = self.memory(lo, hi, 4 * dwords, false);
+        let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
+        let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();
         for k in (0..dwords).step_by(4) {
