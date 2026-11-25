@@ -124,17 +124,19 @@ pub(crate) fn depth_bounds_test() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_DEPTH_BOUNDS").is_none())
 }
 
-/// Whether `container` is `CS_AlphTransmissionPrefilterMip` and is left out,
-/// as DexNom 2e01ab4 leaves it (its translator refuses the program: it
-/// stores through a descriptor control flow picks). The program copies
-/// what lies behind window glass into the mip chain the glass samples,
-/// refracted and blurred by the glass's roughness; left out, the chain is
-/// not written. Off unless `VICTORY_NO_GLASS_PREFILTER` is set.
+/// Whether `container` is `CS_AlphTransmissionPrefilterMip`, left out
+/// unless `VICTORY_GLASS_PREFILTER` is set, as DexNom 2e01ab4 leaves it (its
+/// translator refuses the program: it stores through a descriptor control
+/// flow picks). The program copies what lies behind window glass into the
+/// mip chain the glass samples, refracted and blurred by the glass's
+/// roughness. Run, the cell window is frosted (run 149); left out, the
+/// chain is not written and the window is clear, as in DexNom's run 153
+/// (run 155).
 #[cfg(windows)]
 fn glass_prefilter_left_out(container: &[u8]) -> bool {
     const NAME: &[u8] = b"CS_AlphTransmissionPrefilterMip";
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_GLASS_PREFILTER").is_some())
+    static RUN: OnceLock<bool> = OnceLock::new();
+    !*RUN.get_or_init(|| std::env::var_os("VICTORY_GLASS_PREFILTER").is_some())
         && container.windows(NAME.len()).any(|w| w == NAME)
 }
 
@@ -259,7 +261,7 @@ impl Shader {
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     if glass_prefilter_left_out(container) {
-        return Err("left out (VICTORY_NO_GLASS_PREFILTER)".to_owned());
+        return Err("left out (VICTORY_GLASS_PREFILTER runs it)".to_owned());
     }
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
