@@ -211,7 +211,8 @@ pub struct PsInput {
     pub flat: bool,
     pub fp16: bool,
     /// Two 16-bit values per dword ([`VsOutput::pack2`]); `row2` is the
-    /// second element's register.
+    /// register of the row packed after this one, or this row's (also when
+    /// one is: the ped decal programs).
     pub pack2: bool,
     pub row2: u8,
 }
@@ -235,7 +236,9 @@ pub struct VsOutput {
     /// 16-bit values, one per dword (low half) unless `pack2`: then two per
     /// dword, channel c of this row in dword c / 2 (odd channels in the
     /// high half), then a second 16-bit row from the next whole dword (the
-    /// next 16-bit row of the signature no entry names).
+    /// next 16-bit row of the signature no entry names); an element that
+    /// would start in a high half takes a whole dword, in a later parameter
+    /// when its row's two dwords are used up.
     pub fp16: bool,
     pub pack2: bool,
 }

@@ -1183,6 +1183,181 @@ mod tests {
         assert_eq!(texels, vec![[2.0, 1.0, 2.0, 1.0]; 16]);
     }
 
+    /// A pixel shader reading 16-bit inputs packed two per dword, laid out
+    /// as in the ped programs. TEXCOORD0 (3 channels) and TEXCOORD1 (1)
+    /// share a row and TEXCOORD2 is packed after them; TEXCOORD3 and
+    /// TEXCOORD4 (2 each) share the second parameter, whose stage data names
+    /// no second row, as the ped decal programs' first one does. TEXCOORD1
+    /// would start in a high half, so it takes a whole dword: the third of
+    /// the second parameter, its own row's two being used up. Every pixel
+    /// exports TEXCOORD1.x, TEXCOORD4.x, TEXCOORD2.w and TEXCOORD4.y.
+    #[test]
+    #[cfg(windows)]
+    fn packed_16_bit_inputs_come_from_the_halves_the_console_puts_them_in() {
+        let words = [
+            0x7E06_0280u32, // v_mov_b32 v3, 0
+            0xD742_0002,
+            0x0002_0081, // v_interp_p1ll_f16 v2, v0, attr1.z
+            0xD75A_0003,
+            0x040A_0281, // v_interp_p2_f16 v3, v1, attr1.z, v2
+            0x7E08_1703, // v_cvt_f32_f16 v4, v3
+            0xD742_0002,
+            0x0002_0041, // v_interp_p1ll_f16 v2, v0, attr1.y
+            0xD75A_0003,
+            0x040A_0241, // v_interp_p2_f16 v3, v1, attr1.y, v2
+            0x7E0A_1703, // v_cvt_f32_f16 v5, v3
+            0xD742_0002,
+            0x0002_01C0, // v_interp_p1ll_f16 v2, v0, attr0.w high
+            0xD75A_0003,
+            0x040A_03C0, // v_interp_p2_f16 v3, v1, attr0.w, v2 high
+            0x7E0C_1703, // v_cvt_f32_f16 v6, v3
+            0xD742_0002,
+            0x0002_0141, // v_interp_p1ll_f16 v2, v0, attr1.y high
+            0xD75A_0003,
+            0x040A_0341, // v_interp_p2_f16 v3, v1, attr1.y, v2 high
+            0x7E0E_1703, // v_cvt_f32_f16 v7, v3
+            0xF800_180F,
+            0x0706_0504, // exp mrt0, v4, v5, v6, v7 done vm
+            0xBF81_0000,
+        ];
+        let input = |row, attr, row2| crate::native::PsInput {
+            usage: crate::native::Usage::Generic,
+            row,
+            mask: 3,
+            attr,
+            flat: false,
+            fp16: true,
+            pack2: true,
+            row2,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![input(0, 0, 1), input(2, 1, 2)],
+                // PERSP_CENTER: i and j in v0 and v1.
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, index, kind, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: if kind == 3 { 4 } else { 2 },
+            row: Some(row),
+            col,
+            cols,
+            usage: (1u8 << cols) - 1,
+            half: false,
+        };
+        // (index, row, first channel, channels)
+        let texcoords = [
+            (0, 0, 0, 3),
+            (1, 0, 3, 1),
+            (2, 1, 0, 4),
+            (3, 2, 0, 2),
+            (4, 3, 0, 2),
+        ];
+        let mut elements: Vec<SigElement> = texcoords
+            .iter()
+            .map(|&(index, row, col, cols)| el("TEXCOORD", index, 0, row, col, cols))
+            .collect();
+        elements.push(el("SV_Position", 0, 3, 4, 0, 4));
+        // The console's texture coordinates are 16-bit floats (type 6).
+        let mut isg1 = super::container::signature(&elements, true);
+        for i in 0..texcoords.len() {
+            isg1[8 + 32 * i + 16] = 6;
+        }
+        let osg1 = super::container::signature(&[el("SV_Target", 0, 16, 0, 0, 4)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let ps = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ps.dxil.clone()).unwrap();
+        }
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        // A vertex shader passing POSITION on as the position and writing
+        // 1.0, 2.0, ... to the texture coordinates' channels in order.
+        let mut s = super::shader::Shader::new(false);
+        let b = s.entry;
+        for col in 0..4 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            let x = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+            let args = [s.m.i32(5), s.m.i32(0), s.m.i8(col), x];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        let mut value = 1.0f32;
+        for (id, &(_, _, _, cols)) in texcoords.iter().enumerate() {
+            for col in 0..cols {
+                let args = [
+                    s.m.i32(id as u32),
+                    s.m.i32(0),
+                    s.m.i8(col),
+                    s.m.f32(value.to_bits()),
+                ];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+                value += 1.0;
+            }
+        }
+        s.inputs.push(SigElement {
+            interp: 0,
+            ..el("POSITION", 0, 0, 0, 0, 4)
+        });
+        s.outputs = elements;
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let vs = super::HostShader {
+            stage: super::HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            view_strides: false,
+            heap_indices: Vec::new(),
+            heap_unknown: 0,
+        };
+        let (root, pso) = host.pipeline(&vs, &ps).unwrap();
+        let vertices = [
+            -1.0f32, -1.0, 0.5, 1.0, //
+            -1.0, 3.0, 0.5, 1.0, //
+            3.0, -1.0, 0.5, 1.0,
+        ];
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &super::host::Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (4, 4),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(texels, vec![[4.0, 11.0, 8.0, 12.0]; 16]);
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow

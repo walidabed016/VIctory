@@ -253,9 +253,12 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
-    /// Vertex and mesh outputs holding 16-bit values: row, whether two per
-    /// dword, and the row packed after it.
-    half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    /// Vertex and mesh outputs holding 16-bit values, by row: where each
+    /// half comes from when two per dword ([`packed_halves`]).
+    half_outputs: HashMap<u8, Option<HalfSources>>,
+    /// Pixel inputs holding 16-bit values two per dword, by row: where each
+    /// half comes from ([`packed_halves`]).
+    half_inputs: HashMap<u8, HalfSources>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -527,58 +530,125 @@ const APART_MASK: Why = "a lane mask read as data where the two 32-lane halves d
 const APART_LDS: Why = "one-wave LDS where the two 32-lane halves do not meet";
 const NO_ROOM: Why = "LDS with no room for the 32-lane halves' exchanges";
 
-/// Where half `h` (dword h / 2, the high half when odd) of a parameter
-/// packing 16-bit rows `a` and `b` two per dword comes from: a row and
-/// channel of `elements`, none for padding. Channel c of `a` is half c;
-/// `b` starts at the dword after `a`'s last channel.
-fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(u8, u8)> {
-    let extent = |r: u8| {
-        elements
-            .iter()
-            .filter(|e| e.row == Some(u32::from(r)))
-            .map(|e| e.col + e.cols)
-            .max()
-    };
-    let na = extent(a)?;
-    let a_halves = na.div_ceil(2) * 2;
-    if h < a_halves {
-        return (h < na).then_some((a, h));
-    }
-    let b = b?;
-    let c = h - a_halves;
-    (c < extent(b)?).then_some((b, c))
+/// Where each half of a parameter holding 16-bit values two per dword
+/// comes from: for half h (dword h / 2, the high half when odd), a row and
+/// channel of the signature, none for padding.
+type HalfSources = [Option<(u8, u8)>; 8];
+
+/// Rows of 16-bit values two per dword (`packed`), each with the row
+/// packed after it: the next 16-bit row of the signature (`elements`) that
+/// no stage data entry (`named`) names, taken in row order.
+fn packed_rows(elements: &[SigElement], named: &[u8], packed: &[u8]) -> Vec<(u8, Option<u8>)> {
+    let mut free: Vec<u8> = elements
+        .iter()
+        .filter(|e| e.half && e.kind == 0)
+        .filter_map(|e| u8::try_from(e.row?).ok())
+        .filter(|r| !named.contains(r))
+        .collect();
+    free.sort_unstable();
+    free.dedup();
+    let mut packed = packed.to_vec();
+    packed.sort_unstable();
+    packed
+        .into_iter()
+        .map(|a| (a, free.iter().position(|&r| r > a).map(|i| free.remove(i))))
+        .collect()
 }
 
-/// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
-/// a packed row's partner is the next 16-bit row of the signature that no
-/// output entry names, taken in row order.
-fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
+/// The halves of the parameters packing `rows` (see [`packed_rows`]), by
+/// first row. Channel c of the first row is half c and the second row
+/// starts at the dword after the first's last channel, but an element
+/// starting in a high half takes the next whole dword instead; one that
+/// then passes its row's two dwords moves to the first later parameter
+/// with whole dwords to spare, after its rows (as the ped programs' 1-channel
+/// TEXCOORD6 after the 3-channel TEXCOORD4 does).
+fn packed_halves(elements: &[SigElement], rows: &[(u8, Option<u8>)]) -> HashMap<u8, HalfSources> {
+    let mut moved: Vec<(u8, &SigElement)> = Vec::new();
+    let mut out = HashMap::new();
+    for &(a, b) in rows {
+        let mut halves = [None; 8];
+        let mut used = 0;
+        let mut out_of_row = Vec::new();
+        for r in [a].into_iter().chain(b) {
+            let mut row: Vec<_> = elements
+                .iter()
+                .filter(|e| e.row == Some(u32::from(r)))
+                .collect();
+            row.sort_by_key(|e| e.col);
+            let mut end = 0;
+            for e in row {
+                let at = e.col.next_multiple_of(2);
+                if at + e.cols > 4 {
+                    out_of_row.push((r, e));
+                    continue;
+                }
+                for k in 0..e.cols {
+                    halves[usize::from(used + at + k)] = Some((r, e.col + k));
+                }
+                end = at + e.cols;
+            }
+            used += end.next_multiple_of(2);
+        }
+        moved.retain(|&(r, e)| {
+            if used + e.cols > 8 {
+                return true;
+            }
+            for k in 0..e.cols {
+                halves[usize::from(used + k)] = Some((r, e.col + k));
+            }
+            used += e.cols.next_multiple_of(2);
+            false
+        });
+        moved.extend(out_of_row);
+        out.insert(a, halves);
+    }
+    out
+}
+
+/// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]).
+fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, Option<HalfSources>> {
     let entries = match io {
         StageIo::Vs { outputs, .. } => outputs,
         StageIo::Ms(ms) => &ms.outputs,
         _ => return HashMap::new(),
     };
-    let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
-    let mut free: Vec<u8> = outputs
+    let per_vertex: Vec<_> = entries.iter().filter(|o| o.param & 0x80 == 0).collect();
+    let named: Vec<u8> = per_vertex.iter().map(|o| o.row).collect();
+    let packed: Vec<u8> = per_vertex
         .iter()
-        .filter(|e| e.half && e.kind == 0)
-        .filter_map(|e| u8::try_from(e.row?).ok())
-        .filter(|&r| !per_vertex().any(|o| o.row == r))
+        .filter(|o| o.fp16 && o.pack2)
+        .map(|o| o.row)
         .collect();
-    free.sort_unstable();
-    free.dedup();
-    let mut halves: Vec<_> = per_vertex().filter(|o| o.fp16).collect();
-    halves.sort_by_key(|o| o.row);
-    halves
-        .into_iter()
-        .map(|o| {
-            let b = o
-                .pack2
-                .then(|| free.iter().position(|&r| r > o.row))
-                .flatten();
-            (o.row, (o.pack2, b.map(|i| free.remove(i))))
-        })
+    let halves = packed_halves(outputs, &packed_rows(outputs, &named, &packed));
+    per_vertex
+        .iter()
+        .filter(|o| o.fp16)
+        .map(|o| (o.row, o.pack2.then(|| halves[&o.row])))
         .collect()
+}
+
+/// Pixel inputs of 16-bit values two per dword (see
+/// [`Lower::half_inputs`]): none where the stage data names a second row
+/// other than the one packed after.
+fn half_inputs(io: &StageIo, elements: &[SigElement]) -> HashMap<u8, HalfSources> {
+    let StageIo::Ps { inputs, .. } = io else {
+        return HashMap::new();
+    };
+    let named: Vec<u8> = inputs.iter().map(|i| i.row).collect();
+    let packed: Vec<u8> = inputs
+        .iter()
+        .filter(|i| i.fp16 && i.pack2)
+        .map(|i| i.row)
+        .collect();
+    let rows = packed_rows(elements, &named, &packed);
+    let agree = inputs
+        .iter()
+        .filter(|i| i.fp16 && i.pack2 && i.row2 != i.row)
+        .all(|i| rows.contains(&(i.row, Some(i.row2))));
+    if !agree {
+        return HashMap::new();
+    }
+    packed_halves(elements, &rows)
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -763,6 +833,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
+            half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -7141,21 +7212,26 @@ impl<'a> Lower<'a> {
             StageIo::Ps { inputs, .. } => inputs
                 .iter()
                 .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| (i.pack2, (i.row2 != i.row).then_some(i.row2))),
+                .map(|i| i.pack2),
             _ => None,
         };
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
-            Some((pack2, b)) => {
+            Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
-                // per dword (`packed_half`); the host's are 32-bit floats.
+                // per dword (`packed_halves`); the host's are 32-bit floats.
+                let packed = if pack2 {
+                    let p = self.half_inputs.get(&attribute.row);
+                    Some(*p.ok_or("16-bit input rows paired unlike the stage data says")?)
+                } else {
+                    None
+                };
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, b, h)
-                    } else {
-                        h.is_multiple_of(2).then_some((attribute.row, h / 2))
+                    let src = match packed {
+                        Some(p) => p[usize::from(h)],
+                        None => h.is_multiple_of(2).then_some((attribute.row, h / 2)),
                     };
                     let Some((row, ch)) = src else {
                         return Ok(None);
@@ -8487,17 +8563,16 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        if let Some((row, (pack2, b))) = halves {
+        if let Some((row, packed)) = halves {
             for ch in 0..4u8 {
                 let Some(value) = e.values[usize::from(ch)] else {
                     continue;
                 };
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
-                    let src = if pack2 {
-                        packed_half(outputs, row, b, h)
-                    } else {
-                        (!high).then_some((row, ch))
+                    let src = match packed {
+                        Some(p) => p[usize::from(h)],
+                        None => (!high).then_some((row, ch)),
                     };
                     let found = src.and_then(|(r, c)| {
                         outputs.iter().position(|o| {
