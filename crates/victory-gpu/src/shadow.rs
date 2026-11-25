@@ -81,6 +81,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Ranges last brought up to date wholly guarded and clean, with the
+    /// number of the latest change to title memory before
+    /// ([`crate::watch::changes`]): unchanged since, they are up to date.
+    synced: Mutex<std::collections::HashMap<(usize, usize), u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Shaders have been given the copy to write ([`Shadow::gpu_writes`]).
@@ -530,6 +534,24 @@ fn prep_slot() -> usize {
 
 const NOT_WATCHED: u8 = 2;
 
+/// Whether refreshes of ranges last brought up to date wholly guarded and
+/// clean are skipped while title memory there is unchanged since
+/// ([`crate::watch::last_change`]): run 149 asked ~3,000 times a frame
+/// (16.5 ms) about 13.5 GB, 99.4% of it unchanged, and walked every page it
+/// checked. `VICTORY_REFRESH_ASKS` asks about them again.
+fn skip_synced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REFRESH_ASKS").is_none();
+        if !on {
+            tracing::info!(
+                "refreshes of unchanged guarded ranges ask again (VICTORY_REFRESH_ASKS)"
+            );
+        }
+        on
+    })
+}
+
 // SAFETY: D3D12 resources are free-threaded; the memory a copy maps is
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -639,6 +661,7 @@ impl Shadow {
             len,
             loose: false,
             copied: Mutex::new(vec![0; pages as usize]),
+            synced: Default::default(),
             watched: AtomicU8::new(0),
             shaders_write: AtomicBool::new(false),
             pending: Default::default(),
@@ -1481,9 +1504,39 @@ impl Shadow {
         // millions of groups.
         if self.mirror() {
             self.want(from, to);
-            return self.update_mirror(from, to);
         }
-        self.update_free(from, to)
+        let skip = skip_synced();
+        let since = crate::watch::changes();
+        if skip
+            && let Some(last) = crate::watch::last_change(from, to)
+            && let Some(&at) = self
+                .synced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(from, to))
+            && last <= at
+        {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Skipped, 1);
+                add(C::SkippedBytes, (to - from) as u64);
+            }
+            return 0;
+        }
+        let copied = if self.mirror() {
+            self.update_mirror(from, to)
+        } else {
+            self.update_free(from, to)
+        };
+        if skip && crate::watch::unwritten(from, to) {
+            let mut synced = self.synced.lock().unwrap_or_else(|e| e.into_inner());
+            if synced.len() >= 4096 {
+                synced.clear();
+            }
+            synced.insert((from, to), since);
+        }
+        copied
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer).
@@ -4807,6 +4860,56 @@ pub(crate) mod tests {
         assert!(s.kept[0].lock().unwrap().is_empty() && s.armed[0].lock().unwrap().is_empty());
         drop(s);
         unregister(usize::MAX - 8, at as u64);
+        unmap(&made);
+    }
+
+    /// A refresh of a range brought up to date wholly guarded and clean
+    /// asks nothing while title memory there is unchanged; a title write in
+    /// it, our write to it, or a remapping is taken at the next refresh.
+    #[test]
+    fn unchanged_guarded_ranges_are_not_asked_about_again() {
+        let _serial = crate::watch::serial();
+        if !gpu() {
+            return;
+        }
+        let at = (968 * SLAB) as usize - 256 * MIB;
+        // Two views: a copy, not title memory used in place.
+        let made = views(at, &[4 * MIB, 4 * MIB]);
+        assert_eq!(made.len(), 2, "no free address for test views");
+        register(usize::MAX - 10, at as u64, 8 << 20);
+        let s = find(at as u64, 8 << 20).unwrap();
+        assert!(!s.in_place);
+        // SAFETY: inside the copy's memory.
+        let host = |w: usize| unsafe { s.host_at(w - at, 4).cast::<u32>().read() };
+        crate::watch::forget_asked();
+        s.update(at, 8 * MIB);
+        let asked = crate::watch::asking();
+        crate::watch::forget_asked();
+        assert_eq!(s.update(at, 8 * MIB), 0);
+        assert_eq!(
+            crate::watch::asking(),
+            asked,
+            "asked about an unchanged range"
+        );
+        let w = at + 3 * MIB + 8;
+        // SAFETY: our view (guarded: our handler opens the block).
+        unsafe { (w as *mut u32).write(0x5eed) };
+        crate::watch::forget_asked();
+        assert_eq!(s.update(at, 8 * MIB), PAGE);
+        assert_eq!(host(w), 0x5eed);
+        crate::watch::forget_asked();
+        assert_eq!(s.update(at, 8 * MIB), 0);
+        let asked = crate::watch::asking();
+        // Our write (shaders in place, a copy into title memory).
+        crate::watch::wrote(at + 5 * MIB, at + 5 * MIB + 4);
+        crate::watch::forget_asked();
+        s.update(at, 8 * MIB);
+        assert!(
+            crate::watch::asking() > asked + 1,
+            "not asked again after our write"
+        );
+        drop(s);
+        unregister(usize::MAX - 10, at as u64);
         unmap(&made);
     }
 
