@@ -14,11 +14,20 @@
 //! `VICTORY_AMBIENT=<level>` turns it on (0.6, say; 0 is no indirect diffuse
 //! light at all); off by default, the title's own output.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
+//!
+//! The same program writes the probes' light for reflections too, as plain
+//! colors (R11G11B10), which the reflections' denoiser carries into the
+//! lighting: 8-pixel tiles and rectangles of orange light along the edges of
+//! walls, bunks and ceilings (runs 116 to 118; most likely the sky, which
+//! every ray of the acceleration structure sees, the translation answering
+//! them as misses). `VICTORY_AMBIENT_REFLECTED=<level>` replaces that image
+//! by the constant as well (0: no light from the probes in reflections); off
+//! by default.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
@@ -35,20 +44,32 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// The constant (0.6 looked balanced in run a2); `None` if off.
 pub(crate) fn level() -> Option<f32> {
     static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("VICTORY_AMBIENT")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-            .filter(|l: &f32| l.is_finite() && *l >= 0.0)
-    })
+    *LEVEL.get_or_init(|| setting("VICTORY_AMBIENT"))
+}
+
+/// The constant for the probes' light in reflections; `None` if off.
+pub(crate) fn reflected() -> Option<f32> {
+    static LEVEL: OnceLock<Option<f32>> = OnceLock::new();
+    *LEVEL.get_or_init(|| setting("VICTORY_AMBIENT_REFLECTED"))
+}
+
+fn setting(name: &str) -> Option<f32> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|l: &f32| l.is_finite() && *l >= 0.0)
 }
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(UAV(u0))"
 cbuffer Floor : register(b0) { float level; float3 tint; };
+#ifdef PLAIN
+RWTexture2D<float3> light : register(u0);
+#else
 RWTexture2D<uint> light : register(u0);
+#endif
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
 }
@@ -70,7 +91,11 @@ void main(uint3 at : SV_DispatchThreadID) {
     // What the resolve left is not kept: without rays its inputs are never
     // written and it holds whatever their memory did (bright magenta on
     // translucent surfaces, blocks of colours indoors: Belobug run v6).
+#ifdef PLAIN
+    light[at.xy] = tint * level;
+#else
     light[at.xy] = pack(tint * level);
+#endif
 }
 "#;
 
@@ -79,7 +104,8 @@ const SLOTS: u32 = 1024;
 
 struct Pass {
     root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+    /// Packing into 32-bit integers (R9G9B9E5), then plain colors.
+    pso: [ID3D12PipelineState; 2],
     views: ID3D12DescriptorHeap,
     step: u32,
     next: AtomicU32,
@@ -90,47 +116,64 @@ unsafe impl Send for Pass {}
 unsafe impl Sync for Pass {}
 
 fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("ambient"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
     let text = |b: &ID3DBlob| {
         // SAFETY: the blob's own bytes.
         unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }
             .to_vec()
     };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            tracing::warn!("ambient light: {}", String::from_utf8_lossy(&text(&errors)));
+    let compile = |defines: Option<*const D3D_SHADER_MACRO>| {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source, names and macros live through the call; out
+        // pointers ours.
+        let compiled = unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("ambient"),
+                defines,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            if let Some(errors) = errors {
+                tracing::warn!("ambient light: {}", String::from_utf8_lossy(&text(&errors)));
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
-    let code = text(&code.ok_or_else(windows::core::Error::empty)?);
+        Ok(text(&code.ok_or_else(windows::core::Error::empty)?))
+    };
+    let code = compile(None)?;
+    let plain = [
+        D3D_SHADER_MACRO {
+            Name: s!("PLAIN"),
+            Definition: s!("1"),
+        },
+        D3D_SHADER_MACRO::default(),
+    ];
+    let plain = compile(Some(plain.as_ptr()))?;
     // SAFETY: the root signature is inside the shader; plain creations.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: code.as_ptr().cast(),
-                BytecodeLength: code.len(),
-            },
-            ..Default::default()
-        })?;
+        let pso = |code: &[u8]| {
+            device.CreateComputePipelineState::<ID3D12PipelineState>(
+                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let pso = [pso(&code)?, pso(&plain)?];
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         let views = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: kind,
@@ -161,7 +204,20 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// wrote it as an image. Whether it recorded anything (the list's bindings
 /// are then ours).
 pub(crate) fn raise(list: &HostList, light: This) -> bool {
-    let (Some(level), Some(host)) = (level(), host()) else {
+    level().is_some_and(|level| replace(list, light, level, None))
+}
+
+/// As [`raise`], with the reflections' constant, for an image the program
+/// wrote through a view of `format` (the image's own if `None`): only
+/// plain-color images (R11G11B10) are replaced.
+pub(crate) fn reflect(list: &HostList, image: This, format: Option<u32>) -> bool {
+    reflected().is_some_and(|level| replace(list, image, level, Some(format)))
+}
+
+/// What both do. `plain` is `None` for the packed light, else the format of
+/// the view a plain-color image was written through.
+fn replace(list: &HostList, light: This, level: f32, plain: Option<Option<u32>>) -> bool {
+    let Some(host) = host() else {
         return false;
     };
     let Some(light) = crate::resource::host_resource(light) else {
@@ -180,13 +236,29 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
     };
     // SAFETY: a live resource.
     let d = unsafe { light.GetDesc() };
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    if d.Format != DXGI_FORMAT_R32_UINT {
-        ONCE.call_once(|| tracing::warn!(format = d.Format.0, "no ambient light: another format"));
-        return false;
-    }
-    ONCE.call_once(|| {
-        tracing::info!(level, width = d.Width, height = d.Height, "ambient light");
+    static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+    let format = match plain {
+        None if d.Format != DXGI_FORMAT_R32_UINT => {
+            ONCE[0].call_once(|| {
+                tracing::warn!(format = d.Format.0, "no ambient light: another format")
+            });
+            return false;
+        }
+        None => DXGI_FORMAT_R32_UINT,
+        Some(f) if f.unwrap_or(d.Format.0 as u32) != DXGI_FORMAT_R11G11B10_FLOAT.0 as u32 => {
+            return false;
+        }
+        Some(_) => DXGI_FORMAT_R11G11B10_FLOAT,
+    };
+    let plain = plain.is_some();
+    ONCE[usize::from(plain)].call_once(|| {
+        tracing::info!(
+            level,
+            plain,
+            width = d.Width,
+            height = d.Height,
+            "ambient light"
+        );
     });
     let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
     list.keep(light);
@@ -202,7 +274,7 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
             ptr: cpu.ptr + (slot * pass.step) as usize,
         };
         let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
+            Format: format,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
@@ -210,7 +282,7 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
             .CreateUnorderedAccessView(light, None::<&ID3D12Resource>, Some(&view), at);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
-        l.SetPipelineState(&pass.pso);
+        l.SetPipelineState(&pass.pso[usize::from(plain)]);
         let constants = [level, 1.0f32, 0.98, 0.94];
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(

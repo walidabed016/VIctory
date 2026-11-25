@@ -706,9 +706,10 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// After a dispatch of `p`: the least indirect light, if it is the
-    /// program that resolves that. Whether that recorded a pass of its own,
-    /// replacing the list's view heaps, compute root signature and pipeline.
+    /// After a dispatch of `p`: the least indirect light (and the probes'
+    /// light in reflections), if it is the program that resolves that.
+    /// Whether that recorded a pass of its own, replacing the list's view
+    /// heaps, compute root signature and pipeline.
     fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
@@ -728,11 +729,25 @@ impl State {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
-        if light == 0 {
+        let mut recorded = if light == 0 {
             once!("no ambient light: other tables");
-            return false;
+            false
+        } else {
+            crate::ambient::raise(list, light as This)
+        };
+        if crate::ambient::reflected().is_some() {
+            for u in &stage.translated().used {
+                let at = (u.slot, u.table_offset_dwords);
+                if u.kind == ResourceType::Uav
+                    && at != crate::ambient::LIGHT
+                    && let Some(View::Unordered(r, _, desc)) = view(u.kind, at)
+                    && r != 0
+                {
+                    recorded |= crate::ambient::reflect(list, r as This, desc.map(|d| d[0]));
+                }
+            }
         }
-        crate::ambient::raise(list, light as This)
+        recorded
     }
 
     /// What a draw or dispatch runs, for the device-removed report
