@@ -81,10 +81,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Ranges last brought up to date wholly guarded and clean, with the
-    /// number of the latest change to title memory before
-    /// ([`crate::watch::changes`]): unchanged since, they are up to date.
-    synced: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    /// By region of title memory ([`crate::watch::REGION`]): the ranges in
+    /// it last brought up to date wholly guarded and clean. Unchanged
+    /// since, they are up to date.
+    synced: Mutex<std::collections::HashMap<usize, Synced>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Shaders have been given the copy to write ([`Shadow::gpu_writes`]).
@@ -643,9 +643,14 @@ fn prep_slot() -> usize {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Whether refreshes of ranges last brought up to date wholly guarded and
-/// clean are skipped while title memory there is unchanged since
-/// ([`crate::watch::last_change`]): run 149 asked ~3,000 times a frame
+/// Ranges of a region of title memory brought up to date wholly guarded and
+/// clean, merged, with the number of the latest change to title memory
+/// before the oldest of them ([`crate::watch::changes`]).
+type Synced = (u64, Vec<(usize, usize)>);
+
+/// Whether refreshes skip the regions of title memory they last brought up
+/// to date wholly guarded and clean while those are unchanged since
+/// ([`crate::watch::region_change`]): run 149 asked ~3,000 times a frame
 /// (16.5 ms) about 13.5 GB, 99.4% of it unchanged, and walked every page it
 /// checked. `VICTORY_REFRESH_ASKS` asks about them again.
 fn skip_synced() -> bool {
@@ -1653,38 +1658,85 @@ impl Shadow {
         if self.mirror() {
             self.want(from, to);
         }
-        let skip = skip_synced();
-        let since = crate::watch::changes();
-        if skip
-            && let Some(last) = crate::watch::last_change(from, to)
-            && let Some(&at) = self
-                .synced
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(from, to))
-            && last <= at
-        {
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Skipped, 1);
-                add(C::SkippedBytes, (to - from) as u64);
+        let refresh = |from, to| {
+            if self.mirror() {
+                self.update_mirror(from, to)
+            } else {
+                self.update_free(from, to)
             }
-            return 0;
-        }
-        let copied = if self.mirror() {
-            self.update_mirror(from, to)
-        } else {
-            self.update_free(from, to)
         };
-        if skip && crate::watch::unwritten(from, to) {
-            let mut synced = self.synced.lock().unwrap_or_else(|e| e.into_inner());
-            if synced.len() >= 4096 {
-                synced.clear();
-            }
-            synced.insert((from, to), since);
+        if !skip_synced() {
+            return refresh(from, to);
+        }
+        let since = crate::watch::changes();
+        let mut copied = 0;
+        for (a, b) in self.unsynced(from, to) {
+            copied += refresh(a, b);
+            self.note_synced(a, b, since);
         }
         copied
+    }
+
+    /// The parts of `[from, to)` (inside the buffer) in regions of title
+    /// memory not brought up to date wholly guarded and clean since they
+    /// last changed ([`Shadow::note_synced`]), in order.
+    fn unsynced(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        use crate::watch::REGION;
+        let synced = self.synced.lock().unwrap_or_else(|e| e.into_inner());
+        let mut parts: Vec<(usize, usize)> = Vec::new();
+        for region in from / REGION..to.div_ceil(REGION) {
+            let (a, b) = (from.max(region * REGION), to.min((region + 1) * REGION));
+            if synced.get(&region).is_some_and(|(since, ranges)| {
+                crate::watch::region_change(region) <= *since
+                    && ranges.iter().any(|&(x, y)| x <= a && b <= y)
+            }) {
+                continue;
+            }
+            match parts.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => parts.push((a, b)),
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let skipped = (to - from) - parts.iter().map(|(a, b)| b - a).sum::<usize>();
+            if skipped > 0 {
+                add(C::Skipped, 1);
+                add(C::SkippedBytes, skipped as u64);
+            }
+        }
+        parts
+    }
+
+    /// `[from, to)` was brought up to date after change `since` to title
+    /// memory: its parts wholly guarded and clean now are up to date until
+    /// their regions change.
+    fn note_synced(&self, from: usize, to: usize, since: u64) {
+        use crate::watch::REGION;
+        let mut synced = self.synced.lock().unwrap_or_else(|e| e.into_inner());
+        for region in from / REGION..to.div_ceil(REGION) {
+            let (a, b) = (from.max(region * REGION), to.min((region + 1) * REGION));
+            if !crate::watch::unwritten(a, b) {
+                continue;
+            }
+            let (held, ranges) = synced.entry(region).or_default();
+            if crate::watch::region_change(region) > *held || ranges.len() >= 8 {
+                (*held, *ranges) = (since, vec![(a, b)]);
+                continue;
+            }
+            *held = (*held).min(since);
+            ranges.push((a, b));
+            ranges.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+            for &(x, y) in ranges.iter() {
+                match merged.last_mut() {
+                    Some((_, end)) if x <= *end => *end = (*end).max(y),
+                    _ => merged.push((x, y)),
+                }
+            }
+            *ranges = merged;
+        }
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer).
@@ -5037,11 +5089,12 @@ pub(crate) mod tests {
         unmap(&made);
     }
 
-    /// A refresh of a range brought up to date wholly guarded and clean
-    /// asks nothing while title memory there is unchanged; a title write in
-    /// it, our write to it, or a remapping is taken at the next refresh.
+    /// A refresh skips the regions of title memory brought up to date
+    /// wholly guarded and clean while they are unchanged, whichever range
+    /// took them; a title write in one, or our write to one, is taken at
+    /// the next refresh, which asks about that region alone.
     #[test]
-    fn unchanged_guarded_ranges_are_not_asked_about_again() {
+    fn unchanged_guarded_regions_are_not_asked_about_again() {
         let _serial = crate::watch::serial();
         if !gpu() {
             return;
@@ -5050,6 +5103,7 @@ pub(crate) mod tests {
         // Two views: a copy, not title memory used in place.
         let made = views(at, &[4 * MIB, 4 * MIB]);
         assert_eq!(made.len(), 2, "no free address for test views");
+        assert_eq!(at % crate::watch::REGION, 0);
         register(usize::MAX - 10, at as u64, 8 << 20);
         let s = find(at as u64, 8 << 20).unwrap();
         assert!(!s.in_place);
@@ -5060,28 +5114,25 @@ pub(crate) mod tests {
         let asked = crate::watch::asking();
         crate::watch::forget_asked();
         assert_eq!(s.update(at, 8 * MIB), 0);
+        assert_eq!(s.update(at + MIB, 6 * MIB), 0);
         assert_eq!(
             crate::watch::asking(),
             asked,
-            "asked about an unchanged range"
+            "asked about unchanged regions"
         );
-        let w = at + 3 * MIB + 8;
+        let w = at + 5 * MIB + 8;
         // SAFETY: our view (guarded: our handler opens the block).
         unsafe { (w as *mut u32).write(0x5eed) };
+        assert_eq!(s.unsynced(at, at + 8 * MIB), [(at + 4 * MIB, at + 8 * MIB)]);
         crate::watch::forget_asked();
         assert_eq!(s.update(at, 8 * MIB), PAGE);
         assert_eq!(host(w), 0x5eed);
+        assert!(s.unsynced(at, at + 8 * MIB).is_empty());
         crate::watch::forget_asked();
         assert_eq!(s.update(at, 8 * MIB), 0);
-        let asked = crate::watch::asking();
         // Our write (shaders in place, a copy into title memory).
-        crate::watch::wrote(at + 5 * MIB, at + 5 * MIB + 4);
-        crate::watch::forget_asked();
-        s.update(at, 8 * MIB);
-        assert!(
-            crate::watch::asking() > asked + 1,
-            "not asked again after our write"
-        );
+        crate::watch::wrote(at + MIB, at + MIB + 4);
+        assert_eq!(s.unsynced(at, at + 8 * MIB), [(at, at + 4 * MIB)]);
         drop(s);
         unregister(usize::MAX - 10, at as u64);
         unmap(&made);
