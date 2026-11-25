@@ -30,6 +30,12 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Diagnostics: the submission a queue's last signal followed (0 for
+    /// none), and the value before that signal.
+    #[cfg(feature = "diagnostics")]
+    queued_at: AtomicU64,
+    #[cfg(feature = "diagnostics")]
+    before_queue: AtomicU64,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -50,6 +56,10 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        #[cfg(feature = "diagnostics")]
+        queued_at: AtomicU64::new(0),
+        #[cfg(feature = "diagnostics")]
+        before_queue: AtomicU64::new(0),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -76,10 +86,21 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
-    fence(this).value.load(Ordering::Acquire)
+    let fence = fence(this);
+    #[cfg(feature = "diagnostics")]
+    crate::pipelining::fence_read(
+        Some(fence.queued_at.load(Ordering::Relaxed)).filter(|&at| at > 0),
+    );
+    fence.value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    #[cfg(feature = "diagnostics")]
+    crate::pipelining::fence_wait(Some(fence.queued_at.load(Ordering::Relaxed)).filter(|&at| {
+        at > 0
+            && value > fence.before_queue.load(Ordering::Relaxed)
+            && value <= fence.value.load(Ordering::Acquire)
+    }));
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -96,6 +117,19 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
+/// Diagnostics: a queue is about to signal the fence, after the latest
+/// submission.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn queue_signal(this: This) {
+    let fence = fence(this);
+    fence
+        .before_queue
+        .store(fence.value.load(Ordering::Acquire), Ordering::Relaxed);
+    fence
+        .queued_at
+        .store(crate::pipelining::queue_signal(), Ordering::Relaxed);
+}
+
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());

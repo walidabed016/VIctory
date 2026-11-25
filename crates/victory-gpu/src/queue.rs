@@ -161,6 +161,8 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::fence::queue_signal(fence);
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.

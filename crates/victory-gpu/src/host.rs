@@ -1007,6 +1007,8 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        crate::pipelining::begin();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut batch = Batch::default();
         crate::watch::forget_asked();
@@ -1046,6 +1048,8 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::pipelining::end(back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
         // In the submission's run: what the CPU wrote into host copies goes
         // to their twins first, and what shaders wrote comes down after.
         let (mut twins_before, mut twins_after) = (Vec::new(), None);
@@ -1946,6 +1950,10 @@ impl HostList {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    #[cfg(feature = "diagnostics")]
+                    for at in [src, dst] {
+                        crate::pipelining::touch(crate::pipelining::Touch::TitleCopy, at, len);
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     batch.title_copied(dst, len);
                     #[cfg(feature = "diagnostics")]
@@ -1961,6 +1969,7 @@ impl HostList {
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
+                        crate::pipelining::touch(crate::pipelining::Touch::Fill, src, len);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -1977,6 +1986,8 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        #[cfg(feature = "diagnostics")]
+                        crate::pipelining::run();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -2103,7 +2114,12 @@ impl Batch {
             let asking = crate::watch::asking();
             let mut copied = 0;
             for (a, b) in self.stale(&shadow, from, to) {
-                copied += shadow.update(a, b - a);
+                let n = shadow.update(a, b - a);
+                #[cfg(feature = "diagnostics")]
+                if n > 0 {
+                    crate::pipelining::touch(crate::pipelining::Touch::Refresh, a, b - a);
+                }
+                copied += n;
             }
             self.done.push((shadow, asking, from, to));
             let us = started.elapsed().as_micros() as u64;
@@ -2429,6 +2445,7 @@ impl Meter {
                 crate::texture::seen::log(span);
                 crate::shadow::log_roots(span);
                 log_gpu_times(span);
+                crate::pipelining::log(span);
                 log_gpu_memory();
                 let uploaded = crate::texture::UPLOADED
                     .each_ref()
