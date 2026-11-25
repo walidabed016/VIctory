@@ -77,9 +77,40 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
+/// `VICTORY_SHADER_SWAP=<folder>`: a container whose hash (16 digits, as
+/// logged) names a file `<hash>.dxbc` there is replaced by that file's
+/// container, of the same stage and root signature.
+/// shortcut: for the distant trees' wind variants (`VS_Octa*Wind*`), whose
+/// wind volumes nothing fills yet, so that they threw the trees' quads
+/// across the screen; their variants without wind stand in for them.
+fn swapped(hash: &str) -> Option<&'static [u8]> {
+    static SWAPS: OnceLock<HashMap<String, Vec<u8>>> = OnceLock::new();
+    SWAPS
+        .get_or_init(|| {
+            let mut swaps = HashMap::new();
+            let Some(folder) = std::env::var_os("VICTORY_SHADER_SWAP") else { return swaps };
+            for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "dxbc")
+                    && let (Some(name), Ok(bytes)) = (path.file_stem().and_then(|n| n.to_str()), std::fs::read(&path))
+                {
+                    swaps.insert(name.to_owned(), bytes);
+                }
+            }
+            tracing::info!(count = swaps.len(), "shader containers replaced");
+            swaps
+        })
+        .get(hash)
+        .map(Vec::as_slice)
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let (bytes, full) = match swapped(&full.to_hex()[..16]) {
+        Some(other) => (other, blake3::hash(other)),
+        None => (bytes, full),
+    };
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
