@@ -328,6 +328,13 @@ fn lanes_of_several_waves_match_64_lane_waves() {
 }
 
 #[test]
+fn lanes_of_a_group_under_32_threads_match_64_lane_waves() {
+    // One host wave holds the whole group: the lower half, with idle lanes.
+    check_lanes([4, 4, 1]);
+    check_lanes([16, 1, 1]);
+}
+
+#[test]
 fn a_last_wave_of_32_lanes_has_no_upper_half() {
     check_lanes([32, 1, 3]);
     check_lanes([32, 1, 1]);

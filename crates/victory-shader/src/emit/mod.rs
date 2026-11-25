@@ -204,6 +204,18 @@ fn belobug_off(value: &str, name: &str) -> bool {
         .any(|v| v == name || v == "1" || v == "all")
 }
 
+/// Whether a wave64 compute group of fewer than 32 threads whose program
+/// reads other lanes runs on 32-lane halves: one host wave holds the whole
+/// group, as the lower half, and the upper half has no lanes. Otherwise it
+/// keeps the console's 64-lane waves, which hosts with only 32-lane waves
+/// refuse (subsurfacescatter:CS_SSSTileClassification, 4x4 threads). On
+/// unless `VICTORY_SMALL_GROUPS_WAVE64` is set. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn small_groups_on_halves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_GROUPS_WAVE64").is_none())
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

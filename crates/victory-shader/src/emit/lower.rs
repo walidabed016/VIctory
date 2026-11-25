@@ -3093,11 +3093,12 @@ impl<'a> Lower<'a> {
 
     /// Halves: each host wave takes the next 32 console threads of the
     /// group from a group-shared counter, whichever threads the host packed
-    /// into it ([`super::halves`]). Only for groups of whole host waves.
+    /// into it ([`super::halves`]). Only for groups of whole host waves, or
+    /// of one host wave with idle lanes ([`super::small_groups_on_halves`]).
     fn halves_prologue(&mut self) -> Result<(), Why> {
         use super::bitcode::Rmw;
         let total: u32 = self.s.threads.expect("compute").iter().product();
-        if !total.is_multiple_of(32) {
+        if !total.is_multiple_of(32) && !(total < 32 && super::small_groups_on_halves()) {
             return Err("a group of threads that is no multiple of 32 on 32-lane halves");
         }
         if self.s.lds_dwords >= 8192 {
@@ -3315,7 +3316,7 @@ impl<'a> Lower<'a> {
     fn exchange<const N: usize>(&mut self, words: [V; N], why: Why) -> Result<[(V, V); N], Why> {
         let waves = self.console_waves();
         let at = self.cur_ir;
-        let single = self.s.threads.expect("compute").iter().product::<u32>() == 32;
+        let single = self.s.threads.expect("compute").iter().product::<u32>() <= 32;
         let lds = self.s.lds_dwords;
         let h = self.halves.as_mut().ok_or(why)?;
         let ids = h.ids.ok_or(why)?;
