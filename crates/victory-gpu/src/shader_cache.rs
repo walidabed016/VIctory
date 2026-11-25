@@ -45,8 +45,9 @@ pub(crate) fn counts() -> (u64, u64) {
 /// whether waterfall loops leave each lane its own pass's scalars, whether
 /// textures read only for their size translate, whether constant
 /// descriptors joined by control flow do, and whether descriptor dwords pass
-/// through compares and loads that do not read them as data, and how mesh
-/// programs take wave operations).
+/// through compares and loads that do not read them as data, whether a
+/// uniform choice of immediate samplers translates, and how mesh programs
+/// take wave operations).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -66,6 +67,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::size_only_textures()),
             u8::from(victory_shader::emit::joined_constants()),
             u8::from(victory_shader::emit::unread_fields()),
+            u8::from(victory_shader::emit::sampler_choices()),
         ];
         let mesh = victory_shader::emit::mesh_wave_ops();
         if mesh != victory_shader::emit::MeshWaveOps::Lane {

@@ -90,6 +90,55 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The guest color buffer bypasses its blender for integer surfaces,
+    /// even when the draw asks for blending. D3D12 validates blend enable
+    /// against every active target format when the pipeline is created.
+    pub(crate) fn apply_integer_blend_bypass(&mut self) {
+        let integer = |f: &DXGI_FORMAT| {
+            matches!(
+                *f,
+                DXGI_FORMAT_R32G32B32A32_UINT
+                    | DXGI_FORMAT_R32G32B32A32_SINT
+                    | DXGI_FORMAT_R32G32B32_UINT
+                    | DXGI_FORMAT_R32G32B32_SINT
+                    | DXGI_FORMAT_R16G16B16A16_UINT
+                    | DXGI_FORMAT_R16G16B16A16_SINT
+                    | DXGI_FORMAT_R32G32_UINT
+                    | DXGI_FORMAT_R32G32_SINT
+                    | DXGI_FORMAT_R10G10B10A2_UINT
+                    | DXGI_FORMAT_R8G8B8A8_UINT
+                    | DXGI_FORMAT_R8G8B8A8_SINT
+                    | DXGI_FORMAT_R16G16_UINT
+                    | DXGI_FORMAT_R16G16_SINT
+                    | DXGI_FORMAT_R32_UINT
+                    | DXGI_FORMAT_R32_SINT
+                    | DXGI_FORMAT_R8G8_UINT
+                    | DXGI_FORMAT_R8G8_SINT
+                    | DXGI_FORMAT_R16_UINT
+                    | DXGI_FORMAT_R16_SINT
+                    | DXGI_FORMAT_R8_UINT
+                    | DXGI_FORMAT_R8_SINT
+            )
+        };
+        let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let shared = self.blend.RenderTarget[0];
+            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
+                return;
+            }
+            // With shared blending D3D12 reads slot zero for every target.
+            // Expand it before overriding individual targets, including
+            // their shared write mask.
+            self.blend.RenderTarget[..formats.len()].fill(shared);
+            self.blend.IndependentBlendEnable = (formats.len() > 1).into();
+        }
+        for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
+            if integer(format) {
+                target.BlendEnable = false.into();
+            }
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -736,6 +785,42 @@ fn root_signature(
 #[cfg(all(test, feature = "diagnostics"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_B4G4R4A4_UNORM,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        g.blend.IndependentBlendEnable = true.into();
+        for (i, target) in g.blend.RenderTarget[..3].iter_mut().enumerate() {
+            target.BlendEnable = true.into();
+            target.BlendOp = D3D12_BLEND_OP_MAX;
+            target.RenderTargetWriteMask = [15, 15, 1][i];
+        }
+        let before = g.blend;
+        g.apply_integer_blend_bypass();
+        assert_eq!(g.blend.RenderTarget[0..2], before.RenderTarget[0..2]);
+        let mut expected = before.RenderTarget[2];
+        expected.BlendEnable = false.into();
+        assert_eq!(g.blend.RenderTarget[2], expected);
+
+        g.blend = before;
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 3;
+        g.targets.RTFormats.swap(0, 2);
+        g.apply_integer_blend_bypass();
+        assert!(g.blend.IndependentBlendEnable.as_bool());
+        assert!(!g.blend.RenderTarget[0].BlendEnable.as_bool());
+        for target in &g.blend.RenderTarget[1..3] {
+            assert!(target.BlendEnable.as_bool());
+            assert_eq!(target.BlendOp, D3D12_BLEND_OP_MAX);
+            assert_eq!(target.RenderTargetWriteMask, 3);
+        }
+    }
 
     /// Pipelines of the console's rectangle type get the geometry shader
     /// that draws rectangle lists; others do not.

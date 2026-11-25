@@ -104,6 +104,16 @@ fn swapped(hash: &str) -> Option<&'static [u8]> {
         .map(Vec::as_slice)
 }
 
+/// Whether pipelines blend no integer render target, as the console's color
+/// buffer bypasses its blender for them and D3D12 refuses a pipeline that
+/// blends one (DexNom ddb7332). On unless `VICTORY_NO_INTEGER_BLEND_BYPASS`
+/// is set.
+#[cfg(windows)]
+fn integer_blend_bypass() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_INTEGER_BLEND_BYPASS").is_none())
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -670,6 +680,10 @@ pub(crate) extern "system" fn create_stream(
             graphics.read(kind, desc.stream.add(at))
         };
         at += size;
+    }
+    #[cfg(windows)]
+    if integer_blend_bypass() {
+        graphics.apply_integer_blend_bypass();
     }
     hand_out(
         shaders,
