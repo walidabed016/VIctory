@@ -17,6 +17,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod aftermath;
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
