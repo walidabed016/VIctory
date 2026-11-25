@@ -123,18 +123,9 @@ enum Split {
 /// [`lower`], with the console's waves run as `split` says.
 fn lower_as(parts: &Parts, split: Split) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
-    let mut lanes = false;
     loop {
-        match Lower::new(parts, &bad, split, lanes).run() {
+        match Lower::new(parts, &bad, split).run() {
             Ok(l) => return Ok(l),
-            // Again on the console's lanes, where what had no DXIL form off
-            // them may have one.
-            Err(Stop::Fail(ShaderError::Unsupported {
-                what: HOST_LANES, ..
-            })) if !lanes => {
-                lanes = true;
-                bad.clear();
-            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -255,8 +246,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
-    /// Compute code that reads other lanes (a loop's last pass included):
-    /// thread ids follow the host lanes, so lane n is console lane n.
+    /// Compute code that reads other lanes: thread ids follow the host
+    /// lanes, so lane n is console lane n.
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
@@ -298,11 +289,6 @@ struct Lower<'a> {
     halves: Option<Halves>,
     /// Halves: why a mask read as data has no ballot where it is written.
     ballot_fail: HashMap<Value, Why>,
-    /// Loops on one block whose scalars code after them reads as the last
-    /// pass's (see [`Lower::last_pass_after`]).
-    last_pass_loops: HashSet<usize>,
-    /// Those scalars as that code reads them, with their loop's block.
-    last_pass: HashMap<Value, (usize, Val)>,
     #[cfg(test)]
     halves_barriers: u32,
 }
@@ -667,13 +653,6 @@ fn half_inputs(io: &StageIo, elements: &[SigElement]) -> HashMap<u8, HalfSources
     packed_halves(elements, &rows)
 }
 
-/// A scalar a waterfall loop reads from a descriptor and code after the loop
-/// reads, where it cannot be the loop's last pass's ([`Lower::last_pass_exact`]).
-const LAST_PASS: Why = "a scalar a waterfall loop reads from a descriptor, used after the loop";
-/// [`LAST_PASS`] where only the host's lanes stand in the way: [`lower_as`]
-/// lowers the program again on the console's.
-const HOST_LANES: Why = "a scalar a waterfall loop leaves, off the console's lanes";
-
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -690,7 +669,7 @@ struct Bounding {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, split: Split, lanes: bool) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, split: Split) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -715,10 +694,8 @@ impl<'a> Lower<'a> {
             // lane order; so does LDS shared within one wave, where the
             // console compiler leaves out barriers. In lockstep, EXEC itself
             // is console lanes.
-            // `lanes`: a loop's scalars read after it are its last pass's
-            // (`HOST_LANES`).
             let lockstep = split == Split::Lockstep;
-            console_lanes = reads_console_lanes(x) || lockstep || lanes;
+            console_lanes = reads_console_lanes(x) || lockstep;
             let wave = if x.native.wave64 { 64 } else { 32 };
             let threads: u32 = cs.threads.iter().product();
             let one_wave = threads <= wave;
@@ -898,8 +875,6 @@ impl<'a> Lower<'a> {
             abort: None,
             halves,
             ballot_fail: HashMap::new(),
-            last_pass_loops: HashSet::new(),
-            last_pass: HashMap::new(),
             #[cfg(test)]
             halves_barriers: 0,
         }
@@ -1446,8 +1421,6 @@ impl<'a> Lower<'a> {
             for phi in &p.blocks[b].phis {
                 self.ballot_where_written(phi.value);
             }
-            self.last_pass_after(b)
-                .map_err(|w| unsupported(p.blocks[b].offset, w))?;
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
@@ -1714,11 +1687,6 @@ impl<'a> Lower<'a> {
 
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
-        match self.last_pass.get(&v) {
-            Some(&(_, Val::Missing(w))) => return Err(w),
-            Some(&(_, val)) => return Ok(val),
-            None => {}
-        }
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
@@ -4513,14 +4481,10 @@ impl<'a> Lower<'a> {
         let mut uses = uses_of(&|load| load == site);
         if uses.is_empty() {
             uses = uses_of(&|load| self.same_address(load, site));
-            if !uses.is_empty() && !self.loop_scalars(site.0).is_empty() {
-                if !self.last_pass_exact(site.0) {
-                    return Err(LAST_PASS);
-                }
-                if !self.console_lanes {
-                    return Err(HOST_LANES);
-                }
-                self.last_pass_loops.insert(site.0);
+            if !uses.is_empty() && self.scalar_leaves_loop(site.0) {
+                return Err(
+                    "a scalar a waterfall loop reads from a descriptor, used after the loop",
+                );
             }
         }
         let scalar = |at: Site| {
@@ -4726,20 +4690,21 @@ impl<'a> Lower<'a> {
             }
     }
 
-    /// The scalars (not lane masks) block `b` computes that code after it
-    /// reads, when `b` loops on itself. Lanes run such a loop each until its
-    /// own pass (see `structure`), so a scalar is the lane's own pass's; on
-    /// the console it is the last pass's, the same in every lane.
-    fn loop_scalars(&self, b: usize) -> Vec<Value> {
+    /// Whether block `b` loops on itself and a scalar it computes (not a
+    /// lane mask) is read after the loop. Lanes run such a loop each until
+    /// its own pass (see `structure`), so the scalar is the lane's own pass's;
+    /// on the console it is the last pass's, the same in every lane.
+    fn scalar_leaves_loop(&self, b: usize) -> bool {
         let p = self.x.p;
         if !matches!(p.blocks[b].exit, Exit::Branch { taken, not_taken } if taken == b || not_taken == b)
         {
-            return Vec::new();
+            return false;
         }
         let st = self.x.st;
         let scalar = |(r, v): &(Reg, Value)| {
-            let data = matches!(*r, Reg::S(c) if c != EXEC && c != EXEC + 1) || *r == Reg::Scc;
-            data && !st.masks.contains_key(v) && !st.highs.contains_key(v)
+            matches!(*r, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                && !st.masks.contains_key(v)
+                && !st.highs.contains_key(v)
         };
         let block = &p.blocks[b];
         let written: HashSet<Value> = block
@@ -4750,82 +4715,22 @@ impl<'a> Lower<'a> {
             .filter(scalar)
             .map(|w| w.1)
             .collect();
-        let mut read: Vec<Value> = (p.blocks.iter().enumerate())
+        p.blocks
+            .iter()
+            .enumerate()
             .filter(|&(c, _)| c != b)
-            .flat_map(|(_, other)| {
-                let insts = other.insts.iter().flat_map(|i| i.reads.iter().map(|r| r.1));
-                insts.chain(other.phis.iter().flat_map(|ph| ph.args.iter().copied()))
+            .any(|(_, other)| {
+                other
+                    .insts
+                    .iter()
+                    .flat_map(|i| &i.reads)
+                    .any(|r| written.contains(&r.1))
+                    || other
+                        .phis
+                        .iter()
+                        .flat_map(|ph| &ph.args)
+                        .any(|a| written.contains(a))
             })
-            .filter(|v| written.contains(v))
-            .collect();
-        read.sort_unstable();
-        read.dedup();
-        read
-    }
-
-    /// Whether the scalars loop `l` leaves can be its last pass's in each
-    /// lane after it (see [`Lower::last_pass_after`]), on the console's
-    /// lanes: host waves can be the console's, lane for lane (compute, not
-    /// on halves, and a 64-lane program only where it already runs on 64-lane
-    /// waves), every lane runs the loop on its own (no pass serves several,
-    /// as in a proven waterfall), and the block after it follows it alone.
-    fn last_pass_exact(&self, l: usize) -> bool {
-        let p = self.x.p;
-        let Exit::Branch { taken, not_taken } = p.blocks[l].exit else {
-            return false;
-        };
-        let after = if taken == l { not_taken } else { taken };
-        (self.console_lanes || !self.x.native.wave64)
-            && self.halves.is_none()
-            && self.s.threads.is_some()
-            && self.s.mesh.is_none()
-            && after != l
-            && p.blocks[after].preds == [l]
-            && !self.x.res.waterfall.compares.iter().any(|c| c.0 == l)
-    }
-
-    /// At the start of block `b`, when it follows alone a loop of
-    /// [`Lower::last_pass_loops`]: each scalar the loop computes that code
-    /// after it reads becomes its last pass's. The console runs the loop's
-    /// scalar code while any lane is left in it, so all its lanes leave it
-    /// with the last pass's; lowered per lane, each leaves with its own. The
-    /// lanes of the last pass ran the most iterations (the header's count).
-    fn last_pass_after(&mut self, b: usize) -> Result<(), Why> {
-        use super::wave::Op;
-        let preds: Vec<usize> = (self.x.p.blocks[b].preds.iter())
-            .copied()
-            .filter(|&q| self.block[q].is_some())
-            .collect();
-        let [l] = preds[..] else {
-            return Ok(());
-        };
-        if l == b || !self.last_pass_loops.contains(&l) {
-            return Ok(());
-        }
-        self.cross_lane(false)?;
-        let c = self.cur;
-        let (count, _) = self.counters[&l];
-        let most = self.wave_active(Op::MaxU, count);
-        let last = self.s.m.cmp(c, pred::EQ, count, most);
-        let (lane, none) = (self.lane_index(), self.s.m.i32(u32::MAX));
-        let lane = self.s.m.select(c, last, lane, none);
-        let lane = self.wave_active(Op::MinU, lane);
-        for v in self.loop_scalars(l) {
-            let val = match self.vals.get(&v).copied() {
-                Some(Val::I32(x)) => Val::I32(self.read_lane(x, lane)),
-                Some(Val::Bit(x)) => {
-                    let x = self.s.m.cast(c, Cast::ZExt, x, self.s.t.i32);
-                    let x = self.read_lane(x, lane);
-                    let zero = self.s.m.i32(0);
-                    Val::Bit(self.s.m.cmp(c, pred::NE, x, zero))
-                }
-                Some(missing @ Val::Missing(_)) => missing,
-                None => continue,
-            };
-            self.floats.remove(&v);
-            self.last_pass.insert(v, (l, val));
-        }
-        Ok(())
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -9625,11 +9530,7 @@ impl<'a> Lower<'a> {
                     l.read_phis.contains(&phi.value)
                         && !l.unread_from(phi.value, b, n, &[], &mut 256)
                 };
-                let got = match self.last_pass.get(&arg) {
-                    Some(&(l, val)) if l != q => Some(val),
-                    _ => self.vals.get(&arg).copied(),
-                };
-                let x = match (got, bit) {
+                let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if read(self) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
@@ -10062,16 +9963,21 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_dwords_a_waterfall_loop_leaves_in_scalars_are_the_last_passs() {
+    fn descriptor_dwords_a_waterfall_loop_leaves_in_scalars_are_refused() {
         // The descriptor's kind comes from the sampling loop's load of the
         // same entry; a height kept in a VGPR is each lane's own.
         let (layout, used) = texture_and_uav_tables();
         assert!(lower_wave(&height_then_sample(true), layout, used, false).is_ok());
-        // On the console the SGPR holds the last pass's height: each lane
-        // reads it from a lane of that pass, on the console's lanes.
+        // On the console the SGPR holds the last pass's height.
         let (layout, used) = texture_and_uav_tables();
-        let l = lower_wave(&height_then_sample(false), layout, used, false).unwrap();
-        assert!(l.wave_ops);
+        match lower_wave(&height_then_sample(false), layout, used, false) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(
+                what,
+                "a scalar a waterfall loop reads from a descriptor, used after the loop"
+            ),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("lowered"),
+        }
     }
 
     #[test]
