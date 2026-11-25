@@ -279,6 +279,16 @@ pub fn sampler_choices() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_SAMPLER_CHOICES").is_none())
 }
 
+/// Whether a biased sample with 16-bit coordinates (`image_sample_b` with
+/// a16) translates: the bias takes a VGPR of its own, an f16 in the low
+/// half, and the coordinates follow it packed; refused otherwise. On unless
+/// `VICTORY_NO_A16_BIAS` is set. The value is part of the translation, so
+/// the shader cache must key on it (`victory-gpu`'s does).
+pub fn a16_bias() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_A16_BIAS").is_none())
+}
+
 /// How mesh programs take the console's tests of whether a lane mask has a
 /// lane set and its wave minimums, maximums, ANDs and ORs
 /// (`VICTORY_MESH_WAVE_OPS`). The value is part of the translation, so the

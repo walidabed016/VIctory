@@ -46,8 +46,8 @@ pub(crate) fn counts() -> (u64, u64) {
 /// textures read only for their size translate, whether constant
 /// descriptors joined by control flow do, and whether descriptor dwords pass
 /// through compares and loads that do not read them as data, whether a
-/// uniform choice of immediate samplers translates, and how mesh programs
-/// take wave operations).
+/// uniform choice of immediate samplers translates, whether biased samples
+/// with 16-bit coordinates do, and how mesh programs take wave operations).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -68,6 +68,7 @@ fn build() -> &'static [u8; 32] {
             u8::from(victory_shader::emit::joined_constants()),
             u8::from(victory_shader::emit::unread_fields()),
             u8::from(victory_shader::emit::sampler_choices()),
+            u8::from(victory_shader::emit::a16_bias()),
         ];
         let mesh = victory_shader::emit::mesh_wave_ops();
         if mesh != victory_shader::emit::MeshWaveOps::Lane {
