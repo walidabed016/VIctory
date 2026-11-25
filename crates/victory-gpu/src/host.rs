@@ -2779,6 +2779,9 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    /// Frames since the last logged line, which the VRAM twin counters
+    /// span (`frames` spans the last second).
+    logged_frames: u64,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -2793,6 +2796,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            logged_frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -2806,6 +2810,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.logged_frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -2849,9 +2854,10 @@ impl Meter {
                  {waited:.1} ms/frame waiting for them) and {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            let logged = std::mem::take(&mut self.logged_frames) as f64;
             let [ms, up, compared, down, skipped, whole, given] = [0, 1, 2, 3, 4, 5, 6].map(|i| {
                 let scale = [1e3, 1e6, 1e6, 1e6, 1e6, 1e6, 1.0][i];
-                TWINS[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+                TWINS[i].swap(0, Ordering::Relaxed) as f64 / scale / logged
             });
             if crate::shadow::twins_on() {
                 tracing::info!(
