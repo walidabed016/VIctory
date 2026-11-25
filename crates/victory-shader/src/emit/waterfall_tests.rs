@@ -515,8 +515,7 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
 
 /// [`crate::resource::tests::WATERFALL_INDEXED_WAVE32`]'s loop, and ahead
 /// of it another over the same entries that only reads the height from the
-/// descriptor into an SGPR as `GetDimensions` does, max(1, (HEIGHT + 1) >>
-/// BASE_LEVEL), copied to v17 after the loop;
+/// descriptor into an SGPR (`s_bfe_u32`), copied to v17 after the loop;
 /// with `join`, through a uniform branch around a write of 7 to it, which
 /// never runs. Lanes 8 to 15 hold entry 1's offset, the others entry 0's.
 /// The sample goes to dword `lane` of the buffer, the height to dword
@@ -548,13 +547,8 @@ fn height_after_the_loop(join: bool) -> Vec<u32> {
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         0x93A0_FF1A,
         0x0010_000E, // s_bfe_u32 s32, s26, 0x10000e (height - 1)
-        0x8020_8120, // s_add_u32 s32, s32, 1
-        0x93A1_FF1B,
-        0x0004_000C, // s_bfe_u32 s33, s27, 0x4000c (BASE_LEVEL)
-        0x9020_2120, // s_lshr_b32 s32, s32, s33
-        0x84A0_8120, // s_max_u32 s32, s32, 1
         0xBE96_4716, // s_andn2_wrexec_b32 s22, s22
-        0xBF89_FFF2, // s_cbranch_execnz -> v_readfirstlane_b32
+        0xBF89_FFF7, // s_cbranch_execnz -> v_readfirstlane_b32
         0xBEFE_0317, // s_mov_b32 exec_lo, s23
     ];
     if join {
@@ -611,7 +605,7 @@ fn lanes_read_the_last_passs_height_after_a_waterfall_loop() {
                 .map(|l| if (8..16).contains(&l) { 2.0 } else { 1.0 })
                 .collect();
             assert_eq!(red, want, "{label}, join {join}");
-            assert_eq!(words[32..], [4; 32], "{label}, join {join}");
+            assert_eq!(words[32..], [3; 32], "{label}, join {join}");
         }
     }
 }
