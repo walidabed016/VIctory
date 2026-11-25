@@ -357,3 +357,45 @@ fn a_whole_wave_64_bit_sum_gives_the_sum_of_the_low_dwords() {
         }
     }
 }
+
+const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
+    0x8000_0000 | (op as u32) << 23 | (sdst as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+#[test]
+fn masks_of_lanes_outside_exec_read_as_data_are_the_scalar_units() {
+    // In the lanes whose x & 5 is not 0 (`s_and_saveexec`), each stores the
+    // other lanes of its wave three ways: the saved EXEC without these
+    // (`s_xor_b32 s12, exec_lo, s12`, as an if's else mask), the compare's
+    // complement (`s_not_b32 s13, vcc_lo`) and a copy of the first
+    // (`s_mov_b32 s14, s12`). No lane they hold runs where they are
+    // written, so no ballot there sees them; the scalar unit's operations
+    // on the masks it reads give them.
+    let mut w = vec![sop1(0x03, 1, 0x80), 0xF408_0200, 0xFA00_0000];
+    let shift = inline((SLOTS * 4).trailing_zeros() as u16);
+    w.push(vop2(0x1A, 4, shift, 0));
+    for r in [5, 6, 8] {
+        w.extend(mov_k(r, DEAD));
+    }
+    w.push(vop2(0x1B, 7, inline(5), 0));
+    w.extend([vopc(0xC5, ZERO, 7), sop1(0x3C, 12, VCC_LO)]);
+    w.push(sop2(0x12, 12, EXEC_LO, 12));
+    w.push(sop1(0x07, 13, VCC_LO));
+    w.push(sop1(0x03, 14, 12));
+    w.extend([vop1(0x001, 5, 12), vop1(0x001, 6, 13), vop1(0x001, 8, 14)]);
+    w.push(sop2(0x10, EXEC_LO, EXEC_LO, 12));
+    for (k, r) in [5u8, 6, 8].into_iter().enumerate() {
+        w.extend(store(r, 4, 4 * k as u16));
+    }
+    w.push(S_ENDPGM);
+    let shader = build(&w);
+    let on = |x: u32| x & 5 != 0;
+    let others = (0..32).filter(|&l| !on(l)).fold(0u32, |m, l| m | 1 << l);
+    for (label, got) in run(&shader) {
+        for x in 0..THREADS {
+            let want = if on(x) { others } else { DEAD };
+            let at = (x * SLOTS) as usize;
+            assert_eq!(got[at..at + 3], [want; 3], "{label}: thread {x}");
+        }
+    }
+}

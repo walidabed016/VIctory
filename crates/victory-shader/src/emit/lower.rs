@@ -325,6 +325,8 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// What a lane mask with lanes outside EXEC where it is written stops with.
+const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -1750,45 +1752,188 @@ impl<'a> Lower<'a> {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
+        let (x, y) = self.mask_dwords(lo)?;
+        Ok(if high { y } else { x })
+    }
+
+    /// Both dwords of the lane mask whose low dword is `lo` (see
+    /// [`Lower::mask_dword`]).
+    fn mask_dwords(&mut self, lo: Value) -> Result<(V, V), Why> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if let Some(&xy) = self.ballots.get(&lo) {
+            return Ok(xy);
+        }
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            if self.halves.is_some() || self.mask_data != MaskData::Console {
+                return Err(ELSEWHERE);
+            }
+            let xy = self.mask_elsewhere(lo)?;
+            self.ballots.insert(lo, xy);
+            return Ok(xy);
         }
         if self.halves.is_some() {
             // Halves: only the ballot taken where the mask is written.
-            let &(x, y) = self
-                .ballots
-                .get(&lo)
-                .ok_or_else(|| self.ballot_fail.get(&lo).copied().unwrap_or(APART_MASK))?;
-            return Ok(if high { y } else { x });
+            return Err(self.ballot_fail.get(&lo).copied().unwrap_or(APART_MASK));
         }
-        let (x, y) = match self.ballots.get(&lo) {
-            Some(&xy) => xy,
-            None => {
-                let at = match self.def_block.get(&lo) {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
-                };
-                if !self.balloting.insert(lo) {
-                    return Err("a lane mask whose lanes depend on its own value");
+        let at = match self.def_block.get(&lo) {
+            // Program inputs (EXEC on entry).
+            None => self.s.entry,
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+        };
+        if !self.balloting.insert(lo) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let bit = self.boolean(m, at);
+        self.balloting.remove(&lo);
+        let bit = bit?;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+        self.ballots.insert(lo, xy);
+        Ok(xy)
+    }
+
+    /// Compute: a lane mask with lanes outside EXEC where it is written (no
+    /// ballot there sees them) as the console's scalar unit makes it from
+    /// data: a copy of a mask ([`Lower::copied_mask`]), or a bitwise
+    /// operation of masks and other scalars.
+    fn mask_elsewhere(&mut self, lo: Value) -> Result<(V, V), Why> {
+        let root = self.copied_mask(lo, &mut Vec::new()).unwrap_or(lo);
+        if root != lo {
+            return self.mask_dwords(root);
+        }
+        let p = self.x.p;
+        let b = *self.def_block.get(&lo).ok_or(ELSEWHERE)?;
+        let inst: &'a Inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))
+            .ok_or(ELSEWHERE)?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return Err(ELSEWHERE);
+        };
+        let op = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(if p.wave64 { "_b64" } else { "_b32" }))
+            .filter(|op| {
+                matches!(
+                    *op,
+                    "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" | "not"
+                )
+            })
+            .ok_or(ELSEWHERE)?;
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b].ok_or("a lane mask written after its use")?
+        };
+        let mut words = Vec::new();
+        for s in src {
+            words.push(match *s {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    let x = inst.read(Reg::S(code)).ok_or("an unread operand")?;
+                    if self.is_mask(Some(x)) {
+                        self.mask_dwords(x)?
+                    } else if p.wave64 {
+                        let y = inst.read(Reg::S(code + 1)).ok_or("an unread operand")?;
+                        (self.i32_of(x)?, self.i32_of(y)?)
+                    } else {
+                        (self.i32_of(x)?, self.s.m.i32(0))
+                    }
                 }
-                let bit = self.boolean(m, at);
-                self.balloting.remove(&lo);
-                let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                self.ballots.insert(lo, xy);
-                xy
+                Operand::Const(c) => {
+                    let x = crate::resource::inline(c).ok_or("a special operand")?;
+                    let y = if (x as i32) < 0 { u32::MAX } else { 0 };
+                    (self.s.m.i32(x), self.s.m.i32(y))
+                }
+                Operand::Literal(x) => (self.s.m.i32(x), self.s.m.i32(0)),
+                _ => return Err(ELSEWHERE),
+            });
+        }
+        let ones = self.s.m.i32(u32::MAX);
+        // s_not is the second operand all ones of an XOR.
+        let [(a, c), (b, d)] = match words[..] {
+            [x] if op == "not" => [x, (ones, ones)],
+            [x, y] if op != "not" => [x, y],
+            _ => return Err(ELSEWHERE),
+        };
+        // The operation, whether it inverts its second operand, its result.
+        let (bin, not_b, not_r) = match op {
+            "and" => (Bin::And, false, false),
+            "or" => (Bin::Or, false, false),
+            "andn2" => (Bin::And, true, false),
+            "orn2" => (Bin::Or, true, false),
+            "nand" => (Bin::And, false, true),
+            "nor" => (Bin::Or, false, true),
+            "xnor" => (Bin::Xor, false, true),
+            _ => (Bin::Xor, false, false),
+        };
+        let mut dword = |a: V, b: V| {
+            let m = &mut self.s.m;
+            let b = if not_b {
+                m.bin(at, Bin::Xor, b, ones)
+            } else {
+                b
+            };
+            let r = m.bin(at, bin, a, b);
+            if not_r {
+                m.bin(at, Bin::Xor, r, ones)
+            } else {
+                r
             }
         };
-        Ok(if high { y } else { x })
+        Ok((dword(a, b), dword(c, d)))
+    }
+
+    /// The mask `v` copies: through `s_mov`, `v_readlane_b32` restoring
+    /// a spill ([`Lower::restored`]) and joins whose incoming values all
+    /// copy one mask (`seen`: joins on the way, where a
+    /// loop back to one adds nothing); `v` when it copies none.
+    fn copied_mask(&self, v: Value, seen: &mut Vec<Value>) -> Option<Value> {
+        let p = self.x.p;
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            if seen.contains(&v) {
+                return None;
+            }
+            seen.push(v);
+            let mut root = None;
+            for &a in &p.blocks[b].phis[i].args {
+                match self.copied_mask(a, seen) {
+                    None => {}
+                    Some(r) if root.is_none_or(|x| x == r) => root = Some(r),
+                    Some(_) => return Some(v),
+                }
+            }
+            return Some(root.unwrap_or(v));
+        }
+        let Some(&b) = self.def_block.get(&v) else {
+            return Some(v);
+        };
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let mov = if p.wave64 { "s_mov_b64" } else { "s_mov_b32" };
+        match &inst.fields {
+            Fields::Sop { src, .. } if inst.name() == mov => match src.first() {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                    let from = inst.read(Reg::S(code))?;
+                    self.copied_mask(from, seen)
+                }
+                _ => Some(v),
+            },
+            Fields::Valu(_) => match self.restored(inst) {
+                Some(Moved::Value(from)) => self.copied_mask(from, seen),
+                _ => Some(v),
+            },
+            _ => Some(v),
+        }
     }
 
     // ---- operands ----
@@ -2934,7 +3079,7 @@ impl<'a> Lower<'a> {
     fn half_ballot(&mut self, lo: Value) -> Result<(V, V), Why> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            return Err(ELSEWHERE);
         }
         let bit = self.boolean(m, self.cur)?;
         self.ballot_halves(bit, APART_MASK)
