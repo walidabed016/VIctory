@@ -779,8 +779,9 @@ impl Step {
     /// Pipelined (WAL-17): before the step, waits for the submissions in
     /// flight whose memory it touches: what their shaders write (copied
     /// back when they complete), and for a title copy, which the GPU would
-    /// do after them, also what they read. Refreshes wait in
-    /// [`Batch::flush`]; host work writes the list's own memory.
+    /// do after them, also what they read. Refreshes wait for the pages
+    /// they copy ([`crate::shadow::Shadow::update`]); host work writes the
+    /// list's own memory.
     fn wait_in_flight(&self) {
         use crate::pipelined::Writer;
         if !crate::pipelined::on() {
@@ -2282,13 +2283,7 @@ impl Batch {
             let asking = crate::watch::asking();
             let mut copied = 0;
             for (a, b) in self.stale(&shadow, from, to) {
-                crate::pipelined::wait_writes(a, b, crate::pipelined::Writer::Refresh);
-                let n = shadow.update(a, b - a);
-                #[cfg(feature = "diagnostics")]
-                if n > 0 {
-                    crate::pipelining::touch(crate::pipelining::Touch::Refresh, a, b - a);
-                }
-                copied += n;
+                copied += shadow.update(a, b - a);
             }
             self.done.push((shadow, asking, from, to));
             let us = started.elapsed().as_micros() as u64;

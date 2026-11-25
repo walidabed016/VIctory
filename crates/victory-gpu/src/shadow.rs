@@ -1175,7 +1175,9 @@ impl Shadow {
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
-    /// write-watched). Returns the bytes copied.
+    /// write-watched), waiting for the submissions in flight whose shaders
+    /// write the pages it copies (`crate::pipelined::wait_writes`).
+    /// Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         if self.in_place && self.twin.is_none() {
             return 0;
@@ -1215,17 +1217,20 @@ impl Shadow {
     /// Copies the pages of `[from, to)` the watch says changed since they
     /// were copied; `None` if it cannot tell for the range.
     fn update_watched(&self, from: usize, to: usize) -> Option<usize> {
-        // Before the journal, as arming takes them.
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         let mut started = None;
-        let stale = crate::watch::writes_with(from, to, true, |now, written| {
-            #[cfg(feature = "diagnostics")]
-            {
-                started = Some(std::time::Instant::now());
-            }
-            self.stale(&mut copied, from, to, now, written)
-        })?;
+        let stale = {
+            // Before the journal, as arming takes them; let go before the
+            // copies, which may wait for a copy-back that takes them.
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            crate::watch::writes_with(from, to, true, |now, written| {
+                #[cfg(feature = "diagnostics")]
+                {
+                    started = Some(std::time::Instant::now());
+                }
+                self.stale(&mut copied, from, to, now, written)
+            })?
+        };
         let bytes = stale.into_iter().map(|(a, b)| self.copy(a, b)).sum();
         #[cfg(feature = "diagnostics")]
         {
@@ -1341,6 +1346,13 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Pipelined: the copy and the snapshots would take bytes a
+        // submission in flight writes, or be overwritten by what it wrote,
+        // before its copy-back. Pages the title wrote elsewhere in the
+        // range do not wait for it.
+        crate::pipelined::wait_writes(from, to, crate::pipelined::Writer::Refresh);
+        #[cfg(feature = "diagnostics")]
+        crate::pipelining::touch(crate::pipelining::Touch::Refresh, from, to - from);
         // Title memory used in place is the copy: only its twin takes it.
         if !self.in_place {
             for (at, host, n) in self.pieces(from - start, to - start, true) {
@@ -1356,7 +1368,7 @@ impl Shadow {
                 .push((from, to));
         }
         // The submission being prepared takes it; those in flight do not
-        // write what it refreshes (`crate::pipelined::wait_writes`).
+        // write it (above).
         let slot = prep_slot();
         let mut before = self.before[slot].lock().unwrap_or_else(|e| e.into_inner());
         for (taken, bytes) in before.iter_mut() {
@@ -4428,6 +4440,76 @@ pub(crate) mod tests {
         drop(s);
         unregister(usize::MAX - 24, at as u64);
         unmap(&made);
+    }
+
+    /// Pipelined: a refresh waits for a submission in flight only to copy
+    /// pages its shaders write, not for every range that overlaps them.
+    #[test]
+    fn a_refresh_waits_only_to_copy_pages_shaders_in_flight_write() {
+        use std::time::Duration;
+        /// Lets the held submission complete, also when the test fails.
+        struct Go(std::sync::mpsc::Sender<()>);
+        impl Drop for Go {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let _serial = crate::watch::serial();
+        if !gpu() || !crate::pipelined::on() {
+            return;
+        }
+        // Write-watched memory, its last page not committed: copied.
+        let len = 4 * MIB + (64 << 10);
+        let at = title_memory(1200, 256 * MIB, len, 4 * MIB);
+        assert_ne!(at, 0, "no free address for test memory");
+        register(usize::MAX - 25, at as u64, len as u64);
+        let s = find(at as u64, len as u64).unwrap();
+        assert!(!s.in_place);
+        crate::watch::forget_asked();
+        s.update(at, 4 * MIB);
+        // A submission in flight whose shaders write the second MiB.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        crate::pipelined::launch(
+            vec![(at + MIB, at + 2 * MIB)],
+            Vec::new(),
+            Vec::new(),
+            Box::new(move |_| {
+                let _ = wait.recv();
+            }),
+        );
+        let go = Go(go);
+        let refresh = || {
+            let (s, (tx, rx)) = (s.clone(), std::sync::mpsc::channel());
+            std::thread::spawn(move || {
+                crate::watch::forget_asked();
+                let _ = tx.send(s.update(at, 4 * MIB));
+            });
+            rx
+        };
+        let (x, y) = (at + 3 * MIB + 8, at + MIB + 8);
+        // SAFETY: committed title memory of ours.
+        unsafe { (x as *mut u32).write(0xfeed) };
+        let copied = refresh()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waited for the submission in flight");
+        assert_eq!(copied, PAGE);
+        assert_eq!(held(&s, x), Some(0xfeed));
+        // SAFETY: as above.
+        unsafe { (y as *mut u32).write(0xbeef) };
+        let done = refresh();
+        assert!(
+            done.recv_timeout(Duration::from_millis(300)).is_err(),
+            "copied a page the submission in flight writes"
+        );
+        drop(go);
+        let copied = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("still waiting after the submission completed");
+        assert_eq!(copied, PAGE);
+        assert_eq!(held(&s, y), Some(0xbeef));
+        drop(s);
+        unregister(usize::MAX - 25, at as u64);
+        release(at);
     }
 
     /// Big splits run on the split threads, started once, not on threads
