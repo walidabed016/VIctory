@@ -164,6 +164,7 @@ pub(crate) fn wrote_since(asked: u64, start: usize, end: usize) -> bool {
 /// next asking of a range not asked about since [`forget_asked`]). Its pages
 /// count as written now: the asking it returns.
 pub(crate) fn wrote(start: usize, end: usize) -> u64 {
+    changed(start / BLOCK, end.div_ceil(BLOCK));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.asked += 1;
     let now = j.asked;
@@ -181,6 +182,7 @@ pub(crate) fn wrote(start: usize, end: usize) -> u64 {
         .collect();
     for a in aliases {
         g.clean.remove(a, a + 1);
+        changed(a, a + 1);
         j.written.insert(a * BLOCK / PAGE, now);
         j.ours.push((now, a * BLOCK, (a + 1) * BLOCK));
     }
@@ -440,6 +442,47 @@ pub(crate) fn view(at: usize) -> bool {
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+
+/// Title memory by 4 MiB region, up to 1 TiB: the number of the latest
+/// change to what a guarded asking finds there ([`changed`]). A copy that
+/// took a range wholly guarded and clean holds it until one of its regions
+/// changes, which it tells in a few loads ([`last_change`]) instead of
+/// asking.
+const REGION: usize = 4 << 20;
+static CHANGES: [AtomicU64; 1 << 18] = [const { AtomicU64::new(0) }; 1 << 18];
+static CHANGE: AtomicU64 = AtomicU64::new(0);
+
+/// Blocks `[from, to)` may no longer hold what a copy took, or are
+/// guarded or clean no more.
+fn changed(from: usize, to: usize) {
+    let now = CHANGE.fetch_add(1, Ordering::SeqCst) + 1;
+    let (a, b) = (
+        from * BLOCK / REGION,
+        to.saturating_mul(BLOCK).div_ceil(REGION),
+    );
+    for region in &CHANGES[a.min(CHANGES.len())..b.min(CHANGES.len())] {
+        region.fetch_max(now, Ordering::SeqCst);
+    }
+}
+
+/// The latest change's number ([`changed`]).
+pub(crate) fn changes() -> u64 {
+    CHANGE.load(Ordering::SeqCst)
+}
+
+/// The number of the latest change to title memory `[start, end)`; `None`
+/// past the memory tracked.
+pub(crate) fn last_change(start: usize, end: usize) -> Option<u64> {
+    let (a, b) = (start / REGION, end.div_ceil(REGION));
+    let regions = CHANGES.get(a..b)?;
+    Some(
+        regions
+            .iter()
+            .map(|r| r.load(Ordering::SeqCst))
+            .max()
+            .unwrap_or(0),
+    )
+}
 
 struct Guards {
     /// Blocks we made read-only.
@@ -840,6 +883,7 @@ fn guard_aliases(g: &mut Guards, from: usize, to: usize) {
         }
         if !guarded {
             g.clean.remove(block, block + 1);
+            changed(block, block + 1);
         }
     }
 }
@@ -855,6 +899,7 @@ fn aliases_written(g: &mut Guards, from: usize, to: usize) {
     for a in aliases {
         save(g, a, a + 1);
         g.clean.remove(a, a + 1);
+        changed(a, a + 1);
     }
 }
 
@@ -867,6 +912,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         save(g, from, to);
         g.protected.remove(from, to);
         g.clean.remove(from, to);
+        changed(from, to);
         for block in from..to {
             let mut old = 0;
             // SAFETY: a block we made read-only.
@@ -1159,6 +1205,7 @@ pub fn title_memory_shows(at: usize, len: usize, first: u64) {
     for a in others {
         save(&mut g, a, a + 1);
         g.clean.remove(a, a + 1);
+        changed(a, a + 1);
     }
 }
 
@@ -1201,6 +1248,7 @@ pub fn physical_pages_writing(first: u64, n: usize) {
     for b in blocks {
         save(&mut g, b, b + 1);
         g.clean.remove(b, b + 1);
+        changed(b, b + 1);
     }
 }
 
@@ -1229,6 +1277,7 @@ pub fn physical_pages_written(first: u64, n: usize) {
     let now = j.asked;
     for b in blocks {
         g.clean.remove(b, b + 1);
+        changed(b, b + 1);
         j.written.insert(b * BLOCK / PAGE, now);
     }
 }
@@ -1267,6 +1316,7 @@ fn skip_unwritten() -> bool {
 pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
     let mut g = guards();
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    changed(from, to);
     if watched {
         g.pools.insert(from, to);
     } else {
@@ -1284,6 +1334,7 @@ pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
 pub(crate) fn title_memory_held(at: usize, len: usize, held: bool) {
     let mut g = guards();
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    changed(from, to);
     if held {
         g.held.insert(from, to);
     } else {
@@ -1322,6 +1373,7 @@ fn unguard(g: &mut Guards, from: usize, to: usize, mapped: bool) {
     g.protected.remove(from, to);
     // Unmapped blocks are clean without being guarded.
     g.clean.remove(from, to);
+    changed(from, to);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
