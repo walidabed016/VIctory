@@ -19,6 +19,8 @@ pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
+#[cfg(all(test, windows))]
+mod guard_race;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;

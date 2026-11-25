@@ -20,6 +20,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -514,32 +515,121 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
     )
 }
 
-// Kernel reads into title memory. The GPU side leaves blocks of title GPU
-// buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; Grand Theft Auto VI's
-// synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
-// destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// Reads into title memory. The GPU side leaves blocks of title GPU buffers
+// read-only to see the title's next write, and the kernel's writes fail
+// there instead of faulting into its handler, also where it guards a block
+// again while a read runs (DirectStorage's 0x800706f8 in runs 72 and 73).
+// So reads of files go through a buffer of ours, and the CPU stores what
+// they read, faulting into the handler as the title's own stores do. Grand
+// Theft Auto VI's synchronous reads (title+0x313fc0) read straight into
+// 4 KiB-aligned destinations and retry a failed `ReadFile` forever.
 
+/// Opens title memory `[at, at + len)` before the runtime writes it, so
+/// that few of its stores fault into the GPU side's guard.
+pub(crate) fn opening(at: usize, len: usize) {
+    victory_gpu::kernel_will_write(at, len);
+    #[cfg(test)]
+    super::guard_race::guarded_again(at);
+}
+
+/// Stores `bytes` at title address `at` with the CPU.
+fn store(at: *mut u8, bytes: &[u8]) {
+    opening(at as usize, bytes.len());
+    // SAFETY: the title's destination holds at least `bytes.len()` bytes; a
+    // store to a block the GPU side guarded again faults into its handler.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
+}
+
+/// A read of a file with an `OVERLAPPED` completes before it returns, as
+/// a read can; no title image binds files to a completion port.
 pub extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
     len: u32,
     read: *mut u32,
-    overlapped: *mut c_void,
+    overlapped: *mut OVERLAPPED,
 ) -> i32 {
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_IO_PENDING, GetLastError, SetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+    use windows_sys::Win32::System::IO::GetOverlappedResult;
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+    let host_read = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut OVERLAPPED) -> i32);
+    // SAFETY: a query of the title's handle.
+    if unsafe { GetFileType(file) } != FILE_TYPE_DISK {
+        // A pipe or a console, whose read may wait for data as the title
+        // asked: the kernel writes the destination.
+        opening(buffer as usize, len as usize);
+        return host_read(file, buffer, len, read, overlapped);
+    }
+    let mut bytes = vec![0; len as usize];
+    let mut n = 0;
+    // SAFETY: the title's OVERLAPPED, if any, lives until the read is done.
+    let Some(title) = (unsafe { overlapped.as_mut() }) else {
+        if host_read(file, bytes.as_mut_ptr(), len, &mut n, std::ptr::null_mut()) == 0 {
+            return 0;
+        }
+        store(buffer, &bytes[..n as usize]);
+        if !read.is_null() {
+            // SAFETY: the title's count.
+            unsafe { *read = n };
+        }
+        return 1;
+    };
+    // SAFETY: plain creation of a manual-reset event.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return 0;
+    }
+    // At the title's offset; the event's low bit keeps a completion port
+    // from hearing of it.
+    let mut ours = OVERLAPPED {
+        Anonymous: title.Anonymous,
+        hEvent: (event as usize | 1) as _,
+        ..OVERLAPPED::default()
+    };
+    // SAFETY: our OVERLAPPED and buffer outlive the read, waited for here.
+    let done = host_read(file, bytes.as_mut_ptr(), len, &mut n, &mut ours) != 0
+        || unsafe {
+            GetLastError() == ERROR_IO_PENDING && GetOverlappedResult(file, &ours, &mut n, 1) != 0
+        };
+    // SAFETY: as above; the event is ours.
+    unsafe {
+        let error = GetLastError();
+        CloseHandle(event);
+        SetLastError(error);
+    }
+    if !done {
+        return 0;
+    }
+    store(buffer, &bytes[..n as usize]);
+    if !read.is_null() {
+        // SAFETY: the title's count.
+        unsafe { *read = n };
+    }
+    title.InternalHigh = n as usize;
+    title.Internal = 0;
+    let event = (title.hEvent as usize & !1) as *mut c_void;
+    if !event.is_null() {
+        // SAFETY: the title's event.
+        unsafe { SetEvent(event) };
+    }
+    1
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
+/// Whole items reach the title; a partial last one is indeterminate in C.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    )
+    let host_fread =
+        host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let Some(len) = size.checked_mul(count) else {
+        return host_fread(buffer, size, count, stream); // fails, as it must
+    };
+    let mut bytes = vec![0; len];
+    let items = host_fread(bytes.as_mut_ptr(), size, count, stream);
+    store(buffer, &bytes[..items * size]);
+    items
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -749,6 +839,77 @@ mod tests {
         let handle = file.as_raw_handle().cast();
         assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));
+    }
+
+    /// Reads whose destination the GPU side guarded again after they opened
+    /// it land all the same, stored by the CPU, which faults into the
+    /// guard's handler: a synchronous read, a read at an `OVERLAPPED`'s
+    /// offset of a file opened for overlapped reads, and `fread`. The
+    /// kernel's writes failed there.
+    #[test]
+    fn reads_land_where_a_guard_came_back() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        use crate::modules::guard_race::{guard_again, memory, stand_in_guard, still_to_guard};
+        // SAFETY: the tests' own allocation, readable.
+        let landed =
+            |at: usize, n: usize| unsafe { std::slice::from_raw_parts(at as *const u8, n) };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let bytes: Vec<u8> = (0..20_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let base = memory(3 << 16);
+        stand_in_guard(base, 3 << 16);
+
+        let file = std::fs::File::open(&path).unwrap();
+        let (at, mut n) = (base + 100, 0);
+        guard_again(at);
+        let handle = file.as_raw_handle().cast();
+        assert_ne!(
+            ReadFile(handle, at as *mut u8, 1392, &mut n, std::ptr::null_mut()),
+            0
+        );
+        assert!(!still_to_guard(at), "guarded again");
+        assert_eq!((landed(at, 1392), n), (&bytes[..1392], 1392));
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(&path)
+            .unwrap();
+        let at = base + (1 << 16) + 200;
+        guard_again(at);
+        // SAFETY: plain creation of a manual-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        let mut ov = OVERLAPPED {
+            hEvent: event,
+            ..OVERLAPPED::default()
+        };
+        ov.Anonymous.Anonymous.Offset = 5000;
+        let handle = file.as_raw_handle().cast();
+        assert_ne!(
+            ReadFile(handle, at as *mut u8, 2000, std::ptr::null_mut(), &mut ov),
+            0
+        );
+        assert!(!still_to_guard(at), "guarded again");
+        // SAFETY: our event.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        assert_eq!((ov.Internal, ov.InternalHigh), (0, 2000));
+        assert_eq!(landed(at, 2000), &bytes[5000..7000]);
+
+        let narrow = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let stream = fopen(narrow.as_ptr(), c"rb".as_ptr());
+        assert!(!stream.is_null());
+        let at = base + (2 << 16) + 300;
+        guard_again(at);
+        assert_eq!(fread(at as *mut u8, 4, 750, stream), 750);
+        assert!(!still_to_guard(at), "guarded again");
+        assert_eq!(landed(at, 3000), &bytes[..3000]);
+        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(stream);
     }
 
     fn text(v: &[u16]) -> String {

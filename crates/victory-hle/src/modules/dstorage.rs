@@ -965,11 +965,7 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Opened first, so that most stores do not fault into the GPU side's
-        // guard on title buffers.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
-        #[cfg(test)]
-        tests::guarded_again(request.destination as usize);
+        super::files::opening(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1151,60 +1147,6 @@ mod tests {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
     }
 
-    /// The destination the GPU side guards again once a read opened it.
-    static GUARD_AGAIN: Mutex<Option<usize>> = Mutex::new(None);
-
-    /// What the GPU side's copies do between the opening of a read's
-    /// destination and its write: guard it again, read-only.
-    pub(super) fn guarded_again(at: usize) {
-        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-        let mut again = GUARD_AGAIN.lock().unwrap_or_else(|e| e.into_inner());
-        if again.take_if(|&mut d| d == at).is_some() {
-            let mut old = 0;
-            // SAFETY: the test's own allocation; only its protection changes.
-            let guarded = unsafe { VirtualProtect(at as _, 1, PAGE_READONLY, &mut old) };
-            assert_ne!(guarded, 0);
-        }
-    }
-
-    /// The range of memory whose guard [`stand_in_guard`] stands in for.
-    static GUARDED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-
-    /// Stands in for the GPU side's handler for `[at, at + len)`: a write
-    /// that faults there gives its page write access back and goes on.
-    fn stand_in_guard(at: usize, len: usize) {
-        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-            EXCEPTION_POINTERS,
-        };
-        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-        unsafe extern "system" fn reopen(info: *mut EXCEPTION_POINTERS) -> i32 {
-            // SAFETY: the system passes the exception being dispatched.
-            let r = unsafe { &*(*info).ExceptionRecord };
-            let at = r.ExceptionInformation[1] as u64;
-            let ours = r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
-                && r.NumberParameters >= 2
-                && r.ExceptionInformation[0] == 1
-                && (GUARDED[0].load(Ordering::SeqCst)..GUARDED[1].load(Ordering::SeqCst))
-                    .contains(&at);
-            if !ours {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-            let mut old = 0;
-            // SAFETY: a page of the test's own allocation.
-            unsafe { VirtualProtect(at as _, 1, PAGE_READWRITE, &mut old) };
-            EXCEPTION_CONTINUE_EXECUTION
-        }
-        GUARDED[0].store(at as u64, Ordering::SeqCst);
-        GUARDED[1].store((at + len) as u64, Ordering::SeqCst);
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        // SAFETY: the handler only changes the protection of our range.
-        ONCE.call_once(|| unsafe {
-            AddVectoredExceptionHandler(1, Some(reopen));
-        });
-    }
-
     #[test]
     fn request_layout_is_the_titles() {
         assert_eq!(size_of::<Request>(), 0x48);
@@ -1253,27 +1195,16 @@ mod tests {
     /// (0x800706f8 when the guard came back mid-read: runs 72 and 73).
     #[test]
     fn a_raw_read_lands_where_a_guard_came_back() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-        };
+        use crate::modules::guard_race::{guard_again, memory, stand_in_guard, still_to_guard};
         let plain = pattern(10_000);
         let (_dir, file) = file_with(&plain);
-        // SAFETY: a fresh allocation of our own.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                PAGE,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(base, 0);
+        let base = memory(PAGE);
         stand_in_guard(base, PAGE);
         let at = base + 100;
-        *GUARD_AGAIN.lock().unwrap() = Some(at);
+        guard_again(at);
         let read = request(0, at as *mut c_void, 1392, file, 3000, 1392);
         assert_eq!(execute(&read), Ok(()));
-        assert!(GUARD_AGAIN.lock().unwrap().is_none(), "guarded again");
+        assert!(!still_to_guard(at), "guarded again");
         // SAFETY: our allocation, readable.
         let landed = unsafe { std::slice::from_raw_parts(at as *const u8, 1392) };
         assert_eq!(landed, &plain[3000..4392]);
