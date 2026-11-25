@@ -289,6 +289,18 @@ pub fn a16_bias() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_A16_BIAS").is_none())
 }
 
+/// Whether a join's value with no DXIL form on an edge (a stale lane mask)
+/// may stand where every read of it a lane from that edge could reach lies
+/// behind a flag that edge clears, when a later loop takes the value back
+/// round to its header (unchanged, or through a join in its body); refused
+/// as a read otherwise. On unless `VICTORY_NO_UNREAD_LOOPS` is set. The
+/// value is part of the translation, so the shader cache must key on it
+/// (`victory-gpu`'s does).
+pub fn unread_loops() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_UNREAD_LOOPS").is_none())
+}
+
 /// Whether an operation on a value control flow joins from a load on some
 /// edge (a register a branch reuses where the other paths leave a stale lane
 /// mask) is data, not a mask operation (upstream 0b35b7f, in DexNom); taken

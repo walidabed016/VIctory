@@ -10608,14 +10608,17 @@ impl<'a> Lower<'a> {
     /// constant the edge brings) rule out each block that reads it. A join it
     /// feeds on a forward edge reads it only where no lane bringing it there
     /// reads that join: `facts` hold for every lane that brings `v` to `b`.
-    /// A join can be reached along many paths, so `budget` bounds the joins
-    /// followed.
+    /// A loop taking it back round to a join this follows (`round`: those
+    /// whose blocks were checked with only what holds before the loop, so on
+    /// every turn) reads it nowhere new. A join can be reached along many
+    /// paths, so `budget` bounds the joins followed.
     fn unread_from(
         &self,
         v: Value,
         b: usize,
         n: usize,
         facts: &[(Bool, bool)],
+        round: &[Value],
         budget: &mut u32,
     ) -> bool {
         let (p, st) = (self.x.p, self.x.st);
@@ -10698,6 +10701,11 @@ impl<'a> Lower<'a> {
         if known.is_empty() {
             return false;
         }
+        let round: Vec<Value> = round
+            .iter()
+            .copied()
+            .chain((known.len() == facts.len()).then_some(v))
+            .collect();
         let unreached = |r: usize, edge: Option<(Bool, bool)>| {
             let mut all = known.clone();
             all.push((st.reach[r], true));
@@ -10775,6 +10783,9 @@ impl<'a> Lower<'a> {
                     if unreached(s, edge) || !self.read_phis.contains(&phi.value) {
                         continue;
                     }
+                    if round.contains(&phi.value) && super::unread_loops() {
+                        continue;
+                    }
                     if self.rpo[r] <= self.rpo[s] || *budget == 0 {
                         return false;
                     }
@@ -10782,7 +10793,7 @@ impl<'a> Lower<'a> {
                     let mut carried = known.clone();
                     carried.push((st.reach[s], true));
                     carried.extend(edge);
-                    if !self.unread_from(phi.value, r, m, &carried, budget) {
+                    if !self.unread_from(phi.value, r, m, &carried, &round, budget) {
                         return false;
                     }
                 }
@@ -10820,7 +10831,7 @@ impl<'a> Lower<'a> {
                 }
                 let read = |l: &Self| {
                     l.read_phis.contains(&phi.value)
-                        && !l.unread_from(phi.value, b, n, &[], &mut 256)
+                        && !l.unread_from(phi.value, b, n, &[], &[], &mut 256)
                 };
                 if self.dims.contains_key(&arg) && !self.dims.contains_key(&phi.value) && read(self)
                 {

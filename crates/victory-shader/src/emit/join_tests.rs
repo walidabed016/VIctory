@@ -152,6 +152,67 @@ fn two_turns(skipped: u8, joins: u8, compare: bool) -> Vec<u32> {
     w
 }
 
+/// [`two_turns`]' join (no second join, no compare), then a loop of two
+/// turns that takes s3 back to its header unchanged, and through a join in
+/// a body it never runs (one arm writes 0x100 to s3), then, as the ped pixel
+/// programs' decal loops do, a second join: v1 is 0, the first turn
+/// overwrites s3 with 0x100 and sets v1 to -1, the second skips that, and a
+/// lane reads s3 (adding it to v5) only when v1 is -1.
+fn round_a_loop(skipped: u8) -> Vec<u32> {
+    let mut w = vec![sop1(0x03, 1, ZERO), 0xF408_0200, 0xFA00_0000];
+    w.extend([vop2(0x1A, 4, u16::from(TWO), 0), sop1(0x03, 4, ZERO)]);
+    w.push(vop1(0x01, 5, u16::from(ZERO)));
+    let turn = w.len();
+    w.extend(vop3(0xC4, 2, 128 + 16, v(0), 0));
+    w.extend(vop3(0x101, 6, u16::from(ZERO), u16::from(ONE), 2));
+    w.push(vop2(0x25, 5, v(5), 6));
+    // The arm and the first join, read behind v1 as in [`two_turns`].
+    let arm = |w: &mut Vec<u32>, skipped: u8| {
+        w.extend([vop1(0x01, 1, u16::from(skipped)), sopc(0x06, 4, ONE)]);
+        let skip = w.len();
+        w.push(0);
+        w.extend([
+            sop1(0x03, 3, LITERAL),
+            0x100,
+            vop1(0x01, 1, u16::from(ONES)),
+        ]);
+        w[skip] = sopp(0x05, skip, w.len());
+        w.extend([
+            vopc(0xC2, u16::from(ONES), 1),
+            sop2(0x15, VCC_LO, EXEC_LO, VCC_LO),
+        ]);
+        let unread = w.len();
+        w.push(0);
+        w.extend([sop2(0x0E, 5, 3, LITERAL), 0x100, vop2(0x25, 5, 5, 5)]);
+        w[unread] = sopp(0x07, unread, w.len());
+    };
+    arm(&mut w, skipped);
+    // s16 = 0; head: s16 += 1; s_cmp_eq_u32 s16, 5; s_cbranch_scc0 latch;
+    // s_cmp_eq_u32 s16, 6; s_cbranch_scc1 back; s3 = 0x100; back:
+    // s_branch head; latch: s_cmp_lt_u32 s16, 2; s_cbranch_scc1 head.
+    w.push(sop1(0x03, 16, ZERO));
+    let head = w.len();
+    w.extend([sop2(0x00, 16, 16, ONE), sopc(0x06, 16, 128 + 5)]);
+    let skip = w.len();
+    w.extend([0, sopc(0x06, 16, 128 + 6)]);
+    let keep = w.len();
+    w.extend([0, sop1(0x03, 3, LITERAL), 0x100]);
+    w[keep] = sopp(0x05, keep, w.len());
+    w.push(sopp(0x02, w.len(), head));
+    w[skip] = sopp(0x04, skip, w.len());
+    w.push(sopc(0x0A, 16, TWO));
+    w.push(sopp(0x05, w.len(), head));
+    arm(&mut w, ZERO);
+    w.extend([sop2(0x00, 4, 4, ONE), sopc(0x0A, 4, TWO)]);
+    w.push(sopp(0x05, w.len(), turn));
+    w.extend([
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4,
+    ]);
+    w.push(S_ENDPGM);
+    w
+}
+
 /// Lane `l` loads a dword of a table after the code, read through
 /// `s_getpc_b64` at a join, and stores it: dword `l & 7` on the path
 /// `s_cmp_<cmp>_u32 s0, 0` (s0 is 0) falls through to the load on, dword
@@ -758,5 +819,26 @@ fn a_mask_joined_with_data_is_refused_where_a_lane_bringing_it_reads_it() {
             }
             other => panic!("joins {joins} {compare}: {:?}", other.map(|_| ())),
         }
+    }
+}
+
+#[test]
+fn a_mask_a_loop_carries_round_unchanged_runs_where_only_the_data_is_read() {
+    let shader = lower_cs(&round_a_loop(ZERO)).expect("lower");
+    let want: Vec<u32> = (0..THREADS)
+        .map(|x| 0x200 + if x < 16 { 2 } else { 0 })
+        .collect();
+    for (label, got) in run(&shader) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_mask_a_loop_carries_round_unchanged_is_refused_where_a_lane_bringing_it_reads_it() {
+    match lower_cs(&round_a_loop(ONES)) {
+        Err(ShaderError::Unsupported { what, .. }) => {
+            assert_eq!(what, "a lane mask read as data");
+        }
+        other => panic!("{:?}", other.map(|_| ())),
     }
 }
