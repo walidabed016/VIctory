@@ -791,6 +791,9 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Its reads and writes of memory other resources write too
+    /// ([`crate::resource::alias`]).
+    aliased: crate::resource::alias::Recorded,
 }
 
 impl Step {
@@ -1815,6 +1818,8 @@ impl HostList {
     /// textures' real states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        // First, from the textures' real states.
+        let aliased = crate::resource::alias::submit(self);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let deferred = self.deferred();
         let due: Vec<_> = deferred
@@ -1855,11 +1860,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let stamps = self
             .stamps()
-            .filter(|_| !(before.is_empty() && due.is_empty()));
+            .filter(|_| !(before.is_empty() && due.is_empty() && aliased.is_none()));
         #[cfg(feature = "diagnostics")]
         self.prelude_timed
             .store(stamps.is_some(), Ordering::Relaxed);
-        if before.is_empty() && due.is_empty() {
+        if before.is_empty() && due.is_empty() && aliased.is_none() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1871,6 +1876,9 @@ impl HostList {
                 #[cfg(feature = "diagnostics")]
                 if let Some((heap, _)) = stamps {
                     list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, PRELUDE);
+                }
+                if let Some(copies) = &aliased {
+                    copies.record(list);
                 }
                 if !before.is_empty() {
                     list.ResourceBarrier(&before);
@@ -2116,6 +2124,15 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Runs `f` on the list's reads and writes of memory other resources
+    /// write too ([`crate::resource::alias`]).
+    pub(crate) fn aliased<R>(
+        &self,
+        f: impl FnOnce(&mut crate::resource::alias::Recorded) -> R,
+    ) -> R {
+        f(&mut self.deferred().aliased)
     }
 
     /// Whether this is the first time since the reset that the list asks

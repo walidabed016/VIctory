@@ -1408,12 +1408,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            crate::resource::alias::before_read(list, *resource as This);
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
                 crate::texture::upload(list, *resource as This);
             }
-            crate::resource::alias::before_read(list, *resource as This);
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_access(*resource as This, false);

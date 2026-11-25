@@ -5,24 +5,34 @@
 //! its lighting samples as R9G9B9E5 (67) through other resources at the
 //! same address and size (run 91). A draw or dispatch that writes a texture
 //! (render target, depth or unordered view) notes the write at the
-//! texture's address ([`gpu_wrote`]); one that reads a texture through a
-//! shader view first copies in the newest write at its address if another
-//! resource made it ([`before_read`]), through a buffer footprint, which
-//! allows two formats whose every subresource holds the same rows of the
-//! same bytes. `VICTORY_NO_ALIAS_COPY=1` turns it off.
+//! texture's address ([`gpu_wrote`]). A read through a shader view of a
+//! texture another resource writes over ([`before_read`]) takes, through a
+//! buffer footprint (two formats whose every subresource holds the same
+//! rows of the same bytes):
 //!
-//! shortcut: in recording order, and only reads that start where the write
-//! starts with the same layout; other overlaps are logged (diagnostics),
-//! not copied.
+//! - a write its own list made before it, copied there and then;
+//! - otherwise the newest write submitted before its list, copied in the
+//!   list's prelude at submission ([`submit`]), as the console's memory
+//!   would hold it when the list runs (lists are recorded in another order
+//!   than they are submitted: run 97 counted 154 reads a frame that took
+//!   the previous frame's write).
+//!
+//! `VICTORY_NO_ALIAS_COPY=1` turns it off; `VICTORY_ALIAS_RECORD_ORDER=1`
+//! copies writes of other lists at the read too, in recording order (as
+//! 5bc69ea).
+//!
+//! shortcut: only reads that start where the write starts with the same
+//! layout; other overlaps are logged (diagnostics), not copied.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(feature = "diagnostics")]
 use super::footprint;
-use super::{BUFFER, resource};
+use super::{BUFFER, HostTexture, resource};
 use crate::host::HostList;
 use crate::object::This;
 
@@ -36,44 +46,72 @@ struct Written {
     seq: u64,
 }
 
+/// A write as submitted: when it was noted, the writer's host copy, and
+/// the writer.
+type Write = (u64, Arc<HostTexture>, usize);
+
 #[derive(Default)]
 struct Aliases {
     written: BTreeMap<u64, Vec<Written>>,
     /// Writes noted.
     seq: u64,
-    /// Textures read through shader views: the newest write at their
-    /// address they have taken or passed over.
+    /// Readers of memory other resources write: the newest write a copy
+    /// recorded at the read gave them.
     read: HashMap<usize, u64>,
+    /// Addresses read through another resource than wrote them: their
+    /// writes are noted per list.
+    aliased: std::collections::HashSet<u64>,
+    /// The newest write submitted at each of them.
+    submitted: HashMap<u64, Write>,
+    /// The newest write each reader holds once the lists submitted so far
+    /// have run.
+    taken: HashMap<usize, u64>,
     /// The buffer copies go through, and its bytes. Host lists all run on
-    /// one queue, and each copy leaves it in the state it found it in.
+    /// one queue, each copy leaves it in the state it found it in, and the
+    /// lists that copy through it keep it.
     buffer: Option<(ID3D12Resource, u64)>,
     /// Reader and writer pairs logged (diagnostics).
     #[cfg(feature = "diagnostics")]
     logged: std::collections::HashSet<(usize, usize)>,
-    /// Addresses read through another resource than wrote them, and the
-    /// newest write there when the first such read was recorded: older
-    /// writes went unrecorded (diagnostics).
-    #[cfg(feature = "diagnostics")]
-    aliased: HashMap<u64, u64>,
-    /// What each host list recorded at those addresses, until it is
-    /// recorded again (diagnostics).
-    #[cfg(feature = "diagnostics")]
-    lists: HashMap<usize, Recorded>,
-    /// The newest write submitted at each of them (diagnostics).
-    #[cfg(feature = "diagnostics")]
-    submitted: HashMap<u64, u64>,
 }
 
-/// A host list's reads and writes at addresses read through another
-/// resource than wrote them (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// A host list's reads and writes of aliased memory, until it is reset
+/// ([`HostList::aliased`]).
 #[derive(Default)]
-struct Recorded {
-    /// Address, the newest write noted there when read, and whether this
-    /// list recorded that write.
-    reads: Vec<(u64, u64, bool)>,
-    /// The newest write at each address.
-    writes: HashMap<u64, u64>,
+pub(crate) struct Recorded {
+    /// The newest write the list makes at each aliased address.
+    writes: HashMap<u64, Write>,
+    /// Reads that do not take a write of the list's own, once per reader.
+    reads: Vec<Read>,
+    /// Readers that took a write of the list's own, and that write.
+    inline: Vec<(usize, u64)>,
+    /// What its prelude's copies name, kept until the list has run.
+    kept: Vec<Arc<HostTexture>>,
+    buffers: Vec<ID3D12Resource>,
+}
+
+struct Read {
+    address: u64,
+    reader: usize,
+    to: Arc<HostTexture>,
+    /// The write a copy at the read gave it (in recording order); `None`:
+    /// the prelude's.
+    held: Option<u64>,
+}
+
+/// The copies a list's prelude records ([`submit`]).
+pub(crate) struct Copies {
+    buffer: ID3D12Resource,
+    copies: Vec<Copy>,
+}
+
+struct Copy {
+    from: Arc<HostTexture>,
+    to: Arc<HostTexture>,
+    /// Their real states at submission, before the prelude moves them.
+    real: [D3D12_RESOURCE_STATES; 2],
+    written: Footprints,
+    reads: Footprints,
 }
 
 /// Held while a copy is recorded, so that its writer is not let go of
@@ -82,8 +120,9 @@ static ALIASES: Mutex<Option<Aliases>> = Mutex::new(None);
 
 /// Since the last frame line (diagnostics): alias copies, their bytes,
 /// newer writes at a read's address not copied (layouts that differ), and
-/// submitted reads of aliased memory that took an older write than one
-/// submitted ahead of them (late), or a write submitted after them (early).
+/// reads of aliased memory that, when their list was submitted, held an
+/// older write than one submitted ahead of them (late), or a write not
+/// submitted yet (early).
 #[cfg(feature = "diagnostics")]
 static COUNTS: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -99,21 +138,34 @@ fn on() -> bool {
     })
 }
 
+/// Whether writes of other lists are copied at the read, in recording
+/// order (`VICTORY_ALIAS_RECORD_ORDER=1`).
+fn record_order() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ALIAS_RECORD_ORDER").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("alias copies in recording order (VICTORY_ALIAS_RECORD_ORDER=1)");
+        }
+        on
+    })
+}
+
 fn aliases() -> std::sync::MutexGuard<'static, Option<Aliases>> {
     ALIASES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A draw or dispatch recorded on `list` writes texture `this` through a
 /// render target, depth or unordered view.
-pub(crate) fn gpu_wrote(
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] list: &HostList,
-    this: This,
-) {
+pub(crate) fn gpu_wrote(list: &HostList, this: This) {
     if this.is_null() || !on() {
         return;
     }
     let r = resource(this);
-    if r.desc.dimension == BUFFER || r.host.is_none() {
+    let Some(copy) = r.host.as_ref() else {
+        return;
+    };
+    if r.desc.dimension == BUFFER {
         return;
     }
     let start = r.data() as u64;
@@ -121,9 +173,9 @@ pub(crate) fn gpu_wrote(
     let a = guard.get_or_insert_with(Aliases::default);
     a.seq += 1;
     let seq = a.seq;
-    #[cfg(feature = "diagnostics")]
-    if a.aliased.contains_key(&start) {
-        recorded(a, list).writes.insert(start, seq);
+    if a.aliased.contains(&start) {
+        let write = (seq, copy.clone(), this as usize);
+        list.aliased(|recorded| recorded.writes.insert(start, write));
     }
     let at = a.written.entry(start).or_default();
     if let Some(w) = at.iter_mut().find(|w| w.resource == this as usize) {
@@ -145,6 +197,10 @@ pub(crate) fn forget(resource: usize, start: u64) {
         return;
     };
     a.read.remove(&resource);
+    a.taken.remove(&resource);
+    if a.submitted.get(&start).is_some_and(|w| w.2 == resource) {
+        a.submitted.remove(&start);
+    }
     if let Some(at) = a.written.get_mut(&start) {
         at.retain(|w| w.resource != resource);
         if at.is_empty() {
@@ -153,11 +209,14 @@ pub(crate) fn forget(resource: usize, start: u64) {
     }
 }
 
-/// Before a draw or dispatch reads texture `this` through a shader view:
-/// if the newest write at its address went through another resource and
-/// it has not taken it yet, records the copy of that resource's host copy
-/// into its own, leaving it in the copy destination state. Whether it
-/// copied.
+/// Before a draw or dispatch recorded on `list` reads texture `this`
+/// through a shader view, ahead of bringing it up to date from title
+/// memory: if other resources write its memory, it takes their writes
+/// from now on, not title memory's. The newest one, if its list made it,
+/// is copied into its host copy now, leaving it in the copy destination
+/// state (and so are other lists' in recording order); otherwise the
+/// list's prelude copies the newest one submitted before it. Whether it
+/// copied now.
 pub(crate) fn before_read(list: &HostList, this: This) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -165,59 +224,126 @@ pub(crate) fn before_read(list: &HostList, this: This) -> bool {
         return false;
     }
     let r = resource(this);
-    let Some(to) = r.host.as_ref().map(|h| h.texture.clone()) else {
+    let Some(to) = r.host.clone() else {
         return false;
     };
     let start = r.data() as u64;
     let mut guard = aliases();
     let a = guard.get_or_insert_with(Aliases::default);
-    let newest = a
-        .written
-        .get(&start)
-        .and_then(|at| at.iter().max_by_key(|w| w.seq))
-        .map(|w| (w.resource as This, w.seq));
-    let Some((writer, seq)) = newest else {
+    let Some(at) = a.written.get(&start) else {
         #[cfg(feature = "diagnostics")]
         inside(a, this, start);
         return false;
     };
-    #[cfg(feature = "diagnostics")]
-    if a.written[&start]
-        .iter()
-        .any(|w| w.resource != this as usize)
-    {
-        a.aliased.entry(start).or_insert(seq);
-        let recorded = recorded(a, list);
-        let here = recorded.writes.get(&start) == Some(&seq);
-        recorded.reads.push((start, seq, here));
-    }
-    let seen = a.read.entry(this as usize).or_default();
-    if writer == this || seq <= *seen {
-        *seen = (*seen).max(seq);
+    if at.iter().all(|w| w.resource == this as usize) {
         return false;
     }
-    *seen = seq;
+    let Some((writer, seq)) = at
+        .iter()
+        .max_by_key(|w| w.seq)
+        .map(|w| (w.resource as This, w.seq))
+    else {
+        return false;
+    };
+    if a.aliased.insert(start) {
+        // Its writes went unnoted per list so far: the newest counts as
+        // submitted.
+        if let Some(copy) = super::host_copy(writer) {
+            a.submitted
+                .entry(start)
+                .or_insert((seq, copy, writer as usize));
+        }
+    }
+    if let std::collections::hash_map::Entry::Vacant(v) = a.read.entry(this as usize) {
+        v.insert(0);
+        // Its contents are the host's from now on, not title memory's.
+        crate::texture::host_written(this);
+    }
+    // A write of its own list comes after its prelude, so the read takes
+    // it whatever other lists wrote.
+    let own = list.aliased(|recorded| recorded.writes.get(&start).map(|w| (w.0, w.2)));
+    let (writer, fresh) = match own {
+        Some((seq, writer)) => {
+            let taken = list.aliased(|recorded| {
+                let taken = recorded
+                    .inline
+                    .iter()
+                    .any(|&(reader, s)| reader == this as usize && s >= seq);
+                if !taken {
+                    recorded.inline.push((this as usize, seq));
+                }
+                taken
+            });
+            (writer as This, !taken)
+        }
+        None if record_order() => {
+            let seen = a.read.entry(this as usize).or_default();
+            let fresh = seq > *seen;
+            *seen = (*seen).max(seq);
+            let held = *seen;
+            list.aliased(|recorded| {
+                if !recorded
+                    .reads
+                    .iter()
+                    .any(|read| read.reader == this as usize)
+                {
+                    recorded.reads.push(Read {
+                        address: start,
+                        reader: this as usize,
+                        to: to.clone(),
+                        held: Some(held),
+                    });
+                }
+            });
+            (writer, fresh)
+        }
+        None => {
+            list.aliased(|recorded| {
+                if !recorded
+                    .reads
+                    .iter()
+                    .any(|read| read.reader == this as usize)
+                {
+                    recorded.reads.push(Read {
+                        address: start,
+                        reader: this as usize,
+                        to,
+                        held: None,
+                    });
+                }
+            });
+            return false;
+        }
+    };
+    let alive = a
+        .written
+        .get(&start)
+        .is_some_and(|at| at.iter().any(|w| w.resource == writer as usize));
+    let fresh = fresh && writer != this && alive;
+    if !fresh {
+        return false;
+    }
     // Alive: letting go of it waits for the lock.
     let Some(from) = super::host_resource(writer).cloned() else {
         return false;
     };
-    let Some((written, reads, total)) = matching(&from, &to) else {
+    let Some((written, reads, total)) = matching(&from, &to.texture) else {
         #[cfg(feature = "diagnostics")]
         {
-            COUNTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            log_pair(a, this, writer, "not copied: their layouts differ");
+            COUNTS[2].fetch_add(1, Relaxed);
+            log_pair(
+                a,
+                start,
+                (this as usize, writer as usize),
+                &to.texture,
+                &from,
+                "not copied: their layouts differ",
+            );
         }
         return false;
     };
-    let buffer = match &a.buffer {
-        Some((buffer, size)) if *size >= total => buffer.clone(),
-        _ => {
-            let Some(buffer) = copy_buffer(total) else {
-                return false;
-            };
-            a.buffer = Some((buffer.clone(), total));
-            buffer
-        }
+    let Some(buffer) = buffer_of(a, total) else {
+        return false;
     };
     list.keep(&buffer);
     // The writer goes back to its state after, in case the draw also binds
@@ -236,57 +362,238 @@ pub(crate) fn before_read(list: &HostList, this: This) -> bool {
             before
         });
     crate::list::ensure_state(list, this, COPY_DEST);
-    let state = |before, after| crate::host::transition(&buffer, before, after);
-    // SAFETY: an open list; live resources in the copy states, the buffer
-    // large enough for every footprint.
-    unsafe {
-        list.list.ResourceBarrier(&[state(
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        )]);
-        for (i, footprint) in written.iter().enumerate() {
-            list.list.CopyTextureRegion(
-                &location(&buffer, Some(*footprint), 0),
-                0,
-                0,
-                0,
-                &location(&from, None, i as u32),
-                None,
-            );
-        }
-        list.list.ResourceBarrier(&[state(
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        )]);
-        for (i, footprint) in reads.iter().enumerate() {
-            list.list.CopyTextureRegion(
-                &location(&to, None, i as u32),
-                0,
-                0,
-                0,
-                &location(&buffer, Some(*footprint), 0),
-                None,
-            );
-        }
-        list.list.ResourceBarrier(&[state(
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_COMMON,
-        )]);
-    }
+    copy_through(&list.list, &buffer, &from, &to.texture, &written, &reads);
     if let Some(before) = back {
         crate::list::ensure_state(list, writer, before);
     }
     #[cfg(feature = "diagnostics")]
     {
-        COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        COUNTS[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        COUNTS[0].fetch_add(1, Relaxed);
+        COUNTS[1].fetch_add(total, Relaxed);
         let what = "copy: a texture read takes the writes another resource made over its memory";
-        log_pair(a, this, writer, what);
+        log_pair(
+            a,
+            start,
+            (this as usize, writer as usize),
+            &to.texture,
+            &from,
+            what,
+        );
     }
-    drop(guard);
-    // Its contents are the host's now, not title memory's.
-    crate::texture::host_written(this);
     true
+}
+
+/// When `list` is submitted, before its prelude is recorded: the copies the
+/// prelude records, of the newest write submitted at each address the
+/// list reads without a write of its own; then its own writes count as
+/// submitted.
+pub(crate) fn submit(list: &HostList) -> Option<Copies> {
+    if !on() {
+        return None;
+    }
+    let (reads, inline, writes) = list.aliased(|recorded| {
+        (
+            recorded
+                .reads
+                .iter()
+                .map(|r| (r.address, r.reader, r.to.clone(), r.held))
+                .collect::<Vec<_>>(),
+            recorded.inline.clone(),
+            recorded
+                .writes
+                .iter()
+                .map(|(&address, write)| (address, write.clone()))
+                .collect::<Vec<_>>(),
+        )
+    });
+    if reads.is_empty() && inline.is_empty() && writes.is_empty() {
+        return None;
+    }
+    let mut guard = aliases();
+    let a = guard.get_or_insert_with(Aliases::default);
+    let (mut copies, mut total) = (Vec::new(), 0);
+    for (address, reader, to, held) in reads {
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        let Some((ahead, from, writer)) = a.submitted.get(&address).cloned() else {
+            continue;
+        };
+        let mut holds = held.unwrap_or_else(|| a.taken.get(&reader).copied().unwrap_or(0));
+        if held.is_none() && ahead > holds && !Arc::ptr_eq(&from, &to) {
+            let matched = matching(&from.texture, &to.texture);
+            #[cfg(feature = "diagnostics")]
+            {
+                let (count, what) = match matched {
+                    Some(_) => (
+                        0,
+                        "copy at submission: a texture read takes the newest write \
+                                    another resource made over its memory before its list",
+                    ),
+                    None => (2, "not copied: their layouts differ"),
+                };
+                COUNTS[count].fetch_add(1, Relaxed);
+                log_pair(
+                    a,
+                    address,
+                    (reader, writer),
+                    &to.texture,
+                    &from.texture,
+                    what,
+                );
+            }
+            if let Some((written, reads, bytes)) = matched {
+                holds = ahead;
+                total = total.max(bytes);
+                #[cfg(feature = "diagnostics")]
+                COUNTS[1].fetch_add(bytes, Relaxed);
+                let real =
+                    [&from, &to].map(|t| D3D12_RESOURCE_STATES(t.state.load(Relaxed) as i32));
+                copies.push(Copy {
+                    from,
+                    to,
+                    real,
+                    written,
+                    reads,
+                });
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if ahead > holds {
+            COUNTS[3].fetch_add(1, Relaxed);
+        } else if holds > ahead {
+            COUNTS[4].fetch_add(1, Relaxed);
+        }
+        let taken = a.taken.entry(reader).or_default();
+        *taken = (*taken).max(holds);
+    }
+    for (reader, seq) in inline {
+        let taken = a.taken.entry(reader).or_default();
+        *taken = (*taken).max(seq);
+    }
+    for (address, write) in writes {
+        if a.submitted.get(&address).is_none_or(|w| w.0 < write.0) {
+            a.submitted.insert(address, write);
+        }
+    }
+    if copies.is_empty() {
+        return None;
+    }
+    let buffer = buffer_of(a, total)?;
+    drop(guard);
+    list.aliased(|recorded| {
+        recorded.buffers.push(buffer.clone());
+        for c in &copies {
+            recorded.kept.push(c.from.clone());
+        }
+    });
+    Some(Copies { buffer, copies })
+}
+
+impl Copies {
+    /// Records the copies first in the prelude `list`: each texture from its
+    /// real state at submission to the copy's and back.
+    pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        const STATES: [D3D12_RESOURCE_STATES; 2] = [
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        ];
+        for c in &self.copies {
+            let real = c.real;
+            let moves = |back: bool| -> Vec<D3D12_RESOURCE_BARRIER> {
+                [&c.from, &c.to]
+                    .into_iter()
+                    .zip(real.into_iter().zip(STATES))
+                    .filter(|(_, (real, copy))| real != copy)
+                    .map(|(t, (real, copy))| match back {
+                        false => crate::host::transition(&t.texture, real, copy),
+                        true => crate::host::transition(&t.texture, copy, real),
+                    })
+                    .collect()
+            };
+            let (there, back) = (moves(false), moves(true));
+            // SAFETY: an open list; live textures, in their real states.
+            unsafe {
+                if !there.is_empty() {
+                    list.ResourceBarrier(&there);
+                }
+            }
+            copy_through(
+                list,
+                &self.buffer,
+                &c.from.texture,
+                &c.to.texture,
+                &c.written,
+                &c.reads,
+            );
+            // SAFETY: as above.
+            unsafe {
+                if !back.is_empty() {
+                    list.ResourceBarrier(&back);
+                }
+            }
+        }
+    }
+}
+
+/// The buffer copies go through, at least `size` bytes.
+fn buffer_of(a: &mut Aliases, size: u64) -> Option<ID3D12Resource> {
+    if let Some((buffer, bytes)) = &a.buffer
+        && *bytes >= size
+    {
+        return Some(buffer.clone());
+    }
+    let size = size.next_power_of_two();
+    let buffer = copy_buffer(size)?;
+    a.buffer = Some((buffer.clone(), size));
+    Some(buffer)
+}
+
+/// Records the copy of `from` into `to`, in the copy states, through
+/// `buffer` (in the common state, as it is left).
+fn copy_through(
+    list: &ID3D12GraphicsCommandList,
+    buffer: &ID3D12Resource,
+    from: &ID3D12Resource,
+    to: &ID3D12Resource,
+    written: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    reads: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+) {
+    let state = |before, after| crate::host::transition(buffer, before, after);
+    // SAFETY: an open list; live resources in the copy states, the buffer
+    // large enough for every footprint.
+    unsafe {
+        list.ResourceBarrier(&[state(
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        for (i, footprint) in written.iter().enumerate() {
+            list.CopyTextureRegion(
+                &location(buffer, Some(*footprint), 0),
+                0,
+                0,
+                0,
+                &location(from, None, i as u32),
+                None,
+            );
+        }
+        list.ResourceBarrier(&[state(
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        for (i, footprint) in reads.iter().enumerate() {
+            list.CopyTextureRegion(
+                &location(to, None, i as u32),
+                0,
+                0,
+                0,
+                &location(buffer, Some(*footprint), 0),
+                None,
+            );
+        }
+        list.ResourceBarrier(&[state(
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
 }
 
 /// A copy location: a footprint in `resource` (a buffer), or its
@@ -413,67 +720,6 @@ fn copy_buffer(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
-/// What `list` recorded at aliased addresses, made afresh (and checked
-/// when the list is submitted) once per recording (diagnostics).
-#[cfg(feature = "diagnostics")]
-fn recorded<'a>(a: &'a mut Aliases, list: &HostList) -> &'a mut Recorded {
-    let key = std::ptr::from_ref(list) as usize;
-    // Odd: never a texture's key.
-    if list.first_use(1) {
-        list.defer_host(move || submitted(key));
-        a.lists.insert(key, Recorded::default());
-    }
-    a.lists.entry(key).or_default()
-}
-
-/// When the list `list` is submitted (diagnostics): counts its reads of
-/// aliased memory that took an older write than one submitted ahead of
-/// them (late: recorded before their writer's list, submitted after it),
-/// and those that took a write another list recorded but has not
-/// submitted yet (early: the copy runs before that write); then notes its
-/// writes as submitted.
-#[cfg(feature = "diagnostics")]
-fn submitted(list: usize) {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static LOGGED: AtomicU64 = AtomicU64::new(0);
-    let mut guard = aliases();
-    let Some(Aliases {
-        lists,
-        submitted,
-        aliased,
-        ..
-    }) = guard.as_mut()
-    else {
-        return;
-    };
-    let Some(recorded) = lists.get(&list) else {
-        return;
-    };
-    for &(address, taken, here) in &recorded.reads {
-        let ahead = submitted.get(&address).copied().unwrap_or(0);
-        let late = ahead > taken;
-        let since = aliased.get(&address).copied().unwrap_or(0);
-        if !late && (here || taken <= ahead || taken <= since) {
-            continue;
-        }
-        COUNTS[if late { 3 } else { 4 }].fetch_add(1, Relaxed);
-        if LOGGED.fetch_add(1, Relaxed) < 20 {
-            let what = if late { "late" } else { "early" };
-            tracing::info!(
-                address = format_args!("{address:#x}"),
-                taken,
-                ahead,
-                "alias read {what}: it took write {taken} at submission, when write {ahead} was \
-                 the newest submitted"
-            );
-        }
-    }
-    for (&address, &seq) in &recorded.writes {
-        let newest = submitted.entry(address).or_default();
-        *newest = (*newest).max(seq);
-    }
-}
-
 /// A read that starts inside memory another resource was written through,
 /// past its start: logged once per pair (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -483,30 +729,44 @@ fn inside(a: &mut Aliases, this: This, start: u64) {
             .find(|w| w.end > start && w.resource != this as usize)
             .map(|w| w.resource as This)
     });
-    if let Some(writer) = writer {
-        log_pair(
-            a,
-            this,
-            writer,
-            "not copied: the read starts inside the written memory",
-        );
+    let Some(writer) = writer else {
+        return;
+    };
+    // Alive: letting go of either waits for the lock.
+    if let (Some(to), Some(from)) = (super::host_resource(this), super::host_resource(writer)) {
+        let what = "not copied: the read starts inside the written memory";
+        log_pair(a, start, (this as usize, writer as usize), to, from, what);
     }
 }
 
-/// Logs a reader and writer pair the first time, up to 300 pairs
-/// (diagnostics).
+/// Logs a reader and writer pair over `address` the first time, up to 300
+/// pairs (diagnostics).
 #[cfg(feature = "diagnostics")]
-fn log_pair(a: &mut Aliases, reader: This, writer: This, what: &str) {
-    if a.logged.len() >= 300 || !a.logged.insert((reader as usize, writer as usize)) {
+fn log_pair(
+    a: &mut Aliases,
+    address: u64,
+    pair: (usize, usize),
+    reader: &ID3D12Resource,
+    writer: &ID3D12Resource,
+    what: &str,
+) {
+    if a.logged.len() >= 300 || !a.logged.insert(pair) {
         return;
     }
-    let span = |r: This| {
-        super::texture_span(r).map_or_else(
-            || format!("{r:p}"),
-            |(at, bytes, desc)| format!("{r:p} {desc} at {at:#x}+{bytes:#x}"),
+    let text = |t: &ID3D12Resource| {
+        // SAFETY: a live resource.
+        let d = unsafe { t.GetDesc() };
+        format!(
+            "{}x{}x{} f{} mips {} flags {:#x}",
+            d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0
         )
     };
-    tracing::info!(reader = span(reader), writer = span(writer), "alias {what}");
+    tracing::info!(
+        address = format_args!("{address:#x}"),
+        reader = text(reader),
+        writer = text(writer),
+        "alias {what}"
+    );
 }
 
 /// The frame line of alias copies per frame (diagnostics).
@@ -514,7 +774,7 @@ fn log_pair(a: &mut Aliases, reader: This, writer: This, what: &str) {
 pub(crate) fn line(frames: f64) -> String {
     let [copies, bytes, other, late, early] = COUNTS
         .each_ref()
-        .map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        .map(|c| c.swap(0, Relaxed) as f64 / frames);
     if !on() {
         return "  host costs per frame, alias copies: off (VICTORY_NO_ALIAS_COPY=1)".into();
     }
@@ -551,8 +811,8 @@ mod tests {
         }
     }
 
-    /// A buffer of 16 KiB on a heap of `kind`.
-    fn buffer(kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+    /// A buffer of `size` bytes on a heap of `kind`.
+    fn buffer(kind: D3D12_HEAP_TYPE, size: u64, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
         let host = crate::host::host().unwrap();
         let mut b: Option<ID3D12Resource> = None;
         // SAFETY: plain creation; the out pointer is ours.
@@ -566,7 +826,7 @@ mod tests {
                     D3D12_HEAP_FLAG_NONE,
                     &D3D12_RESOURCE_DESC {
                         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                        Width: 16 << 10,
+                        Width: size,
                         Height: 1,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
@@ -586,10 +846,11 @@ mod tests {
         b.unwrap()
     }
 
-    /// The 64 rows of 64 four-byte texels of a 16 KiB buffer, as `format`.
-    fn rows(format: i32) -> D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+    /// The 64 rows of 64 four-byte texels at `offset` in a buffer, as
+    /// `format`.
+    fn rows(format: i32, offset: u64) -> D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-            Offset: 0,
+            Offset: offset,
             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                 Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format),
                 Width: 64,
@@ -600,11 +861,14 @@ mod tests {
         }
     }
 
-    /// An R9G9B9E5 texture over the memory a compute wrote as R32_UINT
-    /// (run 91's pairs) reads what it wrote, once per write; one whose rows
-    /// hold other bytes does not, and neither does the writer itself.
+    /// An R9G9B9E5 texture over the memory a compute writes as R32_UINT
+    /// (run 91's pairs) holds, when its list runs, the newest write
+    /// submitted before that list, whatever order the lists were recorded
+    /// in, or the write its own list made before the read; one whose rows
+    /// hold other bytes takes nothing, and neither does the writer itself.
     #[test]
-    fn a_read_over_memory_another_resource_wrote_takes_its_writes() {
+    fn a_read_over_memory_another_resource_writes_takes_writes_in_submission_order() {
+        const KIB16: u64 = 16 << 10;
         let _serial = crate::watch::serial();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -645,95 +909,125 @@ mod tests {
             out
         };
         let (reader, narrow) = (at(67), at(54));
-        let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        let readback = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        let pattern: Vec<u8> = (0..16u32 << 10).map(|i| (i * 7 + 3) as u8).collect();
+        let upload = buffer(
+            D3D12_HEAP_TYPE_UPLOAD,
+            4 * KIB16,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        let readback = buffer(
+            D3D12_HEAP_TYPE_READBACK,
+            KIB16,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let pattern = |n: u32| -> Vec<u8> {
+            (0..16u32 << 10)
+                .map(|i| (i * 7 + n * 31 + 3) as u8)
+                .collect()
+        };
         let mut data = std::ptr::null_mut();
-        // SAFETY: our upload buffer, 16 KiB.
+        // SAFETY: our upload buffer, 64 KiB.
         unsafe {
             upload.Map(0, None, Some(&mut data)).unwrap();
-            std::ptr::copy_nonoverlapping(pattern.as_ptr(), data.cast::<u8>(), pattern.len());
+            for n in 0..4 {
+                let to = data.cast::<u8>().add(n as usize * KIB16 as usize);
+                std::ptr::copy_nonoverlapping(pattern(n).as_ptr(), to, KIB16 as usize);
+            }
         }
+        // The compute writing pattern `n`.
+        let write = |list: &HostList, n: u32| {
+            crate::list::ensure_state(list, writer, 0x400);
+            // SAFETY: an open list; live resources.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    &location(host_resource(writer).unwrap(), None, 0),
+                    0,
+                    0,
+                    0,
+                    &location(&upload, Some(rows(42, u64::from(n) * KIB16)), 0),
+                    None,
+                );
+            }
+            gpu_wrote(list, writer);
+        };
+        // A draw reading the reader, and what it read.
+        let read = |list: &HostList| {
+            before_read(list, reader);
+            crate::list::ensure_state(list, reader, 0x800);
+            // SAFETY: an open list; live resources.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    &location(&readback, Some(rows(67, 0)), 0),
+                    0,
+                    0,
+                    0,
+                    &location(host_resource(reader).unwrap(), None, 0),
+                    None,
+                );
+            }
+        };
         let run = |list: HostList| {
             list.close();
             host.execute(&[&list]);
             crate::pipelined::wait_all();
         };
-        // The compute's write.
+        let held = || {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the finished copy's read-back buffer, 16 KiB.
+            unsafe {
+                readback.Map(0, None, Some(&mut data)).unwrap();
+                let read = std::slice::from_raw_parts(data.cast::<u8>(), KIB16 as usize).to_vec();
+                readback.Unmap(0, None);
+                read
+            }
+        };
+        #[cfg(feature = "diagnostics")]
+        let counts = || [2, 3, 4].map(|i| COUNTS[i].load(Relaxed));
+        #[cfg(feature = "diagnostics")]
+        let before = counts();
         let list = host.new_list().unwrap();
-        crate::list::ensure_state(&list, writer, 0x400);
-        // SAFETY: an open list; live resources.
-        unsafe {
-            list.list.CopyTextureRegion(
-                &location(host_resource(writer).unwrap(), None, 0),
-                0,
-                0,
-                0,
-                &location(&upload, Some(rows(42)), 0),
-                None,
-            );
-        }
-        gpu_wrote(&list, writer);
+        write(&list, 0);
         run(list);
-        // The reads.
         let list = host.new_list().unwrap();
         assert!(!before_read(&list, writer), "the writer has its writes");
-        assert!(before_read(&list, reader), "the write is copied in");
-        assert!(!before_read(&list, reader), "once");
-        assert!(
-            !before_read(&list, narrow),
-            "rows of 128 bytes take nothing"
-        );
-        crate::list::ensure_state(&list, reader, 0x800);
-        // SAFETY: an open list; live resources.
-        unsafe {
-            list.list.CopyTextureRegion(
-                &location(&readback, Some(rows(67)), 0),
-                0,
-                0,
-                0,
-                &location(host_resource(reader).unwrap(), None, 0),
-                None,
-            );
-        }
+        assert!(!before_read(&list, narrow), "another list's write waits");
+        read(&list);
         run(list);
-        // SAFETY: the finished copy's read-back buffer, 16 KiB.
-        let read = unsafe {
-            readback.Map(0, None, Some(&mut data)).unwrap();
-            let read = std::slice::from_raw_parts(data.cast::<u8>(), pattern.len()).to_vec();
-            readback.Unmap(0, None);
-            read
-        };
-        assert!(read == pattern, "the reader holds the writer's bytes");
+        assert!(held() == pattern(0), "the reader holds the write");
+        // Recorded before the write's list, submitted after it.
+        let (reading, writing) = (host.new_list().unwrap(), host.new_list().unwrap());
+        read(&reading);
+        write(&writing, 1);
+        run(writing);
+        run(reading);
+        assert!(
+            held() == pattern(1),
+            "a read submitted after a write takes it"
+        );
+        // Recorded after the write's list, submitted before it.
+        let (writing, reading) = (host.new_list().unwrap(), host.new_list().unwrap());
+        write(&writing, 2);
+        read(&reading);
+        run(reading);
+        assert!(
+            held() == pattern(1),
+            "a read submitted before a write does not"
+        );
+        run(writing);
         let list = host.new_list().unwrap();
-        gpu_wrote(&list, writer);
+        write(&list, 3);
         assert!(
             before_read(&list, reader),
-            "a newer write is copied in again"
+            "the list's own write is copied at the read"
         );
+        read(&list);
         run(list);
-        // A read recorded before a newer write's list but submitted after
-        // it is late; one that took a write submitted after it is early.
+        assert!(held() == pattern(3), "the reader holds its list's write");
         #[cfg(feature = "diagnostics")]
         {
-            let counts = || [3, 4].map(|i| COUNTS[i].load(std::sync::atomic::Ordering::Relaxed));
-            let before = counts();
-            let since = || {
-                let now = counts();
-                [now[0] - before[0], now[1] - before[1]]
-            };
-            let (reading, writing) = (host.new_list().unwrap(), host.new_list().unwrap());
-            assert!(!before_read(&reading, reader), "nothing newer yet");
-            gpu_wrote(&writing, writer);
-            run(writing);
-            run(reading);
-            assert_eq!(since(), [1, 0], "one late read");
-            let (reading, writing) = (host.new_list().unwrap(), host.new_list().unwrap());
-            gpu_wrote(&writing, writer);
-            assert!(before_read(&reading, reader), "the newer write");
-            run(reading);
-            run(writing);
-            assert_eq!(since(), [1, 1], "and one early");
+            let now = counts();
+            let since: Vec<u64> = now.iter().zip(before).map(|(n, b)| n - b).collect();
+            // The narrow reader: rows of other bytes, so it keeps no write.
+            assert_eq!(since, [1, 1, 0], "not copied, late and early reads");
         }
         assert_eq!(host.log_messages(), None, "debug layer errors");
         for r in [narrow, reader, writer] {
